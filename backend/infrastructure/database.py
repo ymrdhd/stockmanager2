@@ -1,25 +1,26 @@
 """Single-file SQLite identity, lifecycle and transaction boundary."""
 
+import os
+import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-import os
 from pathlib import Path
-import sqlite3
 from typing import Literal
 from uuid import UUID, uuid4
 
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine, URL
+from sqlalchemy.engine import URL, Engine
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE = ROOT / 'data' / 'stock_manager.sqlite'
 DEFAULT_BINDING = ROOT / "data" / "official.json"
-SCHEMA_VERSION = 7
-REVISION = '0007'
+SCHEMA_VERSION = 8
+REVISION = '0008'
 BUSY_TIMEOUT_MS = 5000
 Role = Literal['formal', 'sandbox', 'backup']
 InitialRole = Literal['formal', 'sandbox']
@@ -27,6 +28,22 @@ InitialRole = Literal['formal', 'sandbox']
 
 class DatabaseError(RuntimeError):
     """A database safety check failed; callers must stop rather than switch."""
+
+
+class IdentityMismatch(DatabaseError):
+    """The request declared a database identity other than the verified one."""
+
+
+# The identity a business write claims; set per request and checked at the write boundary.
+declared_identity: ContextVar[tuple[str, int] | None] = ContextVar('declared_identity', default=None)
+
+
+def declare_identity(database_uuid: str, generation: int) -> None:
+    declared_identity.set((database_uuid, generation))
+
+
+def clear_declared_identity() -> None:
+    declared_identity.set(None)
 
 
 def absolute_path(path: Path) -> Path:
@@ -143,7 +160,7 @@ def read_identity(conn: sqlite3.Connection, *, allow_previous: bool = False) -> 
         versions = conn.execute('SELECT version_num FROM alembic_version').fetchall()
         if len(rows) != 1:
             raise DatabaseError('invalid metadata row count')
-        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006'} if allow_previous else {})}
+        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006', 7: '0007'} if allow_previous else {})}
         if rows[0][3] not in expected or versions != [(expected[rows[0][3]],)]:
             raise DatabaseError('incompatible database metadata or Alembic revision')
         identity = Identity(*rows[0])
@@ -202,7 +219,8 @@ class Database:
         with closing(_connect(self.settings.path, readonly=False)) as conn:
             conn.execute('BEGIN IMMEDIATE')
             try:
-                validate_identity(conn, self.settings)
+                identity = validate_identity(conn, self.settings)
+                require_declared_identity(identity)
                 yield conn
                 conn.commit()
             except BaseException:
@@ -210,12 +228,32 @@ class Database:
                 raise
 
 
+def require_declared_identity(identity: Identity) -> None:
+    """Reject a write whose request declared another database than the verified one."""
+    declared = declared_identity.get()
+    if declared is not None and declared != (identity.database_uuid, identity.generation):
+        raise IdentityMismatch('request declares a different database identity')
+
+
 def validate_binding(settings: DatabaseSettings) -> None:
     from backend.infrastructure.binding import load_binding
+    if settings.mode == 'local':
+        # A local session never adopts the formal ledger and never needs its file,
+        # so a fresh install can run before any formal binding exists.
+        if settings.official_path == settings.path:
+            raise DatabaseError('local mode must not open the official database')
+        try:
+            bound = load_binding(settings.binding_path)
+        except DatabaseError:
+            return
+        # A backup or snapshot keeps the ledger UUID on purpose, so only the file itself
+        # (or an alias of it) proves that the caller is about to open the formal ledger.
+        if bound.path == settings.path or (bound.path.is_file() and os.path.samefile(bound.path, settings.path)):
+            raise DatabaseError('local mode must not open the formal database')
+        return
     bound = load_binding(settings.binding_path)
-    if bound.path != settings.official_path or (settings.mode == 'server' and
-            (bound.path, bound.uuid, bound.generation) !=
-            (settings.path, settings.expected_uuid, settings.generation)):
+    if bound.path != settings.official_path or (bound.path, bound.uuid, bound.generation) != (
+            settings.path, settings.expected_uuid, settings.generation):
         raise DatabaseError('configuration conflicts with fixed formal binding')
 
 
@@ -237,6 +275,24 @@ def open_database(settings: DatabaseSettings) -> Iterator[Database]:
             yield db
         finally:
             db._active = False
+
+
+@contextmanager
+def inspect_database(settings: DatabaseSettings) -> Iterator[Database]:
+    """Read-only diagnosis: never takes the writer lock and never enables WAL.
+
+    Used by maintenance commands that must be safe to run while the formal
+    service is live, so it can report identity without competing for the writer.
+    """
+    validate_binding(settings)
+    _single_file(settings.path)
+    with closing(_connect(settings.path, readonly=True)) as conn:
+        identity = validate_identity(conn, settings)
+    db = Database(settings, identity)
+    try:
+        yield db
+    finally:
+        db._active = False
 
 
 def migrate_schema(engine: Engine, identity: Identity, *, existing: bool = False, target: str = REVISION) -> None:
@@ -324,10 +380,16 @@ def initialize_database(path: Path, *, role: InitialRole, confirm: bool,
     binding_path.parent.mkdir(parents=True, exist_ok=True)
     with writer_lock(binding_path):
         if role == 'sandbox':
-            bound = load_binding(binding_path)
-            if official_path is not None and absolute_path(official_path) != bound.path:
+            # A standalone local sandbox needs no formal ledger. When a binding does
+            # exist it stays authoritative, so the official path is never a sandbox.
+            try:
+                bound = load_binding(binding_path)
+            except DatabaseError:
+                bound = None
+            official = bound.path if bound is not None else absolute_path(official_path or DEFAULT_DATABASE)
+            if official_path is not None and absolute_path(official_path) != official:
                 raise DatabaseError('sandbox conflicts with fixed formal binding')
-            return _initialize_database(path, role=role, confirm=True, official_path=bound.path)
+            return _initialize_database(path, role=role, confirm=True, official_path=official)
         if binding_path.exists() or binding_path.is_symlink():
             raise DatabaseError('formal binding already exists; cannot initialize another formal database')
         identity = _initialize_database(path, role=role, confirm=True, official_path=official_path)

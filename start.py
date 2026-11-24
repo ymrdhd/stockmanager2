@@ -1,27 +1,92 @@
-"""Explicit local launcher and database maintenance commands."""
+"""Explicit local launcher, credential setup and database maintenance commands."""
 
 import argparse
-from dataclasses import asdict
+import getpass
 import json
-from pathlib import Path
 import sqlite3
 import sys
+from dataclasses import asdict
+from pathlib import Path
 
+from backend.config import WEB_DIST, AppConfig, AuthConfig
+from backend.infrastructure.authfile import DEFAULT_AUTH_FILE, AuthFileError, load_auth, save_auth
 from backend.infrastructure.backup import create_backup
 from backend.infrastructure.binding import load_binding
 from backend.infrastructure.database import (
-    DEFAULT_DATABASE, DEFAULT_BINDING, DatabaseError, DatabaseSettings, initialize_database, open_database, adopt_database, upgrade_database,
+    DEFAULT_BINDING,
+    DEFAULT_DATABASE,
+    DatabaseError,
+    DatabaseSettings,
     absolute_path,
+    adopt_database,
+    initialize_database,
+    inspect_database,
+    read_identity,
+    upgrade_database,
 )
 
 
 def _identity_args(parser: argparse.ArgumentParser, *, local: bool = False) -> None:
     parser.add_argument('--database', type=Path, required=local, default=None)
-    parser.add_argument('--uuid', required=local)
-    parser.add_argument('--generation', required=local, type=int)
+    # Formal commands read both from the published binding; a local sandbox derives them
+    # from its own file. `adopt-database` still demands all three explicitly.
+    parser.add_argument('--uuid', default=None)
+    parser.add_argument('--generation', default=None, type=int)
     if local:
         parser.add_argument('--official-database', type=Path)
         parser.add_argument('--writable-sandbox', action='store_true')
+
+
+def _sandbox_identity(path: Path) -> tuple[str, int]:
+    """Read the sandbox's own identity; a standalone database needs no formal ledger."""
+    if not path.is_file():
+        raise DatabaseError(f'{path} does not exist; run init-database --role sandbox first')
+    try:
+        conn = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        raise DatabaseError(f'cannot open {path} read-only for identity check') from exc
+    try:
+        identity = read_identity(conn)
+    finally:
+        conn.close()
+    if identity.instance_role != 'sandbox':
+        raise DatabaseError('a writable local sandbox requires a sandbox-role database, '
+                            'never the formal ledger')
+    return identity.database_uuid, identity.generation
+
+
+def _local_settings(args: argparse.Namespace) -> DatabaseSettings:
+    """Build a local session; a standalone sandbox never needs the formal binding."""
+    try:
+        bound = load_binding(DEFAULT_BINDING)
+    except DatabaseError:
+        bound = None
+    path = absolute_path(args.database)
+    if bound is not None:
+        official = bound.path
+        if args.official_database is not None and absolute_path(args.official_database) != official:
+            raise DatabaseError('official path conflicts with binding')
+        uuid, generation = args.uuid or bound.uuid, args.generation or bound.generation
+    else:
+        # No formal ledger exists yet. Nothing about the sandbox depends on one: its
+        # identity comes from the sandbox file itself, and the default formal path is
+        # only compared with so the two can never be the same file.
+        official = absolute_path(args.official_database or DEFAULT_DATABASE)
+        if args.uuid is not None and args.generation is not None:
+            uuid, generation = args.uuid, args.generation
+        else:
+            uuid, generation = _sandbox_identity(path)
+    return DatabaseSettings(path=path, expected_uuid=uuid,
+                            generation=args.generation or generation, official_path=official,
+                            mode='local', writable_sandbox=args.writable_sandbox)
+
+
+def _server_settings(args: argparse.Namespace) -> DatabaseSettings:
+    binding = load_binding(DEFAULT_BINDING)
+    return DatabaseSettings(path=args.database or binding.path,
+                            expected_uuid=args.uuid if args.uuid is not None else binding.uuid,
+                            generation=args.generation if args.generation is not None else binding.generation,
+                            official_path=binding.path, mode='server')
 
 
 def main() -> int:
@@ -38,6 +103,19 @@ def main() -> int:
         serve.add_argument('--port', type=int, default=9091)
         serve.add_argument('--market-refresh-seconds', type=int, choices=range(10,301), default=20, metavar='10-300')
         serve.add_argument('--no-market-refresh', action='store_true', help='disable automatic network refresh')
+        serve.add_argument('--auth-file', type=Path, default=DEFAULT_AUTH_FILE)
+        serve.add_argument('--static-dir', type=Path, default=WEB_DIST,
+                           help='built browser application directory (default frontend/dist)')
+        serve.add_argument('--allow-missing-web-build', action='store_true',
+                           help='start the API only, reporting the missing browser build')
+    password = commands.add_parser('set-password', help='create or replace the local operator credential file')
+    password.add_argument('--auth-file', type=Path, default=DEFAULT_AUTH_FILE)
+    password.add_argument('--username', default='owner')
+    password.add_argument('--host', action='append', dest='hosts', metavar='HOST:PORT')
+    password.add_argument('--origin', action='append', dest='origins', metavar='SCHEME://HOST:PORT')
+    password.add_argument('--port', type=int, default=9091)
+    password.add_argument('--insecure-cookie', action='store_true',
+                          help='only for loopback testing without TLS')
     check = commands.add_parser('check-database', help='validate formal identity and writer access; no migration')
     _identity_args(check)
     backup = commands.add_parser('backup', help='create a new consistent formal database backup directory')
@@ -54,12 +132,25 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == 'client':
-            print('Client mode is browser-only; remote access is not implemented.', file=sys.stderr)
+            print('Client mode is browser-only; open the private HTTPS address of the formal '
+                  'service on the company machine.', file=sys.stderr)
             return 2
         if args.command == 'init-database':
             identity = initialize_database(args.database, role=args.role, confirm=args.confirm,
                                            official_path=args.official_database)
             print(json.dumps(asdict(identity)))
+            return 0
+        if args.command == 'set-password':
+            from backend.security.passwords import hash_password
+            password_value = getpass.getpass('Password: ')
+            if not password_value or password_value != getpass.getpass('Repeat: '):
+                raise AuthFileError('passwords do not match')
+            hosts = tuple(args.hosts) if args.hosts else (f'127.0.0.1:{args.port}', f'localhost:{args.port}')
+            save_auth(args.auth_file, AuthConfig(
+                username=args.username, password_hash=hash_password(password_value),
+                allowed_hosts=hosts, allowed_origins=tuple(args.origins or ()),
+                cookie_secure=not args.insecure_cookie))
+            print(f'credentials written to {args.auth_file}')
             return 0
         if args.command == 'adopt-database':
             if args.database is None or args.uuid is None or args.generation is None:
@@ -68,35 +159,41 @@ def main() -> int:
                                       expected_uuid=args.uuid, generation=args.generation)
             print(json.dumps(asdict(adopt_database(config, confirm=args.confirm))))
             return 0
-        binding = load_binding(DEFAULT_BINDING)
         local = args.command == 'local'
-        if local and args.official_database is not None and absolute_path(args.official_database) != binding.path:
-            raise DatabaseError('official path conflicts with binding')
-        config = DatabaseSettings(path=args.database or binding.path, expected_uuid=args.uuid if args.uuid is not None else binding.uuid,
-                                  generation=args.generation if args.generation is not None else binding.generation,
-                                  official_path=binding.path, mode='local' if local else 'server',
-                                  writable_sandbox=args.writable_sandbox if local else False)
+        config = _local_settings(args) if local else _server_settings(args)
         if args.command == 'upgrade-database':
             upgrade_database(config, args.destination, confirm=args.confirm)
             return 0
         if args.command == 'backup':
             print(create_backup(config, args.destination))
-        elif args.command == 'check-database':
-            with open_database(config) as db:
+            return 0
+        if args.command == 'check-database':
+            with inspect_database(config) as db:
                 print(json.dumps(asdict(db.identity)))
-        else:
-            import uvicorn
-            from backend.main import create_app
-            from backend.config import AppConfig
+            return 0
 
-            server = uvicorn.Server(uvicorn.Config(create_app(AppConfig(market_auto_refresh=not args.no_market_refresh,
-                                                   market_refresh_seconds=args.market_refresh_seconds), database=config), host='127.0.0.1',
-                                                   port=args.port, workers=1, lifespan='on'))
-            server.run()
-            return 0 if server.started else 1
-        return 0
-    except (DatabaseError, OSError, sqlite3.Error) as exc:
-        print(f'Database operation refused: {exc}', file=sys.stderr)
+        import uvicorn
+
+        from backend.main import create_app, web_root
+
+        auth = load_auth(args.auth_file)
+        root = web_root(args.static_dir)
+        if root is None and not args.allow_missing_web_build:
+            raise AuthFileError(f'built browser application missing at {args.static_dir}; '
+                                'run npm ci && npm run build in frontend/, or pass '
+                                '--allow-missing-web-build to serve the API alone')
+        settings = AppConfig(
+            market_auto_refresh=not args.no_market_refresh,
+            market_refresh_seconds=args.market_refresh_seconds,
+            static_dir=root, require_write_identity=True, auth=auth)
+        server = uvicorn.Server(uvicorn.Config(create_app(settings, database=config),
+                                               host='127.0.0.1', port=args.port, workers=1,
+                                               lifespan='on', proxy_headers=False,
+                                               server_header=False))
+        server.run()
+        return 0 if server.started else 1
+    except (DatabaseError, AuthFileError, OSError, sqlite3.Error) as exc:
+        print(f'Operation refused: {exc}', file=sys.stderr)
         return 1
 
 

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {api, ApiError, WriteAttempt, page, type Fact} from '../src/api/client.ts'
+import {api, ApiError, setGuard, WriteAttempt, page, type Fact} from '../src/api/client.ts'
 import {fen,money,shanghaiTime,yuan} from '../src/ui.ts'
-import {reconciliationForm,tradeForm,transferForm,accountForm} from '../src/forms.ts'
+import {dividendCorrectionForm,dividendForm,openingForm,quoteResolutionForm,reconciliationForm,tradeForm,transferForm,accountForm} from '../src/forms.ts'
 
 test('integer cents and unknown values are displayed without float accounting',()=>{
   assert.equal(fen('1990.01'),199001);assert.equal(fen('-10.05'),-1005);assert.throws(()=>fen('0.001'))
@@ -28,6 +28,46 @@ test('retry of ambiguous write preserves the request ID and exact payload',async
 test('known rejection does not leave a pending request',async()=>{
   const writer=new WriteAttempt(async()=>{throw new ApiError('conflict',false,409)},()=> 'key')
   await assert.rejects(writer.start('/trades',{}));assert.equal(writer.pending,null)
+})
+test('opening, dividend and quote resolution forms match the server contracts',()=>{
+  const accounts=[{id:'a',name:'证券',kind:'securities'}],instruments=[{id:'i',market:'SH',code:'510300'}]
+  const opening=openingForm(accounts,instruments).build({account_id:'a',instrument_id:'i',quantity:'300',cost:'3600.50',fees:'1.20',occurred_at:'2026-01-05T09:30',note:'期初'})
+  assert.deepEqual(opening,{account_id:'a',instrument_id:'i',quantity:300,cost_fen:360050,fees_fen:120,occurred_at:'2026-01-05T09:30:00+08:00',note:'期初'})
+  assert.throws(()=>openingForm(accounts,instruments).build({account_id:'a',instrument_id:'i',quantity:'1.5',cost:'1',fees:'0',occurred_at:'2026-01-05T09:30',note:'n'}))
+  const dividend=dividendForm(accounts,instruments).build({account_id:'a',instrument_id:'i',amount:'88.88',occurred_at:'2026-01-06T10:00',note:'到账'})
+  assert.equal(dividend.kind,'dividend');assert.equal(dividend.amount_fen,8888)
+  const correction=dividendCorrectionForm({id:'event 1',amount_fen:8888,note:'原'}).build({amount:'99.50',occurred_at:'2026-01-06T11:00',note:'更正'})
+  assert.deepEqual(correction,{amount_fen:9950,occurred_at:'2026-01-06T11:00:00+08:00',note:'更正'})
+  const resolution=quoteResolutionForm({id:'q1',price:'4.1000',source:'交易所',trading_day:'2026-01-06',observed_at:'2026-01-06T15:00:00+08:00'},7).build({reason:'以交易所公告为准'})
+  assert.deepEqual(resolution,{selected_quote_id:'q1',expected_quote_revision:7,reason:'以交易所公告为准'})
+})
+test('an unconfirmed write survives a page reload with the same request ID',async()=>{
+  const reloaded=new WriteAttempt(async()=>{throw new ApiError('timeout',true)},()=> 'reload-key')
+  await assert.rejects(reloaded.start('/cash',{amount_fen:1}))
+  // A fresh module instance models the browser reload: pending must be restored, not regenerated.
+  const after=new WriteAttempt(async(_p,_m,b)=>({id:'restored',request_id:b?.request_id}),()=> 'should-never-be-used')
+  assert.equal(after.requestId,'reload-key')
+  const result=await after.retry()
+  assert.equal(result.id,'restored');assert.equal(result.request_id,'reload-key');assert.equal(after.pending,null)
+})
+test('a changed database identity blocks retrying the previous request',async()=>{
+  setGuard(()=>({identity:['00000000-0000-4000-8000-000000000001',1]}))
+  const writer=new WriteAttempt(async()=>{throw new ApiError('timeout',true)},()=> 'identity-key')
+  await assert.rejects(writer.start('/cash',{amount_fen:1}))
+  setGuard(()=>({identity:['00000000-0000-4000-8000-000000000002',1]}))
+  await assert.rejects(writer.retry(),(e:unknown)=>e instanceof ApiError&&e.code==='identity_changed')
+  assert.notEqual(writer.pending,null)
+  writer.discard();setGuard(()=>({}))
+})
+test('a request already in the ledger is reported instead of being posted again',async()=>{
+  let posted=0
+  const writer=new WriteAttempt(async(_p,m)=>{if(m==='GET')return {committed:true};posted++;throw new ApiError('timeout',true)},()=> 'committed-key')
+  await assert.rejects(writer.start('/cash',{amount_fen:1}))
+  const state=await writer.check()
+  assert.equal(state.committed,true)
+  assert.equal(posted,1)
+  // The page must offer the committed result, not a second POST of the same request.
+  writer.discard();assert.equal(writer.pending,null)
 })
 test('list boundary validates revision and pagination',()=>{
   assert.deepEqual(page({items:[{id:'one'}],ledger_revision:1,total:1,limit:50,offset:0}).items,[{id:'one'}])

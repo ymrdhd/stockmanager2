@@ -25,3 +25,21 @@ UUID 和 generation 只能识别版本，**不能远程阻止失联旧机器写�
 ## 5. 发布与维护证据
 
 发布包与审查包分离：发布包含锁定依赖、构建好的前端、启动/升级/回滚文档，不包含真实 DB、密钥或个人资料。发布候选先在测试库跑完整关卡；真实迁移只在用户确认后执行。保留版本 tag、构建哈希、测试和迁移核对结果。现场双机、IT 授权、真实数据迁移和恢复演练未执行时标记 NOT RUN/BLOCKED，不称正式上线。每次升级前重复备份与预演，定期恢复演练。默认本地服务可用性不承诺 24/7；断电/断网依赖主机恢复。
+
+## 6. 07-remote 实际启动与远程访问步骤
+
+以下命令已在本机实现并实测（Windows 11、Python 3.11、Node 24）；Tailscale 双机接入与公司 IT 授权尚未执行，标记 NOT RUN。
+
+安装（仅公司电脑，一次）：`uv sync --locked` → `cd frontend && npm ci && npm run build && cd ..`。
+
+初始化正式库并设置凭据（一次，凭据按需轮换）：`python start.py init-database --database <绝对路径>\data\official.sqlite --confirm`，再 `python start.py set-password --host 127.0.0.1:9091 --host <机器名>.<tailnet>.ts.net`（密码经 getpass 交互输入，只存 scrypt 哈希到 `data/auth.json`，文件权限 0600，不入包不入库）。**Host 必须写成浏览器实际发出的值**：经 Tailscale Serve 的 HTTPS 走 443，浏览器 Host 头不带端口，因此登记 `<机器名>.<tailnet>.ts.net`，不要写 `<主机名>:9091` 或 `<主机名>:443`；只有确实以非默认端口访问时才登记 `主机名:端口`。不使用通配符放行。
+
+启动正式服务：`python start.py server`（等价 `--port 9091`，实际监听 127.0.0.1:9091，同时提供已构建的 Vue 与 `/api/v1`）。自检：`python start.py check-database`（只读诊断，可在服务运行时执行，不抢写锁）。停止：Ctrl+C 或结束进程；写锁由操作系统释放，**不要删除 `*.writer.lock` 作为常规故障处理**。缺少前端构建产物时启动会明确报错，只有显式 `--allow-missing-web-build` 才允许仅提供 API。
+
+家用机访问：安装 Tailscale 并加入同一 tailnet，在**公司电脑**上执行 `tailscale serve --bg --https=443 http://127.0.0.1:9091`，把 loopback 服务以私网 HTTPS 暴露给 tailnet 内设备；家用机浏览器打开 `https://<机器名>.<tailnet>.ts.net/`（`tailscale serve status` 会打印确切地址，以它为准）。要求：不用 Funnel、不做公网端口映射、不共享 SQLite 文件。`allowed_hosts` 只登记上一步实际出现的主机名，`allowed_origins` 仅在确有跨源需求时追加同源 HTTPS 地址（形如 `https://<机器名>.<tailnet>.ts.net`，不带结尾斜杠）。服务端只信 Host/Origin 头本身并逐请求比对白名单，**不采信 `X-Forwarded-Host`、`X-Forwarded-Proto`、`X-Real-IP` 等可伪造的代理身份头**。HTTPS 下保持 `cookie_secure` 默认 true；本地 HTTP 调试才用 `--insecure-cookie`，且该会话不得用于远程。
+
+Windows 开机启动（任务计划程序，不是无条件建库）：触发器「用户登录时」，操作 `python.exe`，参数 `<安装目录>\start.py server`，起始位置填安装目录，勾选「不管用户是否登录都要运行」之外的默认选项即可；同一数据库只允许一个写实例，第二个实例启动会被文件锁拒绝并退出。
+
+本地沙盒模式（全新安装、无正式绑定时）：`python start.py init-database --database <绝对路径>\data\sandbox.sqlite --role sandbox --confirm`，再 `python start.py local --database <...> --uuid <上一步输出的 UUID> --generation 1 --writable-sandbox`。沙盒有独立 UUID、界面标识为「可写沙盒」，不与正式库合并；打开正式库本体或其同 inode 别名会被拒绝。
+
+发布阻断项（未解决）：公司 IT 授权、Tailscale 双机实测、ISS-019 日历期限、ISS-021 V9/G2、ISS-022 真实行情连通性。

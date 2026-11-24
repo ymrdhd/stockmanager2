@@ -14,7 +14,7 @@ from sqlalchemy.engine import URL
 from backend.infrastructure import database
 from backend.infrastructure.backup import create_backup
 from backend.infrastructure.binding import Binding, publish_binding
-from backend.infrastructure.database import (DatabaseError, DatabaseSettings, Identity, adopt_database,
+from backend.infrastructure.database import (REVISION, SCHEMA_VERSION, DatabaseError, DatabaseSettings, Identity, adopt_database,
     initialize_database, migrate_schema, open_database, upgrade_database)
 from test_database import isolated_install
 
@@ -105,8 +105,8 @@ def test_upgrade_0001_to_latest_with_backup(tmp_path):
     dest=tmp_path/'pre-upgrade'
     upgrade_database(cfg,dest,confirm=True)
     with open_database(cfg) as db,db.read() as c:
-        assert db.identity.schema_version==7
-        assert c.execute('SELECT version_num FROM alembic_version').fetchone()==('0007',)
+        assert db.identity.schema_version==SCHEMA_VERSION
+        assert c.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
         assert c.execute('SELECT * FROM original').fetchall()==[(42,)]
         assert c.execute('SELECT ledger_revision FROM ledger_state').fetchone()==(0,)
         assert c.execute('PRAGMA integrity_check').fetchall()==[('ok',)]
@@ -159,5 +159,5 @@ def test_explicit_cli_upgrade_and_maintenance_lock(tmp_path):
         assert not dest.exists()
     subprocess.run(cmd+['upgrade-database','--confirm','--destination',str(dest)],capture_output=True,text=True,check=True,timeout=10)
     result=subprocess.run(cmd+['check-database'],capture_output=True,text=True,check=True,timeout=10)
-    assert json.loads(result.stdout)['schema_version']==7
+    assert json.loads(result.stdout)['schema_version']==SCHEMA_VERSION
     assert (dest/'manifest.json').exists()

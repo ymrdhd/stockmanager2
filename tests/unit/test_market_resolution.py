@@ -16,7 +16,7 @@ from backend.application.portfolio import PortfolioService, QuoteInput, QuoteRes
 from backend.application.trading.service import AccountInput, InstrumentInput, Conflict, TradeService, utc
 from backend.config import AppConfig
 from backend.infrastructure import database
-from backend.infrastructure.database import Identity, adopt_database, migrate_schema, open_database, upgrade_database
+from backend.infrastructure.database import REVISION, Identity, adopt_database, migrate_schema, open_database, upgrade_database
 from backend.main import create_app
 from test_database_upgrade import cfg_for
 from test_pnl import at, cash
@@ -177,7 +177,7 @@ def test_0004_to_0005_preserves_conflict_and_backup(tmp_path):
     with open_database(settings) as db,db.read() as conn:
         assert conn.execute('SELECT * FROM quotes ORDER BY quote_revision').fetchall()==before
         assert conn.execute('SELECT * FROM quote_resolutions').fetchall()==[]
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==('0007',)
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
         assert conn.execute('PRAGMA integrity_check').fetchone()==('ok',)
         assert conn.execute('PRAGMA foreign_key_check').fetchall()==[]
         assert PortfolioService(db).current_price('i',at(6))['quality']=='conflict'

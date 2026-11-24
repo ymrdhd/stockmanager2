@@ -20,7 +20,7 @@ from backend.application.trading.service import InstrumentInput, TradeError, Tra
 from backend.config import AppConfig
 from backend.infrastructure import database
 from backend.infrastructure.database import (
-    DatabaseError, Identity, adopt_database, initialize_database, migrate_schema, open_database, upgrade_database,
+    DatabaseError, Identity, REVISION, adopt_database, initialize_database, migrate_schema, open_database, upgrade_database,
 )
 from backend.infrastructure.market.eastmoney import EastmoneyProvider, MarketDataError
 from backend.main import create_app
@@ -282,7 +282,7 @@ def test_0003_to_0004_real_upgrade_and_legacy_availability(tmp_path):
     with open_database(cfg) as db,db.read() as conn:
         assert conn.execute('SELECT * FROM quotes ORDER BY quote_revision').fetchall()==[
             before[0]+(utc(at(5)),None,'unadjusted_security'),before[1]+(None,None,'unadjusted_security')]
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==('0007',)
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
         assert conn.execute('PRAGMA integrity_check').fetchone()==('ok',)
         assert conn.execute('PRAGMA foreign_key_check').fetchall()==[]
         p=PortfolioService(db)

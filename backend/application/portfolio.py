@@ -405,20 +405,95 @@ class PortfolioService:
                     'quote':q, 'quality':quality, 'market_phase':window.phase if window else 'unknown'}
 
     def strategy_evidence(self, account: str, as_of: datetime) -> dict:
-        """Expose recorded batch facts, not invented strategy decisions."""
+        """Attach each real strategy batch to the recorded V9/G2 decision it came from.
+
+        The ledger stays authoritative: a batch is only 'verified' when the frozen ATR,
+        the signal date and a matching recorded strategy position exist. Nothing here
+        invents a decision, a stop level or a signal date for a legacy batch.
+        """
         cutoff = self._cutoff(as_of)
         with self.db.read() as conn:
             require_account(conn,account,securities=True,at=cutoff)
             versions = {**one(conn,'SELECT ledger_revision FROM ledger_state'),
                         **one(conn,'SELECT quote_revision FROM quote_state')}
-            items = [dict(lot, evidence_status='unverified',
-                          reason_codes=['verified_legacy_rule_source_missing'] +
-                          (['frozen_atr_or_signal_date_missing'] if lot['frozen_atr'] is None or lot['signal_date'] is None else []))
-                     for lot in self._lots(conn, account, cutoff)
-                     if lot['lot_role'] in ('main','sub')]
-            return {**versions,'account_id':account,'as_of':cutoff,'status':'unavailable',
-                    'reason_codes':['verified_legacy_rule_source_missing'],
-                    'items':items}
+            lots = [lot for lot in self._lots(conn, account, cutoff)
+                    if lot['lot_role'] in ('main','sub')]
+            positions = self._strategy_positions(conn, account, cutoff)
+            codes = {row['id']: row['code'] for row in
+                     rows(conn,'SELECT id,code FROM instruments')}
+            items, reasons = self._evidence_items(lots, positions, codes, cutoff)
+            return {**versions,'account_id':account,'as_of':cutoff,
+                    'status':self._evidence_status(items),'reason_codes':reasons,
+                    'items':items,
+                    'note':'策略证据只说明该批次来自哪一条已记录的 V9/G2 决策；成交、数量与现金仍以账本为准。'}
+
+    @staticmethod
+    def _strategy_positions(conn: sqlite3.Connection, account: str, cutoff: str) -> dict:
+        """Index recorded strategy positions by (index_id, signal_date)."""
+        try:
+            found = rows(conn,
+                'SELECT index_id,signal_date,entry_date,entry_price,stop_price,trail_trigger,'
+                'stage,highest_price,holding_days,exit_after_bars,renewals,e2a_extended_days,'
+                'extended,add_executed,exit_filled,closed_date,last_exit_action,last_exit_reason,'
+                'pending_stop,pending_stop_effective_date,execution_source '
+                'FROM strategy_positions WHERE account_id=?',(account,))
+        except sqlite3.OperationalError:
+            # A database below schema 8 has no strategy evidence table at all.
+            return {}
+        return {(row['index_id'],str(row['signal_date'])[:10]): row for row in found}
+
+    @staticmethod
+    def _evidence_items(lots: list[dict], positions: dict, codes: dict, cutoff: str):
+        from backend.domain.strategy.symbols import IndexCodeError, index_for_etf
+
+        items, reasons = [], set()
+        for lot in lots:
+            code = codes.get(lot['instrument_id'])
+            try:
+                index_id = index_for_etf(code) if code else None
+            except IndexCodeError:
+                index_id = None
+            signal_date = str(lot['signal_date'])[:10] if lot['signal_date'] else None
+            record = positions.get((index_id,signal_date)) if index_id and signal_date else None
+            codes_out = list(lot.get('reason_codes', []))
+            if lot['frozen_atr'] is None or signal_date is None:
+                status, codes_out = 'unverified', codes_out + ['frozen_atr_or_signal_date_missing']
+            elif index_id is None:
+                status, codes_out = 'unverified', codes_out + ['security_is_not_a_configured_etf']
+            elif record is None:
+                status, codes_out = 'unverified', codes_out + ['strategy_position_not_recorded']
+            else:
+                status = 'verified'
+            reasons.update(codes_out)
+            items.append({**lot,'instrument_code':code,'index_id':index_id,
+                          'evidence_status':status,'reason_codes':codes_out,
+                          'strategy':None if record is None else {
+                              'entry_date':record['entry_date'],'entry_price':record['entry_price'],
+                              'stop_price':record['stop_price'],'trail_trigger':record['trail_trigger'],
+                              'stage':record['stage'],'highest_price':record['highest_price'],
+                              'holding_days':record['holding_days'],
+                              'exit_after_bars':record['exit_after_bars'],
+                              'renewals':record['renewals'],
+                              'e2a_extended_days':record['e2a_extended_days'],
+                              'extended':bool(record['extended']),
+                              'add_executed':bool(record['add_executed']),
+                              'exit_filled':bool(record['exit_filled']),
+                              'closed_date':record['closed_date'],
+                              'last_exit_action':record['last_exit_action'],
+                              'last_exit_reason':record['last_exit_reason'],
+                              'pending_stop':record['pending_stop'],
+                              'pending_stop_effective_date':record['pending_stop_effective_date'],
+                              'execution_source':record['execution_source']}})
+        return items, sorted(reasons)
+
+    @staticmethod
+    def _evidence_status(items: list[dict]) -> str:
+        if not items:
+            return 'valid'
+        marks = {item['evidence_status'] for item in items}
+        if marks == {'verified'}:
+            return 'verified'
+        return 'partial' if 'verified' in marks or 'partial' in marks else 'unavailable'
 
     def valuation(self, account: str, as_of: datetime, previous_trading_day: date | None = None,
                   quote_revision: int | None = None) -> dict:

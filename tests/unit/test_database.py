@@ -22,6 +22,8 @@ from backend.infrastructure.database import (
     DatabaseError,
     DatabaseSettings,
     Identity,
+    REVISION,
+    SCHEMA_VERSION,
     initialize_database,
     open_database,
     migrate_schema,
@@ -51,8 +53,8 @@ def test_db01_init(formal: tuple[Path, Identity]) -> None:
         assert conn.execute('PRAGMA journal_mode').fetchone() == ('wal',)
         assert conn.execute('PRAGMA foreign_keys').fetchone() == (1,)
         assert conn.execute('PRAGMA busy_timeout').fetchone() == (5000,)
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone() == ('0007',)
-        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'system_metadata', 'alembic_version', 'accounts', 'instruments', 'trade_executions', 'trade_lots', 'lot_allocations', 'cash_movements', 'audit_events', 'ledger_state', 'ledger_requests', 'opening_positions', 'company_events', 'quotes', 'quote_state', 'quote_resolutions', 'finance_categories', 'finance_transactions', 'finance_transfers', 'balance_adjustments', 'account_scope_events', 'transfer_reconciliation_gaps'}
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone() == (REVISION,)
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'system_metadata', 'alembic_version', 'accounts', 'instruments', 'trade_executions', 'trade_lots', 'lot_allocations', 'cash_movements', 'audit_events', 'ledger_state', 'ledger_requests', 'opening_positions', 'company_events', 'quotes', 'quote_state', 'quote_resolutions', 'finance_categories', 'finance_transactions', 'finance_transfers', 'balance_adjustments', 'account_scope_events', 'transfer_reconciliation_gaps', 'strategy_bars', 'strategy_signals', 'strategy_plans', 'strategy_positions', 'strategy_cooldowns', 'strategy_ndx_aux'}
 
 
 def test_db02_no_overwrite(formal: tuple[Path, Identity], tmp_path: Path) -> None:
@@ -224,7 +226,7 @@ def test_i06_online_backup(formal: tuple[Path, Identity], tmp_path: Path) -> Non
     snapshot = target / 'database.sqlite'
     assert manifest['sha256'] == hashlib.sha256(snapshot.read_bytes()).hexdigest()
     assert manifest['database_uuid'] == identity.database_uuid and manifest['generation'] == 1
-    assert manifest['schema_version'] == 7 and manifest['backup_at']
+    assert manifest['schema_version'] == SCHEMA_VERSION and manifest['backup_at']
     assert manifest['instance_role'] == 'backup' and manifest['source_instance_role'] == 'formal'
     with pytest.raises(DatabaseError), open_database(DatabaseSettings(path=snapshot, official_path=snapshot, expected_uuid=identity.database_uuid, generation=1, binding_path=path.parent / 'official.json')):
         pytest.fail('backup accepted as formal writer')
@@ -289,6 +291,20 @@ def test_i06_failed_backup_preserves_existing(formal: tuple[Path, Identity], tmp
     assert {file.name: file.read_bytes() for file in good.iterdir()} == before
 
 
+def auth_file(install: Path, *, host: str) -> Path:
+    """A real credential file is mandatory now; tests derive it, never a default."""
+    from backend.security.passwords import hash_password
+    file = install / 'data' / 'auth.json'
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(json.dumps({
+        'username': 'owner',
+        'password_hash': hash_password('test-only-password', salt=b'0' * 16),
+        'allowed_hosts': [host], 'allowed_origins': [],
+        'session_ttl_seconds': 3600, 'cookie_secure': False,
+    }), encoding='utf-8')
+    return file
+
+
 def test_server_real_http_and_second_instance(formal: tuple[Path, Identity]) -> None:
     path, identity = formal
     with socket.socket() as listener:
@@ -297,8 +313,10 @@ def test_server_real_http_and_second_instance(formal: tuple[Path, Identity]) -> 
     install = isolated_install(path.parent)
     (install / 'data').mkdir()
     shutil.copy2(path.parent / 'official.json', install / 'data' / 'official.json')
+    auth_file(install, host=f'127.0.0.1:{port}')
     cmd = [sys.executable, str(install / 'start.py'), 'server', '--database', str(path),
-           '--uuid', identity.database_uuid, '--generation', '1', '--port', str(port)]
+           '--uuid', identity.database_uuid, '--generation', '1', '--port', str(port),
+           '--allow-missing-web-build']
     first = subprocess.Popen(cmd, cwd=path.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         for _ in range(100):
@@ -313,6 +331,10 @@ def test_server_real_http_and_second_instance(formal: tuple[Path, Identity]) -> 
                 time.sleep(0.1)
         else:
             pytest.fail('server did not start')
+        # Business data stays closed to a client that never authenticated.
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f'http://127.0.0.1:{port}/api/v1/system/status', timeout=1)
+        assert refused.value.code == 401
         second = subprocess.run(cmd, cwd=path.parent, capture_output=True, text=True, timeout=10)
         assert second.returncode != 0 and 'writer lock unavailable' in second.stderr
     finally:

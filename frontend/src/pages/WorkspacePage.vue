@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import {computed, onMounted, onBeforeUnmount, ref} from 'vue'
-import {api, fact, facts, page, str, WriteAttempt, type Fact} from '../api/client'
+import {api, ApiError, fact, facts, page, str, WriteAttempt, type Fact} from '../api/client'
 import {getHealth, type HealthState} from '../api/health'
-import {display, money, shanghaiTime, type FormSpec} from '../ui'
+import * as session from '../api/session'
+import {display, localTime, money, shanghaiTime, type FormSpec} from '../ui'
 import * as forms from '../forms'
 import OperationForm from '../components/OperationForm.vue'
 import RecordTable from '../components/RecordTable.vue'
@@ -13,18 +14,32 @@ const tab=ref<typeof tabs[number]>('总览')
 const health=ref<HealthState>({kind:'checking'}), system=ref<Fact|null>(null), overview=ref<Fact|null>(null), market=ref<Fact|null>(null)
 const accounts=ref<Fact[]>([]), instruments=ref<Fact[]>([]), categories=ref<Fact[]>([]), lots=ref<Fact[]>([])
 const valuation=ref<Fact|null>(null), strategy=ref<Fact|null>(null), month=ref<Fact|null>(null), historical=ref<Fact|null>(null)
+const pool=ref<Fact|null>(null), positionsView=ref<Fact|null>(null), strategyError=ref(''), strategyLoading=ref(false)
 const selectedAccount=ref(''), asOf=ref(''), period=ref(''), historyTime=ref('')
-const error=ref(''), readError=ref(''), feedback=ref(''), busy=ref(false), loading=ref(false), retryPending=ref(false)
+const error=ref(''), readError=ref(''), feedback=ref(''), busy=ref(false), loading=ref(false)
+const retryPending=ref(false), pendingCorrupt=ref(false), storageError=ref('')
 const spec=ref<FormSpec|null>(null), formKey=ref(0), refresh=ref(0)
+const signIn=ref(false), userName=ref(''), userPassword=ref(''), authState=ref(''), sessionName=ref('')
+const quoteInstrument=ref(''), quoteEvidence=ref<Fact|null>(null), quoteError=ref('')
 const writer=new WriteAttempt()
-let active=true, sequence=0, valuationSequence=0
+let active=true, sequence=0, valuationSequence=0, quoteSequence=0, poolSequence=0
 let pendingIdentity: string|null=null, formIdentity: string|null=null
+/** Any unconfirmed (or unreadable) write blocks every new business write, in every tab. */
+const blocked=computed(()=>retryPending.value||pendingCorrupt.value)
 function identityKey(status:Fact): string {
   if(!status.identity||!status.writable)throw new Error('当前没有已验证的可写数据库')
   const i=fact(status.identity)
   return JSON.stringify([status.mode,i.database_uuid,i.generation,i.schema_version])
 }
-const writable=computed(()=>health.value.kind==='connected'&&system.value?.writable===true&&overview.value!==null&&!busy.value&&!retryPending.value&&!loading.value)
+/** Never throw while polling: an unverified status can simply be re-read later. */
+function safeKey(status:Fact|null): string {try{return status?identityKey(status):''}catch{return ''}}
+function syncPending() {
+  retryPending.value=writer.pending!==null
+  pendingCorrupt.value=writer.corrupt
+  storageError.value=writer.storageError
+  if(!writer.pending&&!writer.corrupt)pendingIdentity=null
+}
+const writable=computed(()=>health.value.kind==='connected'&&system.value?.writable===true&&overview.value!==null&&!busy.value&&!blocked.value&&!loading.value)
 const securities=computed(()=>accounts.value.filter(a=>a.kind==='securities'))
 const accountRows=computed(()=>overview.value?facts(overview.value.accounts):[])
 const overviewMonth=computed(()=>overview.value?fact(overview.value.finance_month):null)
@@ -52,23 +67,49 @@ async function loadMaster(path:string):Promise<Fact[]> {
 async function reload() {
   const token=++sequence;loading.value=true;readError.value='';valuation.value=null;strategy.value=null;month.value=null;historical.value=null
   system.value=null;overview.value=null;market.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[]
+  session.forgetIdentity()
   try {
     const h=await getHealth();if(!active||token!==sequence)return;health.value=h
     if(h.kind!=='connected')throw new Error('后端连接失败；未切换数据库，旧数据不再显示为当前值。')
     const status=await api('/system/status');if(!active||token!==sequence)return;system.value=status
+    session.declare(status)
     if(status.mode==='development'){readError.value='开发健康模式，无业务数据库。请通过正式或隔离沙盒启动。';return}
     const [o,m,a,i,c,l]=await Promise.all([api('/finance/overview'),api('/market/status'),loadMaster('/accounts'),loadMaster('/instruments'),loadMaster('/finance/categories'),loadMaster('/lots')])
     if(!active||token!==sequence)return
     overview.value=o;market.value=m;accounts.value=a;instruments.value=i;categories.value=c;lots.value=l
     if(!securities.value.some(a=>a.id===selectedAccount.value))selectedAccount.value=str(securities.value[0]?.id)
+    if(!instruments.value.some(x=>x.id===quoteInstrument.value))quoteInstrument.value=str(instruments.value[0]?.id)
     refresh.value++
     if(selectedAccount.value)await loadInvestment()
     await loadMonth()
-  } catch(e) {if(active&&token===sequence)readError.value=String(e)}
+  } catch(e) {if(active&&token===sequence)handleRead(e)}
   finally {if(active&&token===sequence)loading.value=false}
 }
-async function loadInvestment(){
-  const token=++valuationSequence;valuation.value=null;strategy.value=null
+/** A rejected session must ask for credentials again instead of showing stale data. */
+function handleRead(e:unknown) {
+  readError.value=String(e)
+  if(e instanceof ApiError&&e.status===401){signIn.value=true;sessionName.value='';readError.value='会话已过期或被撤销，请重新登录。';forget()}
+}
+function forget() {system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
+async function signInSubmit() {
+  if(busy.value)return
+  error.value='';authState.value='正在登录…';busy.value=true
+  try {
+    const value=await session.login(userName.value.trim(),userPassword.value)
+    sessionName.value=value.username;signIn.value=false;userPassword.value='';authState.value=''
+    await reload()
+  } catch(e) {authState.value=String(e);error.value=String(e)}
+  finally {busy.value=false}
+}
+async function signOut() {
+  busy.value=true
+  try {await session.logout()} catch{} 
+  finally {sessionName.value='';forget();signIn.value=true;busy.value=false;readError.value='已退出登录。'}
+}
+async function loadInvestment(){await refreshInvestment(false)}
+async function refreshInvestment(quiet:boolean){
+  const token=++valuationSequence
+  if(!quiet){valuation.value=null;strategy.value=null}
   if(!selectedAccount.value)return
   try {
     const time=asOf.value?shanghaiTime(asOf.value):new Date().toISOString()
@@ -76,6 +117,16 @@ async function loadInvestment(){
     const [v,s]=await Promise.all([api(`/portfolio/${id}${query}`),api(`/strategy/evidence/${id}${query}`)])
     if(active&&token===valuationSequence){valuation.value=v;strategy.value=s}
   }catch(e){if(active&&token===valuationSequence)readError.value=String(e)}
+}
+async function loadQuotes() {
+  quoteError.value='';quoteEvidence.value=null
+  if(!quoteInstrument.value){quoteError.value='请选择证券标的';return}
+  const token=++quoteSequence
+  try {
+    const as_of=encodeURIComponent(new Date().toISOString())
+    const r=await api(`/quotes/${encodeURIComponent(quoteInstrument.value)}?as_of=${as_of}`)
+    if(active&&token===quoteSequence)quoteEvidence.value=r
+  }catch(e){if(active&&token===quoteSequence)quoteError.value=String(e)}
 }
 async function loadMonth(){month.value=null;try{month.value=await api('/finance/month'+(period.value?`?period=${encodeURIComponent(period.value)}`:''))}catch(e){readError.value=String(e)}}
 async function loadHistory(){historical.value=null;try{if(!historyTime.value)throw new Error('请选择历史估值时间');historical.value=await api(`/finance/overview?as_of=${encodeURIComponent(shanghaiTime(historyTime.value))}`)}catch(e){readError.value=String(e)}}
@@ -86,29 +137,210 @@ async function submit(values:Record<string,string>) {
   try{body=spec.value.build(values)}catch(e){error.value=String(e);return}
   if(!window.confirm(`${spec.value.title}\n${spec.value.confirm??'请核对真实事实及金额。'}\n确定提交？`))return
   busy.value=true
-  try{const expected=identityKey(system.value??{});const checked=await api('/system/status');if(expected!==formIdentity||identityKey(checked)!==expected)throw new Error('数据库身份已变化，拒绝提交；请重新读取并重新打开表单');pendingIdentity=expected;await writer.start(spec.value.path,body,spec.value.method);feedback.value='提交已确认。正在重新读取实际账本。';spec.value=null;await reload()}
-  catch(e){error.value=String(e)}finally{retryPending.value=writer.pending!==null;if(!writer.pending)pendingIdentity=null;busy.value=false}
+  try{const expected=identityKey(system.value??{});const checked=await api('/system/status');if(expected!==formIdentity||identityKey(checked)!==expected)throw new Error('数据库身份已变化，拒绝提交；请重新读取并重新打开表单');session.declare(checked);pendingIdentity=expected;await writer.start(spec.value.path,body,spec.value.method);feedback.value='提交已确认。正在重新读取实际账本。';spec.value=null;await reload()}
+  catch(e){error.value=String(e)}finally{syncPending();busy.value=false}
 }
-async function retry(){if(busy.value||!writer.pending)return;busy.value=true;error.value='';try{const checked=await api('/system/status');if(identityKey(checked)!==pendingIdentity)throw new Error('数据库身份与原请求不一致，禁止跨库重试');await writer.retry();feedback.value='原请求已确认；未重复提交新请求。';spec.value=null;await reload()}catch(e){error.value=String(e)}finally{retryPending.value=writer.pending!==null;if(!writer.pending)pendingIdentity=null;busy.value=false}}
+/**
+ * Resolve an unconfirmed write: ask the server about the original request ID first,
+ * then resend the identical payload. The record is only cleared once the ledger
+ * definitively answered; a rejected retry never erases the evidence of a write that
+ * may already have committed.
+ */
+async function retry(){
+  if(busy.value||!writer.pending)return
+  busy.value=true;error.value='';feedback.value=''
+  const requestId=writer.requestId
+  try{
+    const checked=await api('/system/status')
+    session.declare(checked)
+    if(pendingIdentity!==null&&safeKey(checked)!==pendingIdentity)throw new Error('数据库身份与原请求不一致，禁止跨库重试')
+    const state=await writer.check()
+    if(state.committed===true){
+      writer.discard();spec.value=null
+      feedback.value=`原请求 ${requestId} 已在账本中入账，未生成新请求。已按实际账本重新读取。`
+      await reload();return
+    }
+    await writer.retry();feedback.value=`原请求 ${requestId} 尚未入账，已用同一请求 ID 与相同内容重新提交。`;spec.value=null;await reload()
+  }catch(e){error.value=String(e)}
+  finally{syncPending();busy.value=false}
+}
+/** Abandoning an unconfirmed write is an explicit operator decision, never automatic. */
+function discardPending(){
+  if(busy.value||!writer.pending)return
+  if(!window.confirm('放弃这条待确认写入？之后再提交将生成新的请求 ID，可能与已入账记录重复。请先核对服务器账本中是否存在该请求编号。'))return
+  const requestId=writer.requestId
+  writer.discard();syncPending();spec.value=null
+  feedback.value=`已放弃待确认写入 ${requestId}。原请求仍可能已入账，请按该请求编号核对成交历史。`
+}
+/** Only after the operator has reconciled the ledger by hand may an unreadable record go away. */
+function clearCorruptPending(){
+  if(busy.value||!writer.corrupt)return
+  if(!window.confirm('确认已按成交历史人工核对过账本？清除后本机不再保留该待核实记录。'))return
+  writer.clearCorrupt();syncPending()
+  feedback.value='已清除无法解析的待核实记录。请按成交历史继续人工核对。'
+}
+async function refreshStrategy(){
+  if(strategyLoading.value)return
+  strategyError.value='';strategyLoading.value=true
+  const token=++poolSequence
+  try{
+    if(!selectedAccount.value)throw new Error('请先选择证券账户')
+    const id=encodeURIComponent(selectedAccount.value)
+    const [p,pos]=await Promise.all([api(`/strategy/pool/${id}`),api(`/strategy/positions/${id}`)])
+    if(active&&token===poolSequence){pool.value=p;positionsView.value=pos}
+  }catch(e){if(active&&token===poolSequence){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
+  finally{if(active&&token===poolSequence)strategyLoading.value=false}
+}
 async function refreshMarket(){if(!writable.value)return;busy.value=true;error.value='';feedback.value='';try{const r=await api('/market/refresh','POST');feedback.value=`实际行情刷新结果：${JSON.stringify(r)}`;await reload()}catch(e){error.value=String(e)}finally{busy.value=false}}
-function beforeUnload(e:BeforeUnloadEvent){if(writer.pending||busy.value){e.preventDefault();e.returnValue=''}}
+function beforeUnload(e:BeforeUnloadEvent){if(writer.pending||writer.corrupt||busy.value){e.preventDefault();e.returnValue=''}}
 let timer:ReturnType<typeof setInterval>|undefined
-onMounted(()=>{void reload();window.addEventListener('beforeunload',beforeUnload);timer=setInterval(async()=>{if(busy.value||loading.value)return;const h=await getHealth();if(!active)return;if(h.kind!=='connected'){health.value=h;system.value=null;overview.value=null;valuation.value=null;market.value=null;month.value=null;historical.value=null;readError.value='后端连接失败；请恢复连接后重新读取。'}else if(health.value.kind!=='connected'){health.value=h;await reload()}},10000)})
-onBeforeUnmount(()=>{active=false;sequence++;valuationSequence++;if(timer)clearInterval(timer);window.removeEventListener('beforeunload',beforeUnload)})
+/** Distinguish a live projection from a stale one; a failed poll never keeps old values marked current. */
+type Freshness = 'live'|'stale'|'unavailable'
+const freshness=ref<Freshness>('live')
+const freshnessNote=ref('')
+const lastPollAt=ref('')
+function markStale(reason:string){freshness.value='stale';freshnessNote.value=reason}
+/**
+ * ISS-027: refresh the current projection on a plain HTTP poll. Historical queries and
+ * a form still being filled are deliberately left untouched, and a network failure is
+ * surfaced as a stale marker instead of silently keeping the old numbers current.
+ */
+async function poll(){
+  if(!active||busy.value||loading.value||blocked.value||spec.value||signIn.value)return
+  if(health.value.kind!=='connected')return
+  if(tab.value!=='总览'&&tab.value!=='投资')return
+  try{
+    const status=await api('/system/status');if(!active)return
+    const key=safeKey(status)
+    if(key&&safeKey(system.value)&&key!==safeKey(system.value)){
+      readError.value='数据库身份或可写状态已变化；已停止自动更新，请点击「重新读取」核对后再操作。';stopPolling();markStale('数据库身份已变化，显示的是上一次成功读取的值');return
+    }
+    system.value=status;session.declare(status)
+    if(status.mode==='development'){freshness.value='unavailable';freshnessNote.value='开发健康模式，无业务数据库';return}
+    const [o,m]=await Promise.all([api('/finance/overview'),api('/market/status')]);if(!active)return
+    if(overview.value&&Number(o.ledger_revision)!==Number(overview.value.ledger_revision))refresh.value++
+    const quoteMoved=!market.value||Number(m.quote_revision)!==Number(market.value.quote_revision)
+    overview.value=o;market.value=m
+    freshness.value='live';freshnessNote.value='';lastPollAt.value=new Date().toISOString()
+    if(tab.value==='投资'&&selectedAccount.value&&!asOf.value&&(quoteMoved||refresh.value))await refreshInvestment(true)
+  }catch(e){
+    if(!active)return
+    if(e instanceof ApiError&&e.status===401){handleRead(e);markStale('会话已过期，显示的是上次成功读取的值');return}
+    // A transport failure proves nothing about the ledger: keep the numbers but label them stale.
+    markStale(`自动刷新失败（${String(e)}），下列数字是 ${lastPollAt.value?localTime(lastPollAt.value)+' ':'上一次'}读取的旧值，不是当前值`)
+  }
+}
+function stopPolling(){if(timer){clearInterval(timer);timer=undefined}}
+async function boot(){
+  syncPending()
+  const existing=await session.stored()
+  if(!active)return
+  sessionName.value=existing?.username ?? ''
+  // reload() turns the login panel on by itself when the server answers 401.
+  await reload()
+  if(existing!==null&&health.value.kind==='connected')signIn.value=false
+}
+/** Cross-tab: another tab may create, retry or abandon the pending write. */
+function onStorage(){syncPending()}
+onMounted(()=>{void boot();window.addEventListener('beforeunload',beforeUnload);window.addEventListener('storage',onStorage);timer=setInterval(()=>{void poll()},20000)})
+onBeforeUnmount(()=>{active=false;sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage)})
 const validTransfer=(r:Fact)=>r.status==='effective'
 const accountById=(id:unknown)=>accountRows.value.find(a=>a.id===id)
+
+// -- V9/G2 read models -------------------------------------------------------------
+const statusLabels:Record<string,string>={SIGNAL:'正式信号（突破成立且闸门通过）',NO_SIGNAL:'未突破（无信号）',DATA_UNAVAILABLE:'数据不可用',FACTOR_BLOCKED:'因子阻止',FACTOR_UNVERIFIED:'因子未核实（严格模式）',COOLDOWN:'冷却期内',POSITION_OPEN:'持仓中',PLAN_PENDING:'已有待执行计划',PORTFOLIO_FULL:'指数仓已达 8 个',CASH_BLOCKED:'现金或权益不足，未生成计划',AWAITING_CONFIRMATION:'次日开盘价已通过条件，待核对真实成交'}
+const actionLabels:Record<string,string>={HOLD:'继续持有',STOP:'触发普通止损',GAP_STOP:'跳空止损',EXIT:'到期或规则退出',CLOSED:'已清仓',ADD_STOP:'子仓触发止损',ADD_GAP_STOP:'子仓跳空止损'}
+const factorLabels:Record<string,string>={PASS:'通过',FAIL:'不通过',UNVERIFIED:'未核实',DATA_UNAVAILABLE:'数据不足',NOT_REQUIRED:'无额外因子',DISABLED:'未配置组合'}
+const num=(v:unknown,d=4)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d):display(v)
+const nested=(v:unknown)=>v&&typeof v==='object'&&!Array.isArray(v)?v as Fact:{}
+const statusText=(v:unknown)=>statusLabels[str(v)]??display(v)
+/** Flatten the pool item into display values; no numbers are recomputed in the browser. */
+const strategyRows=computed(()=>pool.value?facts(pool.value.items).map(item=>{
+  const gap=nested(item.gap), factor=nested(item.factor), combo=nested(item.combo), series=nested(item.series), base=nested(item.regime)
+  return {...item,
+    id:`${str(item.index_id)}`,
+    label:`${str(item.index_id)} ${str(item.name)} → ${str(item.etf_code)||'无对应场内标的'}（${str(item.track)}）`,
+    regime_text:`${str(base.label)||'未知'}`,
+    er60_text:base.er60==null?'--':num(base.er60,4),
+    price_basis_text:`${num(item.signal_close)} ${str(item.price_unit)}`,
+    threshold_text:`${num(item.threshold_high)} ${str(item.price_unit)}`,
+    buy_max_text:`${num(item.buy_max)} ${str(item.price_unit)}`,
+    gap_text:gap.atr_multiple==null?'--':`${num(gap.abs,4)} / ${num(gap.atr_multiple,2)} ATR`,
+    status_text:statusText(item.status),
+    factor_text:`因子 ${factorLabels[str(factor.status)]??'—'}；组合 ${factorLabels[str(combo.status)]??'—'}`,
+    cooldown_text:nested(item.cooldown).active?str(nested(item.cooldown).note)||'冷却中':'无冷却限制',
+    data_text:`${str(series.source)||'无来源'}；${series.bars??0} 根；末日 ${str(series.last_date)||'—'}${str(series.warning)?`；${str(series.warning)}`:''}`,
+  }}):[])
+const strategyColumns=computed(()=>cols({label:'指数与交易标的',regime_text:'G2 市场状态',er60_text:'ER60',signal_date:'最近正式信号日',price_basis_text:'信号收盘',threshold_text:'突破位',buy_max_text:'买入上限',atr14:'ATR14',gap_text:'距突破位 / ATR 倍数',status_text:'信号状态',factor_text:'因子与准入',cooldown_text:'冷却剩余',data_text:'数据来源与质量'}).concat([{key:'detail',label:'状态原因'}]))
+const positionRows=computed(()=>positionsView.value?facts(positionsView.value.items).map(item=>{
+  const p=nested(item.position), pyramid=nested(item.pyramid), aux=nested(item.ndx_aux), cooldown=nested(item.cooldown)
+  return {...item,
+    id:`pos-${str(item.index_id)}`,
+    label:`${str(item.index_id)} ${str(item.name)} → ${str(item.etf_code)}`,
+    entry_text:`${str(p.entry_date)||'—'} @ ${num(p.entry_price)} ${str(item.price_unit)}`,
+    atr_text:`${num(p.signal_atr)}（冻结）`,
+    stop_text:`${num(p.stop_price)} ${str(item.price_unit)}${p.pending_stop==null?'':`；下一交易日生效 ${num(p.pending_stop)}`}`,
+    trail_text:`触发 ${num(p.trail_trigger)}；阶段 ${p.stage??'—'}；峰值 ${num(p.highest_price)}`,
+    term_text:`第 ${p.holding_days??'—'}/${p.exit_after_bars??'—'} 日；续期 ${p.renewals??0} 次；E2a 延持 ${p.e2a_extended_days??0}/10${p.extended?'（延持中）':''}`,
+    pyramid_text:pyramid.reason?`${str(pyramid.status)}：${str(pyramid.reason)}`:'—',
+    ndx_text:aux.status?`${str(aux.status)}：${str(aux.detail)}`:'—',
+    action_text:`${actionLabels[str(p.action)]??display(p.action)}${p.action_price==null?'':` @ ${num(p.action_price)}`}${str(p.action_reason)?`；${str(p.action_reason)}`:''}`,
+    live_text:`策略记录 ${p.add_executed?'已加仓':'主仓'}；账本剩余 ${item.live_quantity??0} 股`,
+    cooldown_text:cooldown.active?str(cooldown.note)||'冷却中':'无冷却限制',
+  }}):[])
+const positionColumns=computed(()=>cols({label:'指数与交易标的',entry_text:'建仓事实（策略证据）',atr_text:'信号日 ATR',stop_text:'当前保护价',trail_text:'跟踪止盈',term_text:'时间退出',pyramid_text:'盈利加仓条件',ndx_text:'NDX 辅助仓',action_text:'策略建议',live_text:'实际持仓对照',cooldown_text:'冷却'}).concat([{key:'warnings',label:'未核对与提示'}]))
+/** Only a recorded formal signal may prefill a trade form; price and quantity stay operator-confirmed. */
+function canFill(row:Fact):boolean{
+  const status=str(row.status)
+  if(status!=='SIGNAL'&&status!=='AWAITING_CONFIRMATION')return false
+  const code=str(row.etf_code)
+  return !!code&&instruments.value.some(i=>str(i.code)===code)
+}
+function openTradeFromSignal(row:Fact){
+  if(!writable.value||!canFill(row))return
+  const instrument=instruments.value.find(i=>str(i.code)===str(row.etf_code))
+  const fill=nested(row.fill)
+  const note=`策略信号证据：${str(row.index_id)} 信号日 ${str(row.signal_date)}，冻结 ATR ${num(row.atr14)}，`
+    +`突破位 ${num(row.threshold_high)} ${str(row.price_unit)}，买入上限 ${num(row.buy_max)} ${str(row.price_unit)}`
+    +(fill.entry_price==null?'':`，次日开盘价 ${num(fill.entry_price)} 已通过价格条件`)
+  openForm(()=>forms.tradeForm(accounts.value,instruments.value,lots.value,undefined,{
+    account_id:selectedAccount.value,instrument_id:str(instrument?.id),side:'buy',lot_role:'main',
+    strategy_id:'INDEX_STRATEGY_ATR',signal_date:str(row.signal_date),frozen_atr:String(row.atr14??''),note,
+  }))
+}
 </script>
 
 <template>
-  <header><div><h1>Stock Manager 2.0</h1><p>V1.0 开发版 · 06-ui</p></div><div role="status"><strong>后端：{{health.kind==='connected'?'已连接':health.kind==='checking'?'正在连接':'连接失败'}}</strong> · {{display(system?.mode)}} · {{system?.writable===true?'允许写入':'禁止写入'}} <button :disabled="busy||loading" @click="reload">重新读取</button></div></header>
+  <header><div><h1>Stock Manager 2.0</h1><p>V1.0 开发版 · 08-strategy</p></div><div role="status"><strong>后端：{{health.kind==='connected'?'已连接':health.kind==='checking'?'正在连接':'连接失败'}}</strong> · {{display(system?.mode)}} · {{system?.writable===true?'允许写入':'禁止写入'}}<template v-if="sessionName"> · 已登录：{{sessionName}} <button :disabled="busy" @click="signOut">退出登录</button></template> <button :disabled="busy||loading" @click="reload">重新读取</button></div></header>
   <nav aria-label="主导航"><button v-for="name in tabs" :key="name" :aria-current="tab===name?'page':undefined" :class="{selected:tab===name}" @click="navigate(name)">{{name}}</button></nav>
   <main>
+    <section v-if="signIn" class="operation" aria-label="登录">
+      <h2>登录</h2>
+      <p>这是单用户私有服务。所有业务数据与写入都需要先通过应用认证；未认证请求一律被拒绝。</p>
+      <form @submit.prevent="signInSubmit">
+        <div class="fields">
+          <label><span>用户名</span><input v-model="userName" autocomplete="username" :disabled="busy"/></label>
+          <label><span>密码</span><input v-model="userPassword" type="password" autocomplete="current-password" :disabled="busy"/></label>
+        </div>
+        <button type="submit" :disabled="busy">登录</button>
+      </form>
+      <p v-if="authState" class="notice" role="status">{{authState}}</p>
+    </section>
+    <p v-if="freshness!=='live'" class="error" role="alert">{{freshnessNote||'当前数字可能不是最新值'}}</p>
     <p v-if="loading" role="status">正在读取服务器真实数据…</p>
     <p v-if="readError" class="error" role="alert">{{readError}}</p>
     <p v-if="error" class="error" role="alert">{{error}}</p>
     <p v-if="feedback" class="notice" role="status">{{feedback}}</p>
-    <section v-if="retryPending" class="error" role="alert">写入结果未知。请勿重录或刷新页面；使用原请求 ID 重试（同一内容）。<button :disabled="busy" @click="retry">重试原请求</button></section>
-    <OperationForm v-if="spec" :key="formKey" :spec="spec" :busy="busy||retryPending||!writable" @submit="submit" @cancel="spec=null" />
+    <section v-if="retryPending" class="error" role="alert">
+      <p>写入结果未知，原请求编号 <code>{{writer.requestId}}</code>。请勿重录或刷新页面：先向服务器核实该编号，再用同一内容重试。核实前所有新写入都被阻止。</p>
+      <button :disabled="busy" @click="retry">核实并重试原请求</button><button :disabled="busy" @click="discardPending">放弃待确认写入</button>
+    </section>
+    <section v-if="pendingCorrupt" class="error" role="alert">
+      <p>本机保留了无法解析的待核实写入记录，已阻止新的业务写入。请按成交历史核对账本后，再明确清除该记录。</p>
+      <button :disabled="busy" @click="clearCorruptPending">已人工核对，清除该记录</button>
+    </section>
+    <p v-if="storageError" class="error" role="alert">{{storageError}}</p>
+    <OperationForm v-if="spec" :key="formKey" :spec="spec" :busy="busy||blocked||!writable" @submit="submit" @cancel="spec=null" />
     <template v-if="health.kind==='connected'&&system&&system.mode!=='development'">
       <section v-if="tab==='总览'">
         <h2>个人资产总览</h2>
@@ -129,16 +361,51 @@ const accountById=(id:unknown)=>accountRows.value.find(a=>a.id===id)
           <p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
           <RecordTable :rows="positions" :columns="cols({code:'代码',market:'市场',quantity:'持仓股数',remaining_cost_fen:'剩余本金',remaining_fees_fen:'剩余费用',holding_cost_fen:'持仓成本',price:'现价（元）',market_value_fen:'市值',daily_pnl_fen:'当日收益',realized_fen:'已实现',unrealized_fen:'未实现',quality:'质量',quote:'报价时点及来源'})"/>
           <h3>当前/历史有效批次</h3><RecordTable :rows="currentLots" :columns="cols({lot_id:'批次ID',code:'证券代码',lot_role:'角色',quantity:'数量',cost_fen:'剩余本金',fees_fen:'剩余费用',frozen_atr:'冻结ATR',signal_date:'信号日',opened_at:'开启时间'})"/>
-        </template><p v-else>请选择证券账户或重新读取。</p>
-        <h3>V9/G2 策略</h3><p class="notice">正式策略引擎尚未迁移（旧源码未提供），观察池、正式信号及决策不可用。以下仅显示已经保存的批次证据，不是交易建议。</p><details v-if="strategy"><summary>原批次证据</summary><pre>{{JSON.stringify(strategy,null,2)}}</pre></details>
+        </template>
+        <template v-else><p>请选择证券账户或重新读取。</p></template>
+        <h3>V9/G2 策略观察池</h3>
+        <p class="notice">观察池只用<b>指数点位</b>日线判定突破与 G2 状态；ETF 复权价只用于研究口径，真实市值用未复权价。策略建议不等于真实成交：真实主仓/子仓/退出只能经「录入真实成交」确认。</p>
+        <div class="toolbar"><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池'}}</button><span v-if="pool">数据日期 {{display(pool.as_of)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(fact(pool.regime as Fact).label)}} / ER60 {{display(fact(pool.regime as Fact).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
+        <p v-if="strategyError" class="error" role="alert">{{strategyError}}</p>
+        <p v-if="pool&&Array.isArray(fact(pool.regime as Fact).warning)===false&&fact(pool.regime as Fact).warning" class="notice">G2 基准提示：{{display(fact(pool.regime as Fact).warning)}}</p>
+        <p v-if="pool&&Array.isArray(pool.equity_reasons)&&pool.equity_reasons.length" class="notice">权益口径：{{display(pool.equity_reasons)}}</p>
+        <RecordTable v-if="pool" :rows="strategyRows" :columns="strategyColumns">
+          <template #actions="{row}">
+            <button v-if="canFill(row)" :disabled="!writable" @click="openTradeFromSignal(row)">按此信号录入真实成交</button>
+          </template>
+        </RecordTable>
+        <p v-else-if="!strategyLoading">尚未读取策略观察池。选择证券账户后点击「刷新策略观察池」。</p>
+        <h3>持仓决策（策略建议 vs 实际持仓）</h3>
+        <p class="notice">主仓与子仓各自使用其真实成交价与信号日冻结 ATR 计算止损；此处不会修改真实持仓。</p>
+        <template v-if="positionsView">
+          <RecordTable :rows="positionRows" :columns="positionColumns"/>
+          <h4>真实账本中的策略批次（核对依据）</h4>
+          <RecordTable v-if="facts(positionsView.custody).length" :rows="facts(positionsView.custody)" :columns="cols({lot_id:'批次ID',lot_role:'角色',strategy_id:'策略标识',signal_date:'信号日',frozen_atr:'冻结ATR',code:'证券代码',market:'市场',kind:'类型',remaining:'剩余数量'})"/>
+          <p v-else class="notice">账本中没有带策略标记的主仓/子仓批次；策略持仓状态若存在则属于未核对证据。</p>
+        </template>
+        <p v-else class="notice">尚未读取持仓决策。</p>
+        <details v-if="strategy"><summary>原批次证据（历史接口）</summary><pre>{{JSON.stringify(strategy,null,2)}}</pre></details>
         <h3>实际行情状态</h3><RecordTable v-if="market" :rows="facts(market.items)" :columns="cols({code:'证券代码',market:'市场',quality:'质量',quote:'报价证据'})"/>
+        <h3>冲突收盘价核实</h3>
+        <p class="notice">同一交易日存在互相矛盾的已核实收盘价时，必须由你明确指定采用哪一条。核实会绑定当前行情版本，版本变化后需要重新核实。</p>
+        <div class="toolbar"><label>证券标的 <select v-model="quoteInstrument"><option value="">选择标的</option><option v-for="i in instruments" :key="String(i.id)" :value="i.id">{{i.market}} {{i.code}}</option></select></label><button @click="loadQuotes">查询报价证据及冲突</button></div>
+        <p v-if="quoteError" class="error" role="alert">{{quoteError}}</p>
+        <template v-if="quoteEvidence">
+          <p>行情版本 {{quoteEvidence.quote_revision}}；证据 {{facts(quoteEvidence.items).length}} 条；已核实冲突 {{facts(quoteEvidence.resolutions).length}} 条。</p>
+          <RecordTable :rows="facts(quoteEvidence.items)" :columns="cols({id:'报价ID',price:'价格（元）',kind:'类型',quality:'质量',source:'来源',observed_at:'观测时间',trading_day:'交易日',quote_revision:'行情版本'})"><template #actions="{row}"><button v-if="row.quality==='conflict'" :disabled="!writable" @click="openForm(()=>forms.quoteResolutionForm(row,Number(quoteEvidence?.quote_revision??0)))">核实采用此价格</button></template></RecordTable>
+          <h4>已核实记录</h4><RecordTable :rows="facts(quoteEvidence.resolutions)" :columns="cols({id:'核实ID',instrument_id:'标的',selected_quote_id:'采用报价',quote_revision:'核实后版本',reviewed_quote_ids:'覆盖的冲突报价',reason:'核实依据',resolved_at:'核实时间'})"/>
+        </template>
       </section>
       <section v-if="tab==='交易'"><h2>真实成交</h2>
-        <div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.instrumentForm)">创建证券标的</button><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts))">期初及证券现金</button><button :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots))">录入买入 / 卖出</button></div>
+        <div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.instrumentForm)">创建证券标的</button><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts))">期初及证券现金</button><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.openingForm(accounts,instruments))">期初持仓录入</button><button :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots))">录入买入 / 卖出</button></div>
         <h3>成交历史（包括待核对和冲正）</h3>
         <PagedRecords path="/trades" :refresh="refresh" :columns="cols({id:'成交ID',account_id:'账户ID',instrument_id:'标的ID',side:'方向',quantity:'数量',price:'价格（元）',fees_fen:'费用',amount_fen:'金额',executed_at:'成交时间',status:'状态',pending_reason:'待核对原因',note:'备注'})"><template #actions="{row}"><button v-if="row.status==='pending'" :disabled="!writable" @click="openForm(()=>forms.confirmation(`/trades/${row.id}/confirm`))">确认</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots,row))">更正</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/trades/${row.id}/void`,'作废成交'))">作废</button></template></PagedRecords>
         <h3>证券资金记录</h3><PagedRecords path="/cash" :refresh="refresh" :columns="cashColumns"><template #actions="{row}"><template v-if="!row.transfer_id&&!row.execution_id&&['deposit','withdrawal','adjustment'].includes(String(row.kind))"><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/cash/${row.id}/void`,'作废资金记录'))">作废</button></template></template></PagedRecords>
         <details><summary>账户及证券标的 ID 对照</summary><RecordTable :rows="accounts" :columns="cols({id:'账户ID',name:'名称',kind:'类型'})"/><RecordTable :rows="instruments" :columns="cols({id:'标的ID',market:'市场',code:'代码',kind:'类型'})"/></details>
+        <h3>现金分红</h3>
+        <p class="notice">现金分红是外部收益，进入证券账户现金，不改变持仓股数。数量型公司行为（拆股、并股、配股）尚未实现，请不要在此录入。</p>
+        <div class="toolbar"><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.dividendForm(accounts,instruments))">录入现金分红</button></div>
+        <PagedRecords path="/company-events" :refresh="refresh" :columns="cols({id:'公司行为ID',account_id:'账户ID',instrument_id:'标的ID',kind:'类型',occurred_at:'发生时间',cash_movement_id:'对应现金流水',note:'备注'})"><template #actions="{row}"><template v-if="row.kind==='dividend'"><button :disabled="!writable" @click="openForm(()=>forms.dividendCorrectionForm(row))">更正金额</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/company-events/${row.id}/void`,'作废现金分红'))">作废</button></template></template></PagedRecords>
       </section>
       <section v-if="tab==='财务'"><h2>个人财务</h2><div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.categoryForm)">新增分类</button><button :disabled="!writable" @click="openForm(()=>forms.billForm(accounts,categories))">新增收入 / 支出 / 手续费</button><button :disabled="!writable||!overview" @click="openForm(()=>forms.transferForm(accountRows))">内部转账</button></div>
         <h3>账户及余额</h3><RecordTable :rows="accountRows" :columns="accountColumns"><template #actions="{row}"><button v-if="row.kind!=='securities'&&row.status==='active'" :disabled="!writable" @click="openForm(()=>forms.balanceForm(row))">余额核实</button><button :disabled="!writable" @click="openForm(()=>forms.accountUpdate(row,currentRevision))">账户状态</button><button :disabled="!writable" @click="openForm(()=>forms.scopeForm(row,currentRevision))">统计范围</button><button v-if="!row.effective_at" :disabled="!writable" @click="openForm(()=>forms.effectiveForm(row,currentRevision))">核实生效时间</button></template></RecordTable>

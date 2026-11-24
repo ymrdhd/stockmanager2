@@ -17,7 +17,7 @@ from backend.application.finance import (
 from backend.application.portfolio import PortfolioService, CompanyInput, OpeningInput
 from backend.application.trading.service import AccountInput, CashInput, Conflict, TradeError, utc
 from backend.infrastructure import database
-from backend.infrastructure.database import Identity, migrate_schema, upgrade_database, open_database, adopt_database
+from backend.infrastructure.database import REVISION, SCHEMA_VERSION, Identity, migrate_schema, upgrade_database, open_database, adopt_database
 from backend.main import create_app
 from backend.config import AppConfig
 from test_trading import cfg, ledger, trade, snapshot
@@ -298,8 +298,8 @@ def test_0005_to_0006_preserves_all_facts_with_fk(tmp_path):
         accounts=c.execute('SELECT * FROM accounts').fetchall()
     dest=tmp_path/'pre-finance'; upgrade_database(settings,dest,confirm=True)
     with open_database(settings) as db,db.read() as c:
-        assert c.execute('SELECT version_num FROM alembic_version').fetchone()==('0007',)
-        assert c.execute('SELECT schema_version FROM system_metadata').fetchone()==(7,)
+        assert c.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
+        assert c.execute('SELECT schema_version FROM system_metadata').fetchone()==(SCHEMA_VERSION,)
         assert c.execute('SELECT id,name,kind,currency,balance_mode,status FROM accounts').fetchall()==accounts
         for t in tables: assert c.execute('SELECT * FROM '+t+' ORDER BY rowid').fetchall()==before[t]
         assert c.execute('PRAGMA integrity_check').fetchone()==('ok',) and c.execute('PRAGMA foreign_key_check').fetchall()==[] and c.execute('PRAGMA foreign_keys').fetchone()==(1,)

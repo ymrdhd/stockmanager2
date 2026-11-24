@@ -7,8 +7,17 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from backend.application.trading.service import AccountInput, CashInput, Conflict, InstrumentInput, Missing, TradeError, TradeInput, TradeService
-from backend.infrastructure.database import DatabaseError
+from backend.application.trading.service import (
+    AccountInput,
+    CashInput,
+    Conflict,
+    InstrumentInput,
+    Missing,
+    TradeError,
+    TradeInput,
+    TradeService,
+)
+from backend.infrastructure.database import DatabaseError, IdentityMismatch
 
 router = APIRouter(prefix='/api/v1', tags=['trading'])
 
@@ -54,6 +63,9 @@ def invoke(operation, *args):
         raise HTTPException(404, {'code': 'not_found', 'message': str(exc), 'request_id': request_id, 'details': {}}) from exc
     except TradeError as exc:
         raise HTTPException(422, {'code': 'invalid_input', 'message': str(exc), 'request_id': request_id, 'details': {}}) from exc
+    except IdentityMismatch as exc:
+        # The browser declared another database than the verified one: no fact changed.
+        raise HTTPException(409, {'code': 'identity_mismatch', 'message': str(exc), 'request_id': request_id, 'details': {}}) from exc
     except DatabaseError as exc:
         raise HTTPException(403, {'code': 'database_refused', 'message': str(exc), 'request_id': request_id, 'details': {}}) from exc
     except sqlite3.IntegrityError as exc:

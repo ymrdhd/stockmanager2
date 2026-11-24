@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from backend.application.trading.service import CashInput, Conflict, TradeError, TradeService, AccountInput, InstrumentInput
 from backend.application.portfolio import PortfolioService, QuoteInput, OpeningInput, CompanyInput
 from backend.infrastructure import database
-from backend.infrastructure.database import Identity, migrate_schema, upgrade_database, open_database, adopt_database, initialize_database
+from backend.infrastructure.database import REVISION, Identity, migrate_schema, upgrade_database, open_database, adopt_database, initialize_database
 from backend.main import create_app
 from backend.config import AppConfig
 from test_trading import cfg, ledger, trade, data, snapshot
@@ -214,7 +214,7 @@ def test_0002_to_0003_real_upgrade_with_facts(tmp_path):
             actual=conn.execute('SELECT * FROM '+table+' ORDER BY rowid').fetchall()
             assert actual==([r+(None,) for r in expected] if table=='trade_lots' else expected)
         assert conn.execute('PRAGMA foreign_key_check').fetchall()==[] and conn.execute('PRAGMA integrity_check').fetchone()==('ok',)
-        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==('0007',)
+        assert conn.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
     with closing(sqlite3.connect(backup/'database.sqlite')) as conn:
         assert conn.execute('SELECT schema_version FROM system_metadata').fetchone()==(2,)
         assert conn.execute('SELECT * FROM cash_movements ORDER BY rowid').fetchall()==before['cash_movements']
