@@ -1,0 +1,61 @@
+# runtime and private information
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+secrets.json
+*.p12
+*.pfx
+data/
+cache/
+logs/
+backups/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.zip
+artifacts/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+
+# frontend
+node_modules/
+dist/
+frontend/.vite/
+
+# editor/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Additional local environments, runtime sidecars and generated reports
+venv/
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+*.bak
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+*.db-journal
+*.sqlite-journal
+*.sqlite3-journal
+
+# Database writer lock sidecars
+*.writer.lock

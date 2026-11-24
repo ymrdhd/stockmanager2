@@ -1,0 +1,45 @@
+[project]
+name = "stock-manager"
+version = "2.0.0.dev0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.128.2,<0.129",
+  "uvicorn>=0.48.0,<0.49",
+  "pydantic>=2.13.5,<3",
+  "sqlalchemy>=2.0,<2.1",
+  "alembic>=1.18,<2",
+  "exchange-calendars==4.13.1",
+  "httpx>=0.28.1,<0.29",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.2,<10",
+  "ruff>=0.11,<1",
+  "mypy>=1.15,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".git", ".venv", "data", "cache", "logs", "backups", "artifacts", "node_modules", "dist"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "integration: tests requiring a temporary database or service",
+  "regression: business-rule golden-case regression",
+  "e2e: browser or multi-device smoke test",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+check_untyped_defs = true

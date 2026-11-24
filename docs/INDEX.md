@@ -1,0 +1,22 @@
+# 文档索引（任务路由，不是必读清单）
+
+**日常只需读**：`AGENTS.md` + `docs/STATUS.md` + 本表命中的相关文档/代码范围。每轮最多先读 1–2 篇专题；仅当修改范围扩大时增加阅读。
+
+| 正在做的任务 | 先读 | 再读/验证 | 预期代码位置 |
+|---|---|---|---|
+| 从零到交付/阶段任务/发布门槛 | `DELIVERY_PLAN.md` | `STATUS.md` + `AGENT_WORKFLOW.md` | `docs/`, 分阶段业务模块 |
+| 初建工程/确定首版功能 | `PRODUCT_SPEC.md` §§1–4 | `ARCHITECTURE.md` §§1–2 | `backend/`, `frontend/` |
+| 买卖、成交导入、批次扣减 | `DATA_CONTRACTS.md` §§1–4 | `ACCEPTANCE_TESTS.md` 交易组 | `backend/application/trading/` |
+| 当日/历史收益、成本、权益 | `DATA_CONTRACTS.md` §§5–7 | `ACCEPTANCE_TESTS.md` 收益组 | `backend/domain/portfolio/`, `analytics/` |
+| 记账、账户、证券资产联动 | `DATA_CONTRACTS.md` §§1、4、6–7 | `PRODUCT_SPEC.md` 财务节 | `backend/application/finance/` |
+| V9/G2 信号和持仓决策 | `STRATEGY_CONTRACT.md` | `LEGACY_BASELINE.md`, 回归样例 | `backend/domain/strategy/` |
+| 行情、Fed、刷新任务 | `ARCHITECTURE.md` 数据流节 | `ACCEPTANCE_TESTS.md` 数据质量组 | `backend/infrastructure/market/` |
+| 页面/交互/API | `INTERFACE_CONTRACT.md` | `PRODUCT_SPEC.md` 对应页面 | `frontend/`, `backend/api/` |
+| 双机、认证、启动模式 | `OPERATIONS_SECURITY.md` | `ARCHITECTURE.md` §§3–4 | `backend/main.py`, 部署脚本 |
+| 备份、恢复、迁移旧库 | `OPERATIONS_SECURITY.md` §§3–5 | `DATA_CONTRACTS.md` §7 | `tools/`, `migrations/` |
+| 架构修改、引入第三方库 | `DECISIONS.md` + `ARCHITECTURE.md` | `CODE_STANDARDS.md` | 相关模块 |
+| 开发迭代收尾、生成审查包 | `AGENT_WORKFLOW.md` | `AGENTS.md` 第 4 节 | `tools/package_changes.py` |
+
+约定：`docs/STATUS.md` 只记当前阶段，完成后覆盖旧状态；`docs/DECISIONS.md` 只记不可轻易更改的决策；不要每轮为小修改建立新 MD。
+
+首次只从 STATUS 对应迭代开始。文档权威：产品=PRODUCT_SPEC，数据=DATA_CONTRACTS，策略=STRATEGY_CONTRACT，页面/API=INTERFACE_CONTRACT，架构=ARCHITECTURE，运维安全=OPERATIONS_SECURITY，代码=CODE_STANDARDS，排程=DELIVERY_PLAN，验收=ACCEPTANCE_TESTS，工作流=AGENT_WORKFLOW。冲突按 AGENTS 处理。
