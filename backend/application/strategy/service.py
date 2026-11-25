@@ -31,6 +31,7 @@ from hashlib import sha256
 import json
 import logging
 import math
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -98,7 +99,9 @@ class StrategyService:
 
     def __init__(self, db: Database, *, data: StrategyData | None = None,
                  store: StrategyStore | None = None,
-                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(UTC), near_stop_bps: int = 200) -> None:
+        if not 0 <= near_stop_bps <= 1000: raise ValueError("near_stop_bps must be 0..1000")
+        self.near_stop_bps = near_stop_bps
         self.db = db
         self.clock = clock
         self.data = data if data is not None else StrategyData(db, clock=clock)
@@ -452,6 +455,7 @@ class StrategyService:
             gap = {'abs': gap_abs, 'pct': gap_abs / price_now * 100 if price_now else None,
                    'atr_multiple': gap_abs / atr}
         signal_atr = plan.atr14
+        stop_warning = self._near_stop(account_id, position, held, as_of, evidence_revision) if safe and not historical and basis == ETF_UNADJUSTED and not model_exit else []
         return {
             'index_id': canonical, 'name': cfg.name, 'market': cfg.market,
             **self._time_payload(as_of),
@@ -468,7 +472,7 @@ class StrategyService:
             'cooldown': cooldown, 'gap': gap,
             'fill': _fill_payload(fill),
             'position': self._position_payload(position, model_decision, cfg, unit),
-            'model_exit': model_exit,
+            'model_exit': model_exit, 'near_stop': stop_warning,
             'pyramid': pyramid, 'ndx_aux': ndx_aux,
             'live_quantity': None if historical else live_qty,
             'evidence': evidence,
@@ -1164,6 +1168,31 @@ class StrategyService:
             source_verified=series.source_verified, connection=connection,
         )
 
+    def _near_stop(self, account, position, held, as_of, evidence_revision):
+        """Display-only distance from verified current protections; not a model exit."""
+        if not position or position.execution_source != SOURCE_LEDGER or not position.is_open or not held:
+            return []
+        try:
+            at=self._decision_time(as_of)
+            with self.db.read() as conn:
+                if conn.execute('SELECT ledger_revision FROM ledger_state').fetchone()[0]!=evidence_revision:
+                    return []
+                valid=[l for l in held if l['signal_verified'] and not l['scale_invalid'] and not l['strategy_deviation']]
+                if len(valid)!=len(held) or len({l['instrument_id'] for l in valid})!=1: return []
+                quote,quality=self.portfolio._current_quote(conn,valid[0]['instrument_id'],utc(at),market_window(at),self.portfolio._revision(conn,None))
+                if quality!='valid' or not quote: return []
+                price=Decimal(quote['price'])/SCALE
+                result=[]
+                candidates=[('main',position.stop_price)]+[('sub',a.get('stop_price')) for a in position.adds if a.get('stop_price') is not None]
+                for role,stop in candidates:
+                    if not any(l['lot_role']==role for l in valid): continue
+                    state=stop_distance(price,stop,self.near_stop_bps)
+                    if state:
+                        result.append({'role':role,'status':state,'stop_price':stop,'quote_price':str(price),'quote_at':quote['effective_at'],'quote_source':quote['source'],'threshold_bps':self.near_stop_bps,'display_only':True})
+                return result
+        except (CalendarUnavailable,InvalidOperation,TypeError,ValueError):
+            return []
+
     def _position_payload(self, position: Optional[PositionState], decision, cfg,
                           unit: str) -> dict | None:
         if position is None:
@@ -1205,6 +1234,15 @@ class StrategyService:
                            - date.fromisoformat(str(last_add)[:10])).days)
         except ValueError:
             return None
+
+
+def stop_distance(price, stop, threshold_bps):
+    if stop is None: return None
+    p, s=Decimal(str(price)),Decimal(str(stop))
+    if not p.is_finite() or not s.is_finite() or p<=0 or s<=0: return None
+    if p<=s: return 'protection_reached'
+    if (p-s)*10000<=s*threshold_bps: return 'near_stop'
+    return None
 
 
 def entry_amount(equity: Optional[int], cfg) -> Optional[float]:

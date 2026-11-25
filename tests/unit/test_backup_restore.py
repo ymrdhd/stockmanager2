@@ -362,3 +362,60 @@ def test_restore_valuation_at_same_cutoff(formal, tmp_path):
         after = FinanceService(db).overview(cutoff)
         for key in ('securities_cash_fen','securities_market_value_fen','securities_equity_fen','net_worth_fen','ledger_revision','quote_revision','finance_month'):
             assert before[key]==after[key]
+
+
+@pytest.mark.parametrize('stage', ['before_swap','after_swap','after_binding'])
+def test_process_death_restore_is_fenced_and_offline_rollback(formal,tmp_path,stage):
+    import subprocess, sys
+    from backend.infrastructure.takeover import marker_path, rollback_pending
+    ids=seed(formal); backup=create_backup(formal,tmp_path/'old'); add_later_facts(formal,ids)
+    before=counts(formal)
+    child=r'''
+import os,sys
+from pathlib import Path
+from backend.infrastructure.database import DatabaseSettings
+from backend.infrastructure import restore as r
+path,binding,uuid,generation,backup,stage=sys.argv[1:]
+s=DatabaseSettings(Path(path),uuid,int(generation),Path(path),binding_path=Path(binding))
+original=r._swap
+if stage=='before_swap':
+    r._swap=lambda *args: os._exit(77)
+elif stage=='after_swap':
+    def swap(*args):
+        original(*args);os._exit(77)
+    r._swap=swap
+else:
+    original_replace=os.replace
+    def replace(src,dst):
+        original_replace(src,dst)
+        if Path(dst)==Path(binding): os._exit(77)
+    os.replace=replace
+r.restore(s,Path(backup),confirm=True)
+'''
+    run=subprocess.run([sys.executable,'-c',child,str(formal.path),str(formal.binding_path),formal.expected_uuid,str(formal.generation),str(backup),stage],capture_output=True)
+    assert run.returncode==77,run.stderr.decode()
+    assert marker_path(formal.binding_path).exists()
+    bound=load_binding(formal.binding_path)
+    current=DatabaseSettings(formal.path,bound.uuid,bound.generation,formal.path,binding_path=formal.binding_path)
+    with pytest.raises(DatabaseError,match='offline recovery'):
+        with open_database(current): pass
+    child2=r'''
+import os,sys
+from pathlib import Path
+from backend.infrastructure import takeover as t
+original=t._publish_db
+def publish(*args):
+    original(*args);os._exit(78)
+t._publish_db=publish
+t.rollback_pending(Path(sys.argv[1]),confirm=True,isolated=True)
+'''
+    run=subprocess.run([sys.executable,'-c',child2,str(formal.binding_path)],capture_output=True)
+    assert run.returncode==78,run.stderr.decode()
+    assert marker_path(formal.binding_path).exists()
+    recovered=rollback_pending(formal.binding_path,confirm=True,isolated=True)
+    assert recovered['generation']==formal.generation+2
+    current=DatabaseSettings(formal.path,formal.expected_uuid,recovered['generation'],formal.path,binding_path=formal.binding_path)
+    assert counts(current)==before
+    assert not marker_path(formal.binding_path).exists()
+    with pytest.raises(DatabaseError):
+        with open_database(formal): pass

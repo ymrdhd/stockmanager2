@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -94,7 +95,12 @@ def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previo
         # A valid backup directory is nonempty: rename cannot replace it.
         if target.exists():
             raise DatabaseError('backup destination already exists')
+        from backend.infrastructure.takeover import _sync_dir
+        for file in (snapshot,staging / MANIFEST_NAME):
+            with file.open("rb") as stream: os.fsync(stream.fileno())
+        _sync_dir(staging)
         staging.rename(target)
+        _sync_dir(target.parent)
         return target
     finally:
         if staging.exists():

@@ -221,7 +221,9 @@ def rollback_pending(binding_path: Path, *, confirm=False, isolated=False):
                 _verified(staged)
                 _publish_db(staged, official)
                 _publish_binding(binding_path, Binding(official, record['uuid'], generation))
-                if _verified(official).generation != generation or load_binding(binding_path).generation != generation:
+                verified=_verified(official)
+                if (verified.generation != generation or verified.database_uuid != record['uuid'] or verified.instance_role!='formal'
+                        or load_binding(binding_path) != Binding(official, record['uuid'], generation)):
                     raise DatabaseError('rollback verification failed')
                 marker.unlink()
                 _sync_dir(marker.parent)

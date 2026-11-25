@@ -34,8 +34,7 @@ BUSINESS_TABLES = ('accounts', 'instruments', 'trade_executions', 'trade_lots',
 REVISION_SOURCES = (('ledger_state', 'ledger_revision'), ('quote_state', 'quote_revision'))
 ATOMIC_NOTE = (
     '数据库文件与 official.json 之间存在非原子窗口（先替换数据库，再发布绑定）：两个文件不可能同时原子切换。'
-    '任一步失败时本次恢复不替换正式数据库、保留原绑定，并把原因写入报告由人工处理；'
-    '若数据库已替换而绑定没有更新，服务端会因身份不符拒绝启动，不会静默用旧库写新事实。'
+    '发布前持久化维护标记；发布中断时拒绝正式启动，使用保留的安全备份显式离线回滚。'
 )
 TEMP_SUFFIX = '.restore-tmp'
 
@@ -312,7 +311,10 @@ def _promote(path: Path, *, uuid: str, generation: int) -> Identity:
 def restore(settings: DatabaseSettings, backup_path: Path, *, confirm: bool,
             destination_report: Path | None = None) -> dict[str, Any]:
     """Replace the formal ledger with a verified backup; refuse rather than half-switch."""
+    # Reuse the takeover maintenance fence and its explicit offline rollback.
+    from backend.infrastructure.takeover import marker_path, _write_json, _sync_dir, _quiet
     official = settings.official_path
+    marker = marker_path(settings.binding_path)
     report: dict[str, Any] = {
         'ok': False, 'backup_path': str(absolute_path(Path(backup_path))),
         'target_path': str(official), 'previous_generation': None, 'new_generation': None,
@@ -391,6 +393,14 @@ def restore(settings: DatabaseSettings, backup_path: Path, *, confirm: bool,
             report['pre_restore_backup'] = str(create_backup(settings, destination))
         except (DatabaseError, OSError, sqlite3.Error) as exc:
             refuse(f'pre-restore backup of the current ledger failed: {exc}')
+        if not check_backup(settings, destination)['ok']:
+            refuse('pre-restore backup verification failed')
+        # A read-only backup of a WAL database may leave empty WAL/SHM sidecars.
+        # Let SQLite close them under the existing locks; never unlink sidecars.
+        try:
+            _quiet(official)
+        except (DatabaseError, OSError, sqlite3.Error) as exc:
+            refuse(f'formal database not quiescent after backup: {exc}')
         uuid = current.database_uuid
         # Retain an exact rollback copy, not a backup-role file, across both publications.
         # Cross-file replacement is not atomic: a power loss must fail identity checks.
@@ -410,28 +420,39 @@ def restore(settings: DatabaseSettings, backup_path: Path, *, confirm: bool,
                     report['new_generation'] = identity.generation
                     # Prepare binding before publishing the database.
                     publish_binding(temporary, Binding(official, uuid, new_generation))
+                    with staged.open('rb') as stream:
+                        os.fsync(stream.fileno())
+                    _write_json(marker, {'path': str(official), 'uuid': uuid,
+                        'old_generation': current.generation, 'new_generation': new_generation,
+                        'backup': str(destination), 'staged': str(staged), 'operation': 'restore'})
                     _swap(staged, official)
                     switched = True
+                    _sync_dir(official.parent)
                 os.replace(temporary, settings.binding_path)
                 binding_switched = True
+                _sync_dir(settings.binding_path.parent)
                 restored = DatabaseSettings(path=official, official_path=official, expected_uuid=uuid,
                                            generation=new_generation, binding_path=settings.binding_path)
-                validate_binding(restored)
+                from backend.infrastructure.binding import load_binding
+                if load_binding(settings.binding_path) != Binding(official, uuid, new_generation):
+                    raise RestoreError('published binding mismatch')
                 with closing(_open_readonly(official)) as conn:
                     validate_identity(conn, restored)
+                    if conn.execute('PRAGMA integrity_check').fetchall() != [('ok',)] or conn.execute('PRAGMA foreign_key_check').fetchall():
+                        raise RestoreError('published database verification failed')
+                marker.unlink()
+                _sync_dir(marker.parent)
             except Exception as exc:
-                try:
-                    if switched:
-                        os.replace(original, official)
-                    if binding_switched:
-                        os.replace(original_binding, settings.binding_path)
-                except OSError as rollback_error:
-                    # A consistent pre-restore backup remains available, and mismatched
-                    # identity fails closed. Do not describe this as successful rollback.
-                    refuse(f'restore and rollback failed: {exc}; {rollback_error}; '
-                           f'use pre-restore backup {destination} for offline recovery')
-                refuse(('restore aborted and original ledger restored: ' if switched else
-                        'restore aborted before switching the formal ledger: ') + str(exc))
+                if switched or binding_switched or (marker.exists() and _digest(official) != _digest(original)):
+                    refuse(f'restore publication interrupted: {exc}; use takeover-rollback with the retained pre-restore backup {destination}')
+                # Before publication it is safe to clear the fence only if both files
+                # are still the original bytes. Otherwise leave explicit recovery.
+                if marker.exists():
+                    if _digest(official) != _digest(original) or _digest(settings.binding_path) != _digest(original_binding):
+                        refuse('restore state uncertain; explicit offline rollback required')
+                    marker.unlink()
+                    _sync_dir(marker.parent)
+                refuse('restore aborted before switching the formal ledger: ' + str(exc))
             finally:
                 temporary.unlink(missing_ok=True)
     report['ok'] = True

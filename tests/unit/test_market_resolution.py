@@ -160,7 +160,7 @@ def legacy04(tmp_path):
     try: migrate_schema(engine,identity,target='0004')
     finally: engine.dispose()
     with closing(sqlite3.connect(path)) as conn,conn:
-        conn.execute("INSERT INTO instruments VALUES ('i','510300','SH','CNY',4,'etf')")
+        conn.execute("INSERT INTO instruments (id,code,market,currency,price_scale,kind) VALUES ('i','510300','SH','CNY',4,'etf')")
         for id_,price,revision in [('q1',120000,1),('q2',130000,2)]:
             conn.execute("INSERT INTO quotes VALUES (?,?,?,'fixture',?,'2026-01-06','close','valid',?,?,?,'unadjusted_security')",
                 (id_,'i',price,utc(at(6)),revision,utc(at(6)),utc(at(6,16))))

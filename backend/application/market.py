@@ -89,10 +89,21 @@ class MarketService:
     def _save(self, raw: dict) -> dict:
         # The provider observes a stable timestamp for each price version; use
         # a namespaced deterministic request key, not a new key on every poll.
+        raw = dict(raw)
+        name = raw.pop('instrument_name', None)
         canonical = {**raw,'price':str(raw['price'].normalize()),
                      'observed_at':utc(raw['observed_at']),'trading_day':raw['trading_day'].isoformat()}
         key = 'market:' + sha256(dump(canonical).encode()).hexdigest()
-        return self.portfolio.quote(QuoteInput(request_id=key,**raw))
+        result = self.portfolio.quote(QuoteInput(request_id=key,**raw))
+        if isinstance(name,str) and 0<len(name.strip())<=120 and '\ufffd' not in name and name.strip() not in ('-','--',raw['instrument_id']):
+            with self.db.transaction() as conn:
+                # Prevent a stale provider response from replacing a newer name.
+                at = utc(raw['observed_at'])
+                old = one(conn,'SELECT name,name_source,name_observed_at FROM instruments WHERE id=?',(raw['instrument_id'],))
+                if (old['name_observed_at'] is None or at>old['name_observed_at']) and (old['name']!=name.strip() or old['name_source']!=raw['source']):
+                    conn.execute('UPDATE instruments SET name=?,name_source=?,name_observed_at=? WHERE id=?',(name.strip(),raw['source'],at,raw['instrument_id']))
+                    conn.execute('UPDATE ledger_state SET ledger_revision=ledger_revision+1 WHERE id=1')
+        return result
 
     def refresh(self, instrument_id: str | None = None, *, automatic: bool = False) -> dict:
         if not self.db.settings.writable or (automatic and self.db.settings.mode != 'server'):

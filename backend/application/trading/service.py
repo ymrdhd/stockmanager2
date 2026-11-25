@@ -414,7 +414,7 @@ class TradeService:
             if existing is not None:
                 return existing
             id_ = uid()
-            conn.execute("INSERT INTO instruments VALUES (?,?,?,'CNY',4,?)", (id_, data.code, data.market, data.kind))
+            conn.execute("INSERT INTO instruments (id,code,market,currency,price_scale,kind) VALUES (?,?,?,'CNY',4,?)", (id_, data.code, data.market, data.kind))
             result = one(conn, 'SELECT * FROM instruments WHERE id=?', (id_,))
             conn.execute('UPDATE ledger_state SET ledger_revision=ledger_revision+1 WHERE id=1')
             remember(conn, data.request_id, payload, result)
@@ -673,7 +673,7 @@ class TradeService:
             return result
 
     def list_records(self, name: str, limit: int | None = None, offset: int = 0, expected_revision: int | None = None, account_id: str | None = None, instrument_id: str | None = None, from_at: datetime | None = None, to_at: datetime | None = None) -> dict:
-        queries = {'accounts': 'SELECT * FROM accounts ORDER BY id', 'instruments': 'SELECT * FROM instruments ORDER BY market,code', 'trades': 'SELECT * FROM trade_executions ORDER BY executed_at,rowid', 'pending': "SELECT * FROM trade_executions WHERE status='pending' ORDER BY executed_at,rowid", 'lots': ('SELECT l.*, COALESCE(t.account_id,o.account_id) AS account_id, COALESCE(t.instrument_id,o.instrument_id) AS instrument_id FROM trade_lots l LEFT JOIN trade_executions t ON t.id=l.open_execution_id LEFT JOIN opening_positions o ON o.id=l.opening_id ORDER BY l.rowid'), 'allocations': 'SELECT a.*,t.status AS execution_status FROM lot_allocations a JOIN trade_executions t ON t.id=a.sell_execution_id ORDER BY a.rowid', 'cash': "SELECT * FROM cash_movements ORDER BY occurred_at,CASE kind WHEN 'opening' THEN 0 ELSE 1 END,rowid"}
+        queries = {'accounts': 'SELECT * FROM accounts ORDER BY id', 'instruments': "SELECT *,CASE WHEN name IS NULL THEN 'missing' ELSE 'valid' END AS name_quality FROM instruments ORDER BY market,code", 'trades': 'SELECT * FROM trade_executions ORDER BY executed_at,rowid', 'pending': "SELECT * FROM trade_executions WHERE status='pending' ORDER BY executed_at,rowid", 'lots': ('SELECT l.*, COALESCE(t.account_id,o.account_id) AS account_id, COALESCE(t.instrument_id,o.instrument_id) AS instrument_id FROM trade_lots l LEFT JOIN trade_executions t ON t.id=l.open_execution_id LEFT JOIN opening_positions o ON o.id=l.opening_id ORDER BY l.rowid'), 'allocations': 'SELECT a.*,t.status AS execution_status FROM lot_allocations a JOIN trade_executions t ON t.id=a.sell_execution_id ORDER BY a.rowid', 'cash': "SELECT * FROM cash_movements ORDER BY occurred_at,CASE kind WHEN 'opening' THEN 0 ELSE 1 END,rowid"}
         with self.db.read() as conn:
             revision = one(conn, 'SELECT ledger_revision,earliest_affected_day FROM ledger_state')
             if expected_revision is not None and revision['ledger_revision'] != expected_revision:

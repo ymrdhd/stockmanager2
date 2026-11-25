@@ -106,7 +106,7 @@ class EastmoneyProvider:
         market = security_market(instrument)
         code = instrument['code']
         data = self._request(SPOT_URL, {'secid': f'{market}.{code}',
-                                       'fields': 'f43,f57,f59,f86,f107'})
+                                       'fields': 'f43,f57,f58,f59,f86,f107'})
         try:
             if data['f57'] != code or str(data['f107']) != str(market):
                 raise MarketDataError('provider returned a different security')
@@ -122,7 +122,7 @@ class EastmoneyProvider:
             price = exact_price(Decimal(raw).scaleb(-digits))
         except (KeyError, ValueError, OverflowError, OSError, CalendarUnavailable) as exc:
             raise MarketDataError('invalid security quote timestamp or fields') from exc
-        return {'instrument_id':instrument['id'], 'price':price, 'observed_at':observed,
+        return {'instrument_id':instrument['id'], 'instrument_name':data.get('f58'), 'price':price, 'observed_at':observed,
                 'trading_day':day, 'kind':'intraday', 'quality':'valid',
                 'source':'eastmoney:unadjusted_spot','price_basis':'unadjusted_security'}
 

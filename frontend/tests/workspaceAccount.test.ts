@@ -14,7 +14,7 @@ function ref<T>(initial:T):Ref<T>{let v=initial;const listeners=new Set<()=>void
 function watch<T>(source:Ref<T>,callback:()=>void){source.listeners.add(callback)}
 function deferred<T>(){let resolve!:(value:T)=>void,reject!:(reason:unknown)=>void;const promise=new Promise<T>((r,j)=>{resolve=r;reject=j});return {promise,resolve,reject}}
 const tick=()=>new Promise<void>(r=>setImmediate(r))
-type Setup={selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
+type Setup={pnlDay(row:Fact):Promise<void>;wentOffline():void;freshness:Ref<string>;writable:Ref<boolean>;system:Ref<Fact|null>;overview:Ref<Fact|null>;health:Ref<Fact>;selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
 function setup(request:(path:string)=>Promise<Fact>):Setup{
   const raw=readFileSync(process.env.SM2_WORKSPACE_SOURCE || new URL('../src/pages/WorkspacePage.vue',import.meta.url),'utf-8')
   const source=raw.split('<script setup lang="ts">')[1].split('</script>')[0].replace(/^import .*$/gm,'')
@@ -25,7 +25,7 @@ function setup(request:(path:string)=>Promise<Fact>):Setup{
   runInNewContext(js+`\nglobalThis.harness={selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,
   investmentError:typeof investmentError==='undefined'?{value:''}:investmentError,
   investmentLoading:typeof investmentLoading==='undefined'?{value:false}:investmentLoading,
-  navigate,refreshInvestment,refreshStrategy,loadPnlMonth,readTrade};`,context)
+  navigate,refreshInvestment,refreshStrategy,loadPnlMonth,readTrade,pnlDay,wentOffline,freshness,writable,system,overview,health};`,context)
   if(!context.harness)throw new Error('Workspace setup did not load')
   return context.harness
 }
@@ -75,4 +75,20 @@ test('actual Workspace setup: A-B-A late response with equal account id is disca
   assert.equal(viewAccount(w.valuation),'A')
   for(const d of old)d.resolve({account_id:'A',serial:-1})
   await tick();assert.equal(w.valuation.value?.serial,newSerial);assert.notEqual(newSerial,-1)
+})
+
+
+test('Workspace offline event fences writes and clears prior investment',async()=>{
+  const w=setup(async path=>({account_id:path.includes('/A')?'A':'B'}))
+  w.health.value={kind:'connected'};w.system.value={writable:true};w.overview.value={ledger_revision:1};w.selectedAccount.value='A'
+  await w.refreshInvestment(false);assert.equal(w.writable.value,true)
+  w.wentOffline();assert.equal(w.writable.value,false);assert.equal(w.freshness.value,'stale');assert.equal(w.valuation.value,null)
+})
+
+test('Workspace refuses different version of month detail',async()=>{
+  const row={as_of:'2026-01-06T07:00:00+00:00'}
+  const snap={account_id:'A',ledger_revision:5,quote_revision:3,database_uuid:'demo',generation:1,items:[row]}
+  const w=setup(async path=>path.includes('/month?')?snap:{...snap,ledger_revision:6,as_of:row.as_of})
+  w.selectedAccount.value='A';w.pnlMonth.value='2026-01';await w.loadPnlMonth();await w.pnlDay(row)
+  assert.equal(w.valuation.value,null);assert.equal(w.pnlHistory.value,null);assert.match(w.investmentError.value,/版本/)
 })

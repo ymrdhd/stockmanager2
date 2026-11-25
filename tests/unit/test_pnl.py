@@ -189,7 +189,7 @@ def legacy_trading(tmp_path):
     with closing(sqlite3.connect(path)) as conn,conn:
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute("INSERT INTO accounts VALUES ('a','account','securities','CNY','ledger','active')")
-        conn.execute("INSERT INTO instruments VALUES ('i','510300','SH','CNY',4,'etf')")
+        conn.execute("INSERT INTO instruments (id,code,market,currency,price_scale,kind) VALUES ('i','510300','SH','CNY',4,'etf')")
         from backend.application.trading.service import canonical,dump,utc
         for id_,side,qty,status,day in [('buy','buy',100,'effective',5),('sell','sell',10,'effective',6),('old','sell',5,'reversed',6)]:
             v=canonical(trade('a','i',id_,side=side,quantity=qty,day=day,price='10',fees_fen=0))

@@ -19,8 +19,8 @@ from sqlalchemy.engine import URL, Engine
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE = ROOT / 'data' / 'stock_manager.sqlite'
 DEFAULT_BINDING = ROOT / "data" / "official.json"
-SCHEMA_VERSION = 10
-REVISION = '0010'
+SCHEMA_VERSION = 11
+REVISION = '0011'
 BUSY_TIMEOUT_MS = 5000
 Role = Literal['formal', 'sandbox', 'backup']
 InitialRole = Literal['formal', 'sandbox']
@@ -160,7 +160,7 @@ def read_identity(conn: sqlite3.Connection, *, allow_previous: bool = False) -> 
         versions = conn.execute('SELECT version_num FROM alembic_version').fetchall()
         if len(rows) != 1:
             raise DatabaseError('invalid metadata row count')
-        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006', 7: '0007', 8: '0008', 9: '0009'} if allow_previous else {})}
+        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006', 7: '0007', 8: '0008', 9: '0009', 10: '0010'} if allow_previous else {})}
         if rows[0][3] not in expected or versions != [(expected[rows[0][3]],)]:
             raise DatabaseError('incompatible database metadata or Alembic revision')
         identity = Identity(*rows[0])
@@ -252,7 +252,7 @@ def validate_binding(settings: DatabaseSettings) -> None:
             raise DatabaseError('local mode must not open the formal database')
         return
     if os.path.lexists(settings.binding_path.with_name(settings.binding_path.name + '.takeover-pending')):
-        raise DatabaseError('unfinished takeover; offline recovery required')
+        raise DatabaseError('unfinished takeover or restore; offline recovery required')
     bound = load_binding(settings.binding_path)
     if bound.path != settings.official_path or (bound.path, bound.uuid, bound.generation) != (
             settings.path, settings.expected_uuid, settings.generation):
@@ -394,7 +394,7 @@ def initialize_database(path: Path, *, role: InitialRole, confirm: bool,
                 raise DatabaseError('sandbox conflicts with fixed formal binding')
             return _initialize_database(path, role=role, confirm=True, official_path=official)
         if os.path.lexists(binding_path.with_name(binding_path.name + '.takeover-pending')):
-            raise DatabaseError('unfinished takeover; offline recovery required')
+            raise DatabaseError('unfinished takeover or restore; offline recovery required')
         if binding_path.exists() or binding_path.is_symlink():
             raise DatabaseError('formal binding already exists; cannot initialize another formal database')
         identity = _initialize_database(path, role=role, confirm=True, official_path=official_path)
@@ -414,7 +414,7 @@ def adopt_database(settings: DatabaseSettings, *, confirm: bool) -> Identity:
     file.parent.mkdir(parents=True, exist_ok=True)
     with writer_lock(file):
         if os.path.lexists(file.with_name(file.name + '.takeover-pending')):
-            raise DatabaseError('unfinished takeover; offline recovery required')
+            raise DatabaseError('unfinished takeover or restore; offline recovery required')
         if file.exists() or file.is_symlink():
             raise DatabaseError('formal binding already exists')
         _single_file(settings.path)

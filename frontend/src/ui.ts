@@ -41,7 +41,7 @@ export function localTime(value: unknown): string {
   return parts.replace(' ', 'T')
 }
 export const now = () => localTime(new Date().toISOString())
-const names: Record<string,string> = {valid:'有效', unavailable:'不可用', derived_unverified:'未核实', conflict:'冲突', stale:'过期', missing:'缺失', pending:'待核对', effective:'有效', reversed:'已冲正', active:'启用', closed:'关闭', securities:'证券', bank:'银行', cash:'现金', payment:'支付账户', other_asset:'其他资产', credit_card:'信用卡', other_liability:'其他负债', buy:'买入', sell:'卖出', ordinary:'普通', main:'主仓', sub:'子仓', income:'收入', expense:'支出', fee:'手续费', opening:'期初', deposit:'入金', withdrawal:'出金', adjustment:'余额校正', dividend:'分红', server:'正式服务', sandbox:'可写沙盒', readonly:'只读', development:'无数据库开发模式', asset:'资产', liability:'负债'}
+const names: Record<string,string> = {valid:'有效', unavailable:'不可用', derived_unverified:'未核实', conflict:'冲突', stale:'过期', missing:'缺失', pending:'待核对', effective:'有效', reversed:'已冲正', active:'启用', closed:'关闭', securities:'证券', bank:'银行', cash:'现金', payment:'支付账户', other_asset:'其他资产', credit_card:'信用卡', other_liability:'其他负债', buy:'买入', sell:'卖出', ordinary:'普通', main:'主仓', sub:'子仓', income:'收入', expense:'支出', fee:'手续费', refund:'退款', posted:'已入账', corrected:'已更正', voided:'已作废', verified:'已核实', unverified:'未核实', opening:'期初', deposit:'入金', withdrawal:'出金', adjustment:'余额校正', dividend:'分红', server:'正式服务', sandbox:'可写沙盒', readonly:'只读', development:'无数据库开发模式', asset:'资产', liability:'负债'}
 export function display(value: unknown, key = ''): string {
   if (value === null || value === undefined) return '不可用'
   if (key.endsWith('_fen')) return money(value)

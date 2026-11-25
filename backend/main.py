@@ -64,7 +64,7 @@ def create_app(config: AppConfig | None = None, *, database: DatabaseSettings | 
             app.state.database = db
             market = MarketService(db, market_provider) if db is not None else None
             app.state.market = market
-            app.state.strategy = StrategyService(db) if db is not None else None
+            app.state.strategy = StrategyService(db, near_stop_bps=settings.near_stop_bps) if db is not None else None
             stop = asyncio.Event()
             worker = (asyncio.create_task(market.run(stop, settings.market_refresh_seconds))
                       if market is not None and database is not None and database.mode == 'server'
@@ -108,14 +108,14 @@ def create_app(config: AppConfig | None = None, *, database: DatabaseSettings | 
         web = {'built': root is not None, 'path': str(root) if root is not None else None}
         if db is None:
             return {'mode': 'development', 'writable': False, 'identity': None,
-                    'version': settings.version, 'web': web,
+                    'version': settings.version, 'web': web, 'listen_port': (request.scope.get('server') or (None,None))[1],
                     'auth_required': security is not None}
         # Report identity only after checking the current binding in a read transaction.
         with db.read():
             return {'mode': ('server' if db.settings.mode == 'server' else
                              'sandbox' if db.settings.writable else 'readonly'),
                     'writable': db.settings.writable, 'identity': asdict(db.identity),
-                    'version': settings.version, 'web': web,
+                    'version': settings.version, 'web': web, 'listen_port': (request.scope.get('server') or (None,None))[1],
                     'auth_required': security is not None}
 
     root = web_root(settings.static_dir)

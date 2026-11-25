@@ -342,7 +342,7 @@ class TencentQuoteProvider(TencentProvider):
             quote_time(day, effective, kind)
         except CalendarUnavailable as exc:
             raise TencentError("exchange calendar unavailable for quote session") from exc
-        return {"instrument_id": instrument["id"], "price": price, "observed_at": effective,
+        return {"instrument_id": instrument["id"], "instrument_name": parts[1].strip(), "price": price, "observed_at": effective,
                 "trading_day": day, "kind": kind, "quality": "valid",
                 "source": "tencent:unadjusted_spot", "price_basis": "unadjusted_security"}
 

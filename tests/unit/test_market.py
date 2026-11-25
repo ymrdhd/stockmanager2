@@ -267,7 +267,7 @@ def legacy_quotes(tmp_path):
     try: migrate_schema(engine,identity,target='0003')
     finally: engine.dispose()
     with closing(sqlite3.connect(path)) as conn,conn:
-        conn.execute("INSERT INTO instruments VALUES ('i','510300','SH','CNY',4,'etf')")
+        conn.execute("INSERT INTO instruments (id,code,market,currency,price_scale,kind) VALUES ('i','510300','SH','CNY',4,'etf')")
         conn.execute("INSERT INTO quotes VALUES ('old','i',100000,'old_fixture',?,'2026-01-05','close','valid',1)",(utc(at(8)),))
         conn.execute("INSERT INTO quotes VALUES ('invalid','i',100000,'old_fixture',?,'2026-01-04','close','valid',2)",(utc(at(8)),))
         conn.execute('UPDATE quote_state SET quote_revision=2')

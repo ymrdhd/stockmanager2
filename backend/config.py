@@ -40,6 +40,7 @@ class AppConfig(BaseModel):
     name: str = "Stock Manager 2.0"
     version: str = "2.0.0-dev"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    near_stop_bps: int = Field(default=200, ge=0, le=1000)
     market_auto_refresh: bool = True
     market_refresh_seconds: int = Field(default=20, ge=10, le=300)
     # Production entry points pass the built browser application; tests opt out.

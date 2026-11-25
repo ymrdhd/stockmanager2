@@ -31,8 +31,8 @@ def opening(data: OpeningInput,svc: Service):
 @router.get('/openings')
 def openings(svc: Service,account_id: str|None=None,
              limit: Annotated[int,Query(ge=1,le=500)]=100,
-             offset: Annotated[int,Query(ge=0,le=10**9)]=0):
-    result=invoke(svc.openings,account_id,limit,offset)
+             offset: Annotated[int,Query(ge=0,le=10**9)]=0, ledger_revision: int|None=None):
+    result=invoke(svc.openings,account_id,limit,offset,ledger_revision)
     result['source']='sqlite_ledger'
     result['quality']='derived_unverified' if result['data_incomplete'] else 'valid'
     result['as_of']=datetime.now().astimezone().isoformat()
@@ -76,8 +76,8 @@ def quotes(instrument_id: str,as_of: datetime,svc: Service,quote_revision: int|N
 
 
 @router.get('/portfolio/{account_id}')
-def valuation(account_id: str,as_of: datetime,svc: Service,previous_trading_day: date|None=None,quote_revision: int|None=None):
-    return invoke(svc.valuation,account_id,as_of,previous_trading_day,quote_revision)
+def valuation(account_id: str,as_of: datetime,svc: Service,previous_trading_day: date|None=None,quote_revision: int|None=None, ledger_revision: int|None=None, database_uuid: str|None=None,generation: int|None=None):
+    return invoke(svc.valuation,account_id,as_of,previous_trading_day,quote_revision,ledger_revision,database_uuid,generation)
 
 
 @router.get('/portfolio/{account_id}/month')

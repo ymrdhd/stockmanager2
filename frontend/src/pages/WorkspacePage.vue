@@ -29,7 +29,7 @@ async function loadNetTrend(){
 function exportNetTrend(){
   if(!netTrend.value)return
   // Export only server timestamps, fixed-point amounts and quality tokens; unknown amounts stay blank.
-  const keys=['as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','securities_equity_fen','quality']
+  const keys=['as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','liquid_net_worth_fen','liquid_assets_fen','securities_equity_fen','quality']
   const scalar=(x:unknown)=>x==null?'':String(x).replace(/[\r\n,"]/g,'')
   const snapshot=netTrend.value
   const text=['ledger_revision,quote_revision,'+keys.join(','),...facts(snapshot.items).map(r=>[snapshot.ledger_revision,snapshot.quote_revision,...keys.map(k=>r[k])].map(scalar).join(','))].join('\r\n')
@@ -59,7 +59,17 @@ async function loadPnlMonth(){
 }
 async function pnlDay(row:Fact){
   if(!pnlHistory.value||str(pnlHistory.value.account_id)!==selectedAccount.value)return
-  asOf.value=localTime(row.as_of);await loadInvestment()
+  const snapshot=pnlHistory.value, ticket=accountScope.capture(), token=++valuationSequence
+  valuation.value=null;strategy.value=null;investmentLoading.value=true;investmentError.value=''
+  try{
+    const params=new URLSearchParams({as_of:str(row.as_of),ledger_revision:String(snapshot.ledger_revision),quote_revision:String(snapshot.quote_revision),database_uuid:str(snapshot.database_uuid),generation:String(snapshot.generation)})
+    const result=await api('/portfolio/'+encodeURIComponent(ticket.account)+'?'+params.toString())
+    if(active&&token===valuationSequence&&accountScope.accepts(ticket,result)&&pnlHistory.value===snapshot){
+      if(result.ledger_revision!==snapshot.ledger_revision||result.quote_revision!==snapshot.quote_revision||result.database_uuid!==snapshot.database_uuid||result.generation!==snapshot.generation||result.as_of!==row.as_of)throw new Error('收益版本已变化，请重新查询摘要')
+      asOf.value=localTime(row.as_of);valuation.value=result
+    }
+  }catch(e){if(active&&token===valuationSequence&&accountScope.current(ticket)){investmentError.value=String(e);pnlError.value='无法读取同版本详情，请重新查询月度摘要。';pnlHistory.value=null}}
+  finally{if(active&&token===valuationSequence&&accountScope.current(ticket))investmentLoading.value=false}
 }
 const strategyMode=ref<'current'|'historical'>('current'), strategyDay=ref('')
 function strategyQuery(){
@@ -68,7 +78,7 @@ function strategyQuery(){
   return '?mode=historical&as_of='+encodeURIComponent(strategyDay.value)
 }
 function resetStrategyMode(){poolSequence++;pool.value=null;positionsView.value=null;strategyLoading.value=false;signalFeedback.value='';strategyError.value=''}
-const openings=ref<Fact[]>([]), openingsError=ref('')
+
 const tradeAccount=ref(''),tradeInstrument=ref(''),tradeFrom=ref(''),tradeTo=ref(''),tradePath=ref('/trades'),tradeDetail=ref<Fact|null>(null),tradeReadError=ref('')
 function filterTrades(){
   tradeScope.reset(tradeAccount.value,()=>{tradeSequence++;tradeEpoch.value++;tradeReadError.value='';tradeDetail.value=null;tradePath.value='/trades'+(tradeAccount.value?'?account_id='+encodeURIComponent(tradeAccount.value):'')})
@@ -117,25 +127,25 @@ function identityKey(status:Fact): string {
   return JSON.stringify([status.mode,i.database_uuid,i.generation,i.schema_version])
 }
 /** Never throw while polling: an unverified status can simply be re-read later. */
-function safeKey(status:Fact|null): string {try{return status?identityKey(status):''}catch{return ''}}
+function safeKey(status:Fact|null): string {try{if(!status?.identity)return '';const i=fact(status.identity);return JSON.stringify([status.mode,i.database_uuid,i.generation,i.schema_version])}catch{return ''}}
 function syncPending() {
   retryPending.value=writer.pending!==null
   pendingCorrupt.value=writer.corrupt
   storageError.value=writer.storageError
   if(!writer.pending&&!writer.corrupt)pendingIdentity=null
 }
-const writable=computed(()=>health.value.kind==='connected'&&system.value?.writable===true&&overview.value!==null&&!busy.value&&!blocked.value&&!loading.value)
+const writable=computed(()=>health.value.kind==='connected'&&system.value?.writable===true&&overview.value!==null&&freshness.value==='live'&&!busy.value&&!blocked.value&&!loading.value)
 const securities=computed(()=>accounts.value.filter(a=>a.kind==='securities'))
 const accountRows=computed(()=>overview.value?facts(overview.value.accounts):[])
 const overviewMonth=computed(()=>overview.value?fact(overview.value.finance_month):null)
 const positions=computed(()=>valuation.value?facts(valuation.value.positions):[])
-const filteredPositions=computed(()=>{const q=holdingSearch.value.trim().toLowerCase();return positions.value.filter(p=>{const i=instruments.value.find(i=>i.id===p.instrument_id);return !q||[p.code,i?.name,i?.code].some(v=>str(v).toLowerCase().includes(q))})})
+const filteredPositions=computed(()=>{const q=holdingSearch.value.trim().toLowerCase();return positions.value.filter(p=>{const i=instruments.value.find(i=>i.id===p.instrument_id);return !q||[p.code,p.name,i?.name,i?.code].some(v=>str(v).toLowerCase().includes(q))})})
 const currentLots=computed(()=>filteredPositions.value.flatMap(p=>facts(p.lots).map(l=>({...l,code:p.code,market:p.market}))))
 const currentRevision=computed(()=>Number(overview.value?.ledger_revision ?? 0))
 const cols=(fields:Record<string,string>)=>Object.entries(fields).map(([key,label])=>({key,label}))
 const accountColumns=cols({name:'账户',kind:'类型',asset_class:'资产/负债',balance_fen:'余额/权益（元）',balance_at:'余额时点',effective_at:'生效日期',effective_date_quality:'生效日期质量',included:'纳入统计',status:'当前状态',quality:'质量',reasons:'异常原因'})
 const cashColumns=cols({id:'流水ID',account_id:'证券账户ID',kind:'类型',amount_fen:'金额',occurred_at:'时间',transfer_id:'内部转账ID',reversal_of:'冲正来源',note:'备注'})
-const billColumns=cols({id:'账单ID',account_id:'账户ID',kind:'类型',category_id:'分类',amount_fen:'金额',occurred_at:'日期',status:'状态',note:'备注'})
+const billColumns=cols({id:'账单ID',account_id:'账户ID',kind:'类型',category_id:'分类',amount_fen:'金额',net_amount_fen:'冲减后金额',related_transaction_id:'原支出',occurred_at:'日期',status:'状态',note:'备注'})
 const transferColumns=cols({id:'转账ID',from_account_id:'转出账户ID',to_account_id:'转入账户ID',amount_fen:'金额',occurred_at:'日期',status:'状态',from_included:'转出已包含',to_included:'转入已包含',note:'备注'})
 // Use actual returned IDs and versions for every write; never estimate a balance in the browser.
 function openForm(make:()=>FormSpec) {if(!writable.value)return;error.value='';feedback.value='';try{formIdentity=identityKey(system.value??{});formIntent=writer.beginIntent();spec.value=make();formKey.value++}catch(e){error.value=String(e)}}
@@ -154,13 +164,16 @@ async function loadMaster(path:string):Promise<Fact[]> {
   return items
 }
 async function reload() {
-  const token=++sequence;loading.value=true;readError.value='';clearAccountViews();month.value=null;historical.value=null
+  const oldIdentity=safeKey(system.value);spec.value=null;backupState.value=null;migrationState.value=null;quoteEvidence.value=null;quoteSequence++
+  const token=++sequence;loading.value=true;readError.value='';freshness.value='stale';clearAccountViews();month.value=null;historical.value=null
   clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[]
   session.forgetIdentity()
   try {
     const h=await getHealth();if(!active||token!==sequence)return;health.value=h
     if(h.kind!=='connected')throw new Error('后端连接失败；未切换数据库，旧数据不再显示为当前值。')
     const status=await api('/system/status');if(!active||token!==sequence)return;system.value=status
+    if(oldIdentity&&oldIdentity!==safeKey(status)){selectedAccount.value='';tradeAccount.value='';quoteInstrument.value='';feedback.value='数据库身份已变化，旧表单已失效；待核实请求仍保留。'}
+    if(status.auth_required===true){const activeSession=await session.stored();if(!active||token!==sequence)return;if(!activeSession)throw new ApiError('会话已失效',false,401);sessionName.value=activeSession.username;signIn.value=false}
     session.declare(status)
     if(status.mode==='development'){readError.value='开发健康模式，无业务数据库。请通过正式或隔离沙盒启动。';return}
     const [o,m,a,i,c,l]=await Promise.all([api('/finance/overview'),api('/market/status'),loadMaster('/accounts'),loadMaster('/instruments'),loadMaster('/finance/categories'),loadMaster('/lots')])
@@ -172,15 +185,16 @@ async function reload() {
     refresh.value++
     if(selectedAccount.value)await loadInvestment()
     await loadMonth()
+    if(active&&token===sequence&&!readError.value){freshness.value='live';freshnessNote.value=''}
   } catch(e) {if(active&&token===sequence)handleRead(e)}
   finally {if(active&&token===sequence)loading.value=false}
 }
 /** A rejected session must ask for credentials again instead of showing stale data. */
 function handleRead(e:unknown) {
-  readError.value=String(e)
-  if(e instanceof ApiError&&e.status===401){signIn.value=true;sessionName.value='';readError.value='会话已过期或被撤销，请重新登录。';forget()}
+  readError.value=String(e);markStale('读取失败，禁止写入')
+  if(e instanceof ApiError&&e.status===401){markStale('会话已失效，禁止写入');signIn.value=true;sessionName.value='';readError.value='会话已过期或被撤销，请重新登录。';forget()}
 }
-function forget() {sequence++;clearAccountViews();quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
+function forget() {sequence++;backupState.value=null;migrationState.value=null;quoteEvidence.value=null;maintenanceError.value='';clearAccountViews();quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
 async function signInSubmit() {
   if(busy.value)return
   error.value='';authState.value='正在登录…';busy.value=true
@@ -206,7 +220,7 @@ async function refreshInvestment(quiet:boolean){
     const time=asOf.value?shanghaiTime(asOf.value):new Date().toISOString()
     const id=encodeURIComponent(ticket.account), query=`?as_of=${encodeURIComponent(time)}`
     const [v,s]=await Promise.all([api(`/portfolio/${id}${query}`),api(`/strategy/evidence/${id}${query}`)])
-    if(active&&token===valuationSequence&&accountScope.accepts(ticket,v,s)){valuation.value=v;strategy.value=s}
+    if(active&&token===valuationSequence&&accountScope.accepts(ticket,v,s)){if(v.ledger_revision!==s.ledger_revision||v.quote_revision!==s.quote_revision||v.database_uuid!==s.database_uuid||v.generation!==s.generation||v.as_of!==s.as_of)throw new Error('持仓与证据版本不一致，请重新读取');valuation.value=v;strategy.value=s}
   }catch(e){if(active&&token===valuationSequence&&accountScope.current(ticket)){valuation.value=null;strategy.value=null;investmentError.value=String(e)}}
   finally{if(active&&token===valuationSequence&&accountScope.current(ticket))investmentLoading.value=false}
 }
@@ -220,14 +234,8 @@ async function loadQuotes() {
     if(active&&token===quoteSequence)quoteEvidence.value=r
   }catch(e){if(active&&token===quoteSequence)quoteError.value=String(e)}
 }
-async function loadMonth(){month.value=null;try{month.value=await api('/finance/month'+(period.value?`?period=${encodeURIComponent(period.value)}`:''))}catch(e){readError.value=String(e)}}
-/** The read-only opening list is the source for correcting or voiding a batch. */
-async function loadOpenings(){
-  openingsError.value='';openings.value=[]
-  try{openings.value=page(await api('/openings?limit=200&offset=0')).items}
-  catch(e){openingsError.value=String(e)}
-}
-async function loadHistory(){historical.value=null;try{if(!historyTime.value)throw new Error('请选择历史估值时间');historical.value=await api(`/finance/overview?as_of=${encodeURIComponent(shanghaiTime(historyTime.value))}`)}catch(e){readError.value=String(e)}}
+async function loadMonth(){month.value=null;const token=sequence;try{const result=await api('/finance/month'+(period.value?`?period=${encodeURIComponent(period.value)}`:''));if(active&&token===sequence)month.value=result}catch(e){if(active&&token===sequence)handleRead(e)}}
+async function loadHistory(){historical.value=null;const token=sequence;try{if(!historyTime.value)throw new Error('请选择历史估值时间');const result=await api(`/finance/overview?as_of=${encodeURIComponent(shanghaiTime(historyTime.value))}`);if(active&&token===sequence)historical.value=result}catch(e){if(active&&token===sequence)readError.value=String(e)}}
 async function submit(values:Record<string,string>) {
   if(!spec.value||!writable.value)return
   error.value='';feedback.value=''
@@ -237,7 +245,7 @@ async function submit(values:Record<string,string>) {
   if(!window.confirm(`${spec.value.title}\n${spec.value.confirm??'请核对真实事实及金额。'}\n确定提交？`))return
   busy.value=true
   try{const expected=identityKey(system.value??{});const checked=await api('/system/status');if(spec.value!==submitted||intent!==formIntent||expected!==originalIdentity||identityKey(checked)!==expected)throw new Error('数据库身份已变化，拒绝提交；请重新读取并重新打开表单');session.declare(checked);pendingIdentity=expected;await writer.start(submitted.path,body,submitted.method,intent);feedback.value='提交已确认。正在重新读取实际账本。';spec.value=null;await reload()}
-  catch(e){error.value=String(e)}finally{syncPending();busy.value=false}
+  catch(e){error.value=String(e);if(e instanceof ApiError&&e.status===401)handleRead(e);else if(!(e instanceof ApiError)||e.uncertain||e.status===undefined)markStale('写入结果待核实，请重新读取')}finally{syncPending();busy.value=false}
 }
 /**
  * Resolve an unconfirmed write: ask the server about the original request ID first,
@@ -316,12 +324,17 @@ async function writeStrategySignals(){
   finally{if(active&&token===poolSequence&&accountScope.current(ticket))signalWriting.value=false}
 }
 async function loadMaintenance(){
-  maintenanceError.value='';maintenanceLoading.value=true;backupState.value=null;migrationState.value=null
+  maintenanceError.value='';maintenanceLoading.value=true;backupState.value=null;migrationState.value=null;const token=sequence
   try{
     const [b,m]=await Promise.all([api('/maintenance/backups'),api('/maintenance/migration')])
-    backupState.value=b;migrationState.value=m
-  }catch(e){maintenanceError.value=String(e)}
+    if(active&&token===sequence){backupState.value=b;migrationState.value=m}
+  }catch(e){if(active&&token===sequence){maintenanceError.value=String(e);if(e instanceof ApiError&&e.status===401)handleRead(e)}}
   finally{maintenanceLoading.value=false}
+}
+async function createManualBackup(){
+  if(!writable.value||maintenanceLoading.value)return
+  maintenanceLoading.value=true;maintenanceError.value='';feedback.value=''
+  try{const result=await api('/maintenance/backups','POST');if(result.ok!==true||result.verified!==true)throw new Error('未取得已验证备份');feedback.value='备份已校验：'+str(result.name)+'，'+str(result.backup_at);await loadMaintenance()}catch(e){maintenanceError.value=String(e)}finally{maintenanceLoading.value=false}
 }
 async function refreshMarket(){if(!writable.value)return;busy.value=true;error.value='';feedback.value='';try{const r=await api('/market/refresh','POST');feedback.value=`实际行情刷新结果：${JSON.stringify(r)}`;await reload()}catch(e){error.value=String(e)}finally{busy.value=false}}
 function beforeUnload(e:BeforeUnloadEvent){if(writer.pending||writer.corrupt||busy.value){e.preventDefault();e.returnValue=''}}
@@ -338,18 +351,19 @@ function markStale(reason:string){freshness.value='stale';freshnessNote.value=re
  * surfaced as a stale marker instead of silently keeping the old numbers current.
  */
 async function poll(){
-  if(!active||busy.value||loading.value||blocked.value||spec.value||signIn.value)return
-  if(health.value.kind!=='connected')return
-  if(tab.value!=='总览'&&tab.value!=='投资')return
+  if(!active||busy.value||loading.value||signIn.value)return
+  const token=sequence
+  if(health.value.kind!=='connected'||freshness.value==='stale'){await reload();return}
+  // Check connection and identity even on financial and maintenance pages.
   try{
-    const status=await api('/system/status');if(!active)return
+    const status=await api('/system/status');if(!active||token!==sequence)return
     const key=safeKey(status)
-    if(key&&safeKey(system.value)&&key!==safeKey(system.value)){
-      readError.value='数据库身份或可写状态已变化；已停止自动更新，请点击「重新读取」核对后再操作。';stopPolling();markStale('数据库身份已变化，显示的是上一次成功读取的值');clearStrategyView();todo.value=null;netTrend.value=null;return
+    if(key!==safeKey(system.value)||status.writable!==system.value?.writable){
+      forget();readError.value='数据库身份或可写状态已变化；请点击「重新读取」核对后再操作。';markStale('数据库身份已变化，旧数据已清除');return
     }
     system.value=status;session.declare(status)
     if(status.mode==='development'){freshness.value='unavailable';freshnessNote.value='开发健康模式，无业务数据库';return}
-    const [o,m]=await Promise.all([api('/finance/overview'),api('/market/status')]);if(!active)return
+    const [o,m]=await Promise.all([api('/finance/overview'),api('/market/status')]);if(!active||token!==sequence)return
     if(overview.value&&Number(o.ledger_revision)!==Number(overview.value.ledger_revision)){refresh.value++;clearStrategyView();todo.value=null;netTrend.value=null}
     const quoteMoved=!market.value||Number(m.quote_revision)!==Number(market.value.quote_revision)
     if(quoteMoved){clearStrategyView();netTrend.value=null}
@@ -357,21 +371,23 @@ async function poll(){
     freshness.value='live';freshnessNote.value='';lastPollAt.value=new Date().toISOString()
     if(tab.value==='投资'&&selectedAccount.value&&!asOf.value&&(quoteMoved||refresh.value))await refreshInvestment(true)
   }catch(e){
-    if(!active)return
+    if(!active||token!==sequence)return
     if(e instanceof ApiError&&e.status===401){handleRead(e);markStale('会话已过期，显示的是上次成功读取的值');return}
     // A transport failure proves nothing about the ledger: keep the numbers but label them stale.
     markStale(`自动刷新失败（${String(e)}），下列数字是 ${lastPollAt.value?localTime(lastPollAt.value)+' ':'上一次'}读取的旧值，不是当前值`)
   }
 }
+function wentOffline(){markStale('网络中断，禁止正式写入；待核实请求仍保留');sequence++;valuationSequence++;quoteSequence++;clearAccountViews();loading.value=false}
+function cameOnline(){if(!busy.value)void reload()}
 function stopPolling(){if(timer){clearInterval(timer);timer=undefined}}
 async function boot(){
   syncPending()
-  const existing=await session.stored()
+  const existing=await session.stored().catch(()=>null)
   if(!active)return
   sessionName.value=existing?.username ?? ''
   // reload() turns the login panel on by itself when the server answers 401.
   await reload()
-  if(existing!==null&&health.value.kind==='connected')signIn.value=false
+  // reload/handleRead is authoritative; do not hide the login panel after a 401.
 }
 /** Cross-tab: another tab may create, retry or abandon the pending write. */
 function onStorage(){syncPending()}
@@ -396,8 +412,8 @@ watch(selectedAccount,()=>{
   if(!retryPending.value)spec.value=null
   if(tab.value==='投资'&&!loading.value&&selectedAccount.value)void loadInvestment()
 },{flush:'sync'})
-onMounted(()=>{void boot();window.addEventListener('beforeunload',beforeUnload);window.addEventListener('storage',onStorage);timer=setInterval(()=>{void poll()},20000)})
-onBeforeUnmount(()=>{active=false;accountScope.reset('',()=>{});tradeScope.reset('',()=>{});sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage)})
+onMounted(()=>{void boot();window.addEventListener('beforeunload',beforeUnload);window.addEventListener('storage',onStorage);window.addEventListener('offline',wentOffline);window.addEventListener('online',cameOnline);timer=setInterval(()=>{void poll()},20000)})
+onBeforeUnmount(()=>{active=false;accountScope.reset('',()=>{});tradeScope.reset('',()=>{});sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage);window.removeEventListener('offline',wentOffline);window.removeEventListener('online',cameOnline)})
 const validTransfer=(r:Fact)=>r.status==='effective'
 const accountById=(id:unknown)=>accountRows.value.find(a=>a.id===id)
 
@@ -410,7 +426,7 @@ const nested=(v:unknown)=>v&&typeof v==='object'&&!Array.isArray(v)?v as Fact:{}
 const statusText=(v:unknown)=>statusLabels[str(v)]??display(v)
 function ndxText(aux:Fact):string{
   if(!aux.status)return '—'
-  return `${str(aux.status)}：${str(aux.detail)}；目标 ${aux.target_ratio==null?'—':num(Number(aux.target_ratio)*100,1)+'%'} / ${aux.target_amount==null?'—':num(aux.target_amount,2)+' 元'}；实际 ${aux.actual_quantity??'—'} 股；不预留资金${aux.next_etf_session?'；适用 '+str(aux.next_etf_session):''}`
+  return `${str(aux.status)}：${str(aux.detail)}；目标 ${aux.target_ratio==null?'—':num(Number(aux.target_ratio)*100,1)+'%'} / ${aux.target_amount==null?'—':num(aux.target_amount,2)+' 元'}；实际 ${aux.actual_quantity??'—'} 股；当前比例 ${aux.current_ratio==null?'—':num(Number(aux.current_ratio)*100,1)+'%'}；实际现金 ${money(aux.actual_cash_fen)}；现金缓冲 25 万元；不预留资金${aux.next_etf_session?'；适用 '+str(aux.next_etf_session):''}`
 }
 /** Which price series a row was computed on; the two are never mixed in one number. */
 const basisLabels:Record<string,string>={index_level:'指数点位',etf_unadjusted:'ETF 未复权',etf_adjusted:'ETF 复权价'}
@@ -449,11 +465,12 @@ const positionRows=computed(()=>positionsView.value?facts(positionsView.value.it
     term_text:`第 ${p.holding_days??'—'}/${p.exit_after_bars??'—'} 日；续期 ${p.renewals??0} 次；E2a 延持 ${p.e2a_extended_days??0}/10${p.extended?'（延持中）':''}`,
     pyramid_text:pyramid.reason?`${str(pyramid.status)}：${str(pyramid.reason)}`:'—',
     ndx_text:ndxText(aux),
+    near_stop_text:(Array.isArray(item.near_stop)?facts(item.near_stop):[]).map(r=>`${display(r.role)}：${r.status==='protection_reached'?'报价达到保护价':'接近止损'}（报价 ${r.quote_price}，保护价 ${r.stop_price}，${display(r.quote_at,'quote_at')}，${r.quote_source}）`).join('；')||'无已核实提示',
     action_text:`【模型建议，非实际成交】${actionLabels[str(p.action)]??display(p.action)}${p.action_price==null?'':` @ ${num(p.action_price)}`}${str(p.action_reason)?`；${str(p.action_reason)}`:''}`,
     live_text:item.live_quantity==null?'真实数量不可核实':`策略记录 ${p.add_executed?'已加仓':'主仓'}；账本剩余 ${item.live_quantity} 股`,
     cooldown_text:cooldown.active==null?'冷却状态不可核实':cooldown.active?str(cooldown.note)||'冷却中':'无冷却限制',
   }}):[])
-const positionColumns=computed(()=>cols({label:'指数与交易标的',entry_text:'建仓事实（策略证据）',atr_text:'信号日 ATR',stop_text:'当前保护价',trail_text:'跟踪止盈',term_text:'时间退出',pyramid_text:'盈利加仓条件',ndx_text:'NDX 辅助仓',action_text:'策略建议',live_text:'实际持仓对照',cooldown_text:'冷却'}).concat([{key:'warnings',label:'未核对与提示'}]))
+const positionColumns=computed(()=>cols({label:'指数与交易标的',entry_text:'建仓事实（策略证据）',atr_text:'信号日 ATR',stop_text:'当前保护价',near_stop_text:'报价风险提示（非策略指令）',trail_text:'跟踪止盈',term_text:'时间退出',pyramid_text:'盈利加仓条件',ndx_text:'NDX 辅助仓',action_text:'策略建议',live_text:'实际持仓对照',cooldown_text:'冷却'}).concat([{key:'warnings',label:'未核对与提示'}]))
 /** Only a recorded formal signal on the unadjusted ETF series may prefill a trade form. */
 function canFill(row:Fact):boolean{
   const status=str(row.status)
@@ -529,11 +546,12 @@ function openTradeFromSignal(row:Fact){
       <section v-if="tab==='总览'">
         <h2>个人资产总览</h2>
         <template v-if="overview">
-          <dl class="metrics"><div v-for="item in cols({net_worth_fen:'净资产',total_assets_fen:'总资产',total_liabilities_fen:'总负债',securities_equity_fen:'证券权益',securities_cash_fen:'证券现金',securities_market_value_fen:'证券市值',investment_daily_pnl_fen:'证券当日收益'})" :key="item.key"><dt>{{item.label}}</dt><dd>{{money(overview[item.key])}}</dd></div></dl>
+          <dl class="metrics"><div v-for="item in cols({net_worth_fen:'净资产',liquid_net_worth_fen:'流动净资产',liquid_assets_fen:'流动资产',total_assets_fen:'总资产',total_liabilities_fen:'总负债',securities_equity_fen:'证券权益',securities_cash_fen:'证券现金',securities_market_value_fen:'证券市值',investment_daily_pnl_fen:'证券当日收益'})" :key="item.key"><dt>{{item.label}}</dt><dd>{{money(overview[item.key])}}</dd></div></dl>
+          <p>基础投资收益率（上一交易日收盘权益）：{{overview.investment_daily_return_pct==null?'不可计算':String(overview.investment_daily_return_pct)+'%'}}；{{display(overview.investment_daily_return_reason)}}。流动净资产口径：短期负债，其他资产/负债分类未知时不计算；{{display(overview.liquidity_reasons)}}</p>
           <p>质量：{{display(overview.quality)}}；{{display(overview.as_of,'as_of')}}；账本版本 {{overview.ledger_revision}} · 行情版本 {{overview.quote_revision}}</p>
           <p v-if="Array.isArray(overview.reasons)&&overview.reasons.length" class="notice">{{display(overview.reasons)}}</p>
-          <h3>本财务月（23日至次月22日）</h3><RecordTable v-if="overviewMonth" :rows="[overviewMonth]" :columns="cols({period:'周期开始',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',net_fen:'结余'})"/>
-          <h3>风险、信号与待核对</h3><div class="toolbar"><label>证券账户 <select v-model="selectedAccount"><option value="">选择账户</option><option v-for="a in securities" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><button :disabled="strategyLoading||signalWriting" @click="refreshWorkstation">只读刷新风险及待办</button><button @click="navigate('投资')">投资详情</button><button @click="navigate('交易')">待核对成交详情</button></div><p v-if="todo">全库待核对成交 {{todo.total}} 条；账本 {{todo.ledger_revision}}，时点 {{display(todo.as_of)}}</p><p v-else>待核对数量尚未读取。</p><p v-if="todoError" class="error">{{todoError}}</p><p v-if="strategyError" class="error">{{strategyError}}</p><template v-if="pool&&strategyMode==='current'"><p>策略行情日 {{display(pool.as_of)}}，账本截止 {{display(pool.ledger_cutoff)}}；只读建议不等于真实成交。</p><RecordTable :rows="strategyRows.filter(r=>r.status==='SIGNAL'||r.status==='AWAITING_CONFIRMATION'||r.status==='PLAN_PENDING'||nested(r.ndx_aux).actionable===true)" :columns="cols({label:'标的',status_text:'状态',detail:'原因',ndx_text:'T5'})"/></template><template v-if="positionsView&&strategyMode==='current'"><h4>实际策略持仓的风险参考（未核实不得执行）</h4><RecordTable :rows="positionRows" :columns="cols({label:'标的',stop_text:'保护价',action_text:'模型建议',term_text:'期限',ndx_text:'T5',warnings:'证据提示'})"/></template><p v-if="!positionsView">持仓风险尚未读取，不代表没有风险。</p><h3>资产结构</h3><RecordTable :rows="Object.entries(nested(overview.asset_categories)).map(([kind,value])=>({kind,...nested(value)}))" :columns="cols({kind:'类别',asset_class:'资产/负债',amount_fen:'金额',known_fen:'已知部分',quality:'质量'})"/><h3>资产负债明细（含排除统计账户）</h3><RecordTable :rows="accountRows" :columns="accountColumns"/>
+          <h3>本财务月（23日至次月22日）</h3><RecordTable v-if="overviewMonth" :rows="[overviewMonth]" :columns="cols({period:'周期开始',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',refund_received_fen:'实际收到退款',refund_against_original_fen:'冲减本期原支出',bill_cash_flow_fen:'账单现金流',net_fen:'结余'})"/>
+          <h3>风险、信号与待核对</h3><div class="toolbar"><label>证券账户 <select v-model="selectedAccount"><option value="">选择账户</option><option v-for="a in securities" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><button :disabled="strategyLoading||signalWriting" @click="refreshWorkstation">只读刷新风险及待办</button><button @click="navigate('投资')">投资详情</button><button @click="navigate('交易')">待核对成交详情</button></div><p v-if="todo">全库待核对成交 {{todo.total}} 条；账本 {{todo.ledger_revision}}，时点 {{display(todo.as_of)}}</p><p v-else>待核对数量尚未读取。</p><p v-if="todoError" class="error">{{todoError}}</p><p v-if="strategyError" class="error">{{strategyError}}</p><template v-if="pool&&strategyMode==='current'"><p>策略行情日 {{display(pool.as_of)}}，账本截止 {{display(pool.ledger_cutoff)}}；只读建议不等于真实成交。</p><RecordTable :rows="strategyRows.filter(r=>r.status==='SIGNAL'||r.status==='AWAITING_CONFIRMATION'||r.status==='PLAN_PENDING'||nested(r.ndx_aux).actionable===true)" :columns="cols({label:'标的',status_text:'状态',detail:'原因',ndx_text:'T5'})"/></template><template v-if="positionsView&&strategyMode==='current'"><h4>实际策略持仓的风险参考（未核实不得执行）</h4><RecordTable :rows="positionRows" :columns="cols({label:'标的',stop_text:'保护价',near_stop_text:'接近保护价提示',action_text:'模型建议',term_text:'期限',ndx_text:'T5',warnings:'证据提示'})"/></template><p v-if="!positionsView">持仓风险尚未读取，不代表没有风险。</p><h3>资产结构</h3><RecordTable :rows="Object.entries(nested(overview.asset_categories)).map(([kind,value])=>({kind,...nested(value)}))" :columns="cols({kind:'类别',asset_class:'资产/负债',amount_fen:'金额',known_fen:'已知部分',quality:'质量'})"/><h3>资产负债明细（含排除统计账户）</h3><RecordTable :rows="accountRows" :columns="accountColumns"/>
         </template>
         <p v-else>总览尚未取得。</p>
       </section>
@@ -543,12 +561,13 @@ function openTradeFromSignal(row:Fact){
         <p v-if="investmentLoading" role="status">正在读取选定证券账户…</p><p v-if="investmentError" class="error" role="alert">{{investmentError}}</p>
         <template v-if="valuation"><p>数据时点 {{display(valuation.as_of,'as_of')}}；账本 {{valuation.ledger_revision}} / 行情 {{valuation.quote_revision}}；质量 {{display(valuation.quality)}}；{{display(valuation.reasons)}}</p>
           <dl class="metrics"><div v-for="item in cols({cash_fen:'证券现金',market_value_fen:'市值',equity_fen:'账户权益',daily_pnl_fen:'自然日收益',latest_trading_day_pnl_fen:'最近交易日收益',realized_fen:'已实现收益',unrealized_fen:'未实现收益',cumulative_pnl_fen:'累计收益'})" :key="item.key"><dt>{{item.label}}</dt><dd>{{money(valuation[item.key])}}</dd></div></dl>
-          <p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
-          <label>搜索持仓代码或名称 <input v-model="holdingSearch"/></label><RecordTable :rows="filteredPositions" :columns="cols({code:'代码',market:'市场',quantity:'持仓股数',remaining_cost_fen:'剩余本金',remaining_fees_fen:'剩余费用',holding_cost_fen:'持仓成本',price:'现价（元）',market_value_fen:'市值',daily_pnl_fen:'当日收益',realized_fen:'已实现',unrealized_fen:'未实现',quality:'质量',quote:'报价时点及来源'})"/>
+          <p>基础当日收益率：{{valuation.daily_return_pct==null?'不可计算':String(valuation.daily_return_pct)+'%'}}；上一交易日收盘权益 {{money(valuation.previous_close_equity_fen)}}（{{display(valuation.previous_close_as_of,'as_of')}}）；{{display(valuation.daily_return_reason)}}</p>
+          <p>权益对账差额（不是可自动调整金额）：{{money(valuation.reconciliation_difference_fen)}}；{{display(valuation.reasons)}}。</p><button v-if="accountById(selectedAccount)" :disabled="!writable||!!asOf" @click="openForm(()=>forms.equityAdjustmentForm(accountById(selectedAccount)!,valuation!))">核对证券现金差额并校正</button><p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
+          <label>搜索持仓代码或名称 <input v-model="holdingSearch"/></label><RecordTable :rows="filteredPositions" :columns="cols({code:'代码',name:'名称',name_quality:'名称质量',market:'市场',quantity:'持仓股数',remaining_cost_fen:'剩余本金',remaining_fees_fen:'剩余费用',holding_cost_fen:'持仓成本',price:'现价（元）',market_value_fen:'市值',daily_pnl_fen:'当日收益',realized_fen:'已实现',unrealized_fen:'未实现',quality:'质量',quote:'报价时点及来源'})"/>
           <h3>当前/历史有效批次</h3><RecordTable :rows="currentLots" :columns="cols({lot_id:'批次ID',code:'证券代码',lot_role:'角色',quantity:'数量',cost_fen:'剩余本金',fees_fen:'剩余费用',frozen_atr:'冻结ATR',signal_date:'信号日',opened_at:'开启时间'})"/>
         </template>
         <template v-else><p>请选择证券账户或重新读取。</p></template>
-        <h3>月度投资盈亏（日级明细）</h3><p class="notice">基于当前账本与行情版本重算，不表示当时已知的历史证据；未核实金额不显示为零。</p><div class="toolbar"><label>月份 <input type="month" v-model="pnlMonth"/></label><button @click="loadPnlMonth">查询</button></div><p v-if="pnlError" class="error" role="alert">{{pnlError}}</p><template v-if="pnlHistory"><p>账本 {{pnlHistory.ledger_revision}} / 行情 {{pnlHistory.quote_revision}}；查询时间 {{display(pnlHistory.as_of)}}</p><RecordTable :rows="facts(pnlHistory.items)" :columns="cols({day:'日期',is_session:'交易日',daily_pnl_fen:'自然日投资收益',equity_fen:'证券权益',quality:'质量',reasons:'原因',reason:'不可用原因'})"><template #actions="{row}"><button @click="pnlDay(row)">查看该日持仓</button></template></RecordTable></template><h3>V9/G2 策略观察池</h3>
+        <h3>月度投资盈亏（日级明细）</h3><p class="notice">基于当前账本与行情版本重算，不表示当时已知的历史证据；未核实金额不显示为零。</p><div class="toolbar"><label>月份 <input type="month" v-model="pnlMonth"/></label><button @click="loadPnlMonth">查询</button></div><p v-if="pnlError" class="error" role="alert">{{pnlError}}</p><template v-if="pnlHistory"><p>账本 {{pnlHistory.ledger_revision}} / 行情 {{pnlHistory.quote_revision}}；查询时间 {{display(pnlHistory.as_of)}}</p><RecordTable :rows="facts(pnlHistory.items)" :columns="cols({day:'日期',is_session:'交易日',daily_pnl_fen:'自然日投资收益',daily_return_pct:'基础收益率（%）',daily_return_reason:'收益率原因',equity_fen:'证券权益',quality:'质量',reasons:'原因',reason:'不可用原因'})"><template #actions="{row}"><button @click="pnlDay(row)">查看该日持仓</button></template></RecordTable></template><h3>V9/G2 策略观察池</h3>
         <p class="notice">默认 <b>ETF 模式</b>下，V9 突破位、ATR 与 BuyMax 全部用<b>ETF 未复权人民币日线</b>计算；<b>G2 基准</b>用 <b>14 只指数真实点位</b>判定。两套价格各自成体系、不混算，也不做点位折算；真实市值用未复权价。表内「信号收盘」列标明每一行用的是哪套价格。策略建议不等于真实成交：真实主仓/子仓/退出只能经「录入真实成交」确认。</p>
         <div class="toolbar"><label>策略模式 <select v-model="strategyMode" :disabled="signalWriting" @change="resetStrategyMode"><option value="current">当前决策</option><option value="historical">历史回放（只读）</option></select></label><label v-if="strategyMode==='historical'">截止交易日 <input type="date" v-model="strategyDay" @change="resetStrategyMode"/></label><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池（只读）'}}</button><button :disabled="signalWriting||!writable||!selectedAccount||strategyMode!=='current'" @click="writeStrategySignals">{{signalWriting?'正在写入…':'记录正式信号（写入）'}}</button><span v-if="pool">行情日期 {{display(pool.as_of)}}；账本截止 {{display(pool.ledger_cutoff)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(nested(pool.regime).label)}} / ER60 {{display(nested(pool.regime).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
         <p class="notice">刷新只读取证据、不写库；只有「记录正式信号（写入）」会把信号与数据版本落到账本。</p>
@@ -597,14 +616,12 @@ function openTradeFromSignal(row:Fact){
         <div class="toolbar"><label>证券账户 <select v-model="tradeAccount"><option value="">全部</option><option v-for="a in securities" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><label>证券 <select v-model="tradeInstrument"><option value="">全部</option><option v-for="i in instruments" :key="str(i.id)" :value="str(i.id)">{{i.code}}</option></select></label><label>起始（北京时间，含） <input type="datetime-local" v-model="tradeFrom"/></label><label>结束（北京时间，不含） <input type="datetime-local" v-model="tradeTo"/></label><button @click="filterTrades">筛选成交</button></div>
         <p v-if="tradeReadError" class="error" role="alert">{{tradeReadError}}</p>
         <PagedRecords :key="tradeEpoch" :path="tradePath" :account-id="tradeAccount" :refresh="refresh" :columns="cols({id:'成交ID',account_id:'账户ID',instrument_id:'标的ID',side:'方向',quantity:'数量',price:'价格（元）',fees_fen:'费用',amount_fen:'金额',executed_at:'成交时间',status:'状态',pending_reason:'待核对原因',note:'备注'})"><template #actions="{row}"><button @click="readTrade(row)">查看事实与审计</button><button v-if="row.status==='pending'" :disabled="!writable" @click="openForm(()=>forms.confirmation(`/trades/${row.id}/confirm`))">确认</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots,row))">更正</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/trades/${row.id}/void`,'作废成交'))">作废</button></template></PagedRecords>
-        <details v-if="tradeDetail" open><summary>成交事实与审计记录</summary><pre>{{JSON.stringify(tradeDetail,null,2)}}</pre></details>
+        <details v-if="tradeDetail" open><summary>成交事实与审计记录</summary><RecordTable :rows="[tradeDetail]" :columns="cols({id:'成交ID',account_id:'账户',side:'方向',quantity:'数量',status:'状态',strategy_deviation:'策略偏离',note:'说明'})"/><RecordTable :rows="facts(tradeDetail.audit_events)" :columns="cols({event:'事件',created_at:'记录时间',reason:'原因',entity_id:'对象'})"/><details><summary>原始审计证据</summary><pre>{{JSON.stringify(tradeDetail,null,2)}}</pre></details></details>
         <h3>证券资金记录</h3><PagedRecords path="/cash" :refresh="refresh" :columns="cashColumns"><template #actions="{row}"><template v-if="!row.transfer_id&&!row.execution_id&&['opening','deposit','withdrawal','adjustment'].includes(String(row.kind))"><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/cash/${row.id}/void`,'作废资金记录'))">作废</button></template></template></PagedRecords>
         <details><summary>账户及证券标的 ID 对照</summary><RecordTable :rows="accounts" :columns="cols({id:'账户ID',name:'名称',kind:'类型'})"/><RecordTable :rows="instruments" :columns="cols({id:'标的ID',market:'市场',code:'代码',kind:'类型'})"/></details>
         <h3>期初持仓批次（可更正 / 作废）</h3>
         <p class="notice">更正与作废都保留审计痕迹：作废不会删除原批次，只会写入一条冲正记录。这里只列出期初批次，不改动真实成交历史。</p>
-        <div class="toolbar"><button @click="loadOpenings">{{openings.length?'重新读取期初批次':'读取期初批次'}}</button></div>
-        <p v-if="openingsError" class="error" role="alert">{{openingsError}}</p>
-        <RecordTable v-if="openings.length" :rows="openings" :columns="cols({id:'期初批次ID',account_id:'账户ID',instrument_id:'标的ID',quantity:'数量',cost_fen:'成本',fees_fen:'费用',occurred_at:'发生时间',status:'状态',note:'备注'})"><template #actions="{row}"><button :disabled="!writable" @click="openForm(()=>forms.openingCorrectionForm(row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.openingVoidForm(row))">作废</button></template></RecordTable>
+        <PagedRecords path="/openings" :refresh="refresh" :columns="cols({id:'期初批次ID',account_id:'账户ID',instrument_id:'标的ID',quantity:'数量',cost_fen:'成本',fees_fen:'费用',occurred_at:'发生时间',status:'状态',note:'备注'})"><template #actions="{row}"><button :disabled="!writable" @click="openForm(()=>forms.openingCorrectionForm(row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.openingVoidForm(row))">作废</button></template></PagedRecords>
         <h3>现金分红</h3>
         <p class="notice">现金分红是外部收益，进入证券账户现金，不改变持仓股数。拆分与合并仅录入已核实的实际比例及真实尾差；复杂配股尚不支持数量调整。</p>
         <div class="toolbar"><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.dividendForm(accounts,instruments))">录入现金分红</button><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.companyForm(accounts,instruments))">核实拆分 / 合并</button></div>
@@ -612,14 +629,14 @@ function openTradeFromSignal(row:Fact){
       </section>
       <section v-if="tab==='财务'"><h2>个人财务</h2><div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.categoryForm)">新增分类</button><button :disabled="!writable" @click="openForm(()=>forms.billForm(accounts,categories))">新增收入 / 支出 / 手续费</button><button :disabled="!writable||!overview" @click="openForm(()=>forms.transferForm(accountRows))">内部转账</button></div>
         <h3>账户及余额</h3><RecordTable :rows="accountRows" :columns="accountColumns"><template #actions="{row}"><button v-if="row.kind!=='securities'&&row.status==='active'" :disabled="!writable" @click="openForm(()=>forms.balanceForm(row))">余额核实</button><button :disabled="!writable" @click="openForm(()=>forms.accountUpdate(row,currentRevision))">账户状态</button><button :disabled="!writable" @click="openForm(()=>forms.scopeForm(row,currentRevision))">统计范围</button><button v-if="!row.effective_at" :disabled="!writable" @click="openForm(()=>forms.effectiveForm(row,currentRevision))">核实生效时间</button></template></RecordTable>
-        <h3>普通收支账单</h3><div class="toolbar"><label>账户 <select v-model="billAccount"><option value="">全部</option><option v-for="a in accounts" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><label>起始（北京时间，含） <input type="datetime-local" v-model="billFrom"/></label><label>结束（北京时间，不含） <input type="datetime-local" v-model="billTo"/></label><button @click="filterBills">筛选账单</button></div><p v-if="billReadError" class="error">{{billReadError}}</p><PagedRecords :path="billPath" :refresh="refresh" :columns="billColumns"><template #actions="{row}"><template v-if="row.status==='effective'"><button :disabled="!writable" @click="openForm(()=>forms.billForm(accounts,categories,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/finance/bills/${row.id}/void`,'作废账单'))">作废</button></template></template></PagedRecords>
+        <h3>普通收支账单</h3><div class="toolbar"><label>账户 <select v-model="billAccount"><option value="">全部</option><option v-for="a in accounts" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><label>起始（北京时间，含） <input type="datetime-local" v-model="billFrom"/></label><label>结束（北京时间，不含） <input type="datetime-local" v-model="billTo"/></label><button @click="filterBills">筛选账单</button></div><p v-if="billReadError" class="error">{{billReadError}}</p><PagedRecords :path="billPath" :refresh="refresh" :columns="billColumns"><template #actions="{row}"><template v-if="row.status==='effective'"><button :disabled="!writable" @click="openForm(()=>row.kind==='refund'?forms.refundForm(accounts,row,row):forms.billForm(accounts,categories,row))">更正</button><button v-if="['expense','fee'].includes(String(row.kind))" :disabled="!writable" @click="openForm(()=>forms.refundForm(accounts,row))">录入退款</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/finance/bills/${row.id}/void`,'作废账单'))">作废</button></template></template></PagedRecords>
         <h3>内部转账</h3><PagedRecords path="/finance/transfers" :refresh="refresh" :columns="transferColumns"><template #actions="{row}"><template v-if="validTransfer(row)"><button v-if="!row.from_included&&!row.to_included" :disabled="!writable" @click="openForm(()=>forms.transferForm(accountRows,row))">更正</button><button v-if="!row.from_included&&!row.to_included" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/finance/transfers/${row.id}/void`,'作废转账'))">作废</button><button v-if="accountById(row.from_account_id)?.kind!=='securities'||accountById(row.to_account_id)?.kind!=='securities'" :disabled="!writable" @click="openForm(()=>forms.reconciliationForm(accountRows,row))">人工核对更正 / 作废</button></template></template></PagedRecords>
-        <h3>财务月</h3><label>周期开始日期（23日，留空为当前） <input type="date" v-model="period"/></label><button @click="loadMonth">查询</button><template v-if="month"><RecordTable :rows="[month]" :columns="cols({period:'周期开始',start_at:'开始时点',end_exclusive:'结束（不含）',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',net_fen:'结余',ledger_revision:'账本版本'})"/><RecordTable :rows="Object.entries(nested(month.categories)).map(([category_id,amount_fen])=>({category_id,amount_fen}))" :columns="cols({category_id:'分类',amount_fen:'分类金额'})"/><RecordTable :rows="facts(month.items)" :columns="billColumns"/></template>
-        <h3>按年查询财务月</h3><label>年份 <input type="number" min="1900" max="9997" v-model.number="financeYear"/></label><button @click="loadYear">查询年度财务月</button><p v-if="yearError" class="error" role="alert">{{yearError}}</p><RecordTable v-if="yearResult" :rows="facts(yearResult.items)" :columns="cols({period:'周期开始',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',net_fen:'结余'})"/><h3>基础净资产趋势（按月末，当前月截至查询）</h3><p>当前账本/行情版本重算，非历史知识回放，未知值保留空缺。</p><label>月份数 <select v-model.number="netMonths"><option :value="1">1</option><option :value="3">3</option><option :value="6">6</option><option :value="12">12</option></select></label><button @click="loadNetTrend">查询净资产趋势</button><button :disabled="!netTrend" @click="exportNetTrend">导出摘要 CSV（分）</button><p v-if="netTrendError" class="error">{{netTrendError}}</p><template v-if="netTrend"><p>账本 {{netTrend.ledger_revision}} / 行情 {{netTrend.quote_revision}}</p><RecordTable :rows="facts(netTrend.items)" :columns="cols({as_of:'估值时点',total_assets_fen:'总资产',total_liabilities_fen:'总负债',net_worth_fen:'净资产',securities_equity_fen:'证券权益',quality:'质量',reasons:'原因'})"/></template><h3>历史余额与净资产</h3><label>截止时间（北京时间） <input type="datetime-local" step="1" v-model="historyTime"/></label><button @click="loadHistory">查询历史</button><template v-if="historical"><RecordTable :rows="[historical]" :columns="cols({as_of:'估值时点',net_worth_fen:'净资产',total_assets_fen:'总资产',total_liabilities_fen:'总负债',quality:'质量',ledger_revision:'账本版本',quote_revision:'报价版本',reasons:'原因'})"/><RecordTable :rows="facts(historical.accounts)" :columns="accountColumns"/></template>
+        <h3>财务月</h3><label>周期开始日期（23日，留空为当前） <input type="date" v-model="period"/></label><button @click="loadMonth">查询</button><template v-if="month"><RecordTable :rows="[month]" :columns="cols({period:'周期开始',start_at:'开始时点',end_exclusive:'结束（不含）',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',refund_received_fen:'实际收到退款',refund_against_original_fen:'冲减本期原支出',bill_cash_flow_fen:'账单现金流',net_fen:'结余',ledger_revision:'账本版本'})"/><RecordTable :rows="Object.entries(nested(month.categories)).map(([category_id,amount_fen])=>({category_id,amount_fen}))" :columns="cols({category_id:'分类',amount_fen:'分类金额'})"/><RecordTable :rows="facts(month.items)" :columns="billColumns"/></template>
+        <h3>按年查询财务月</h3><label>年份 <input type="number" min="1900" max="9997" v-model.number="financeYear"/></label><button @click="loadYear">查询年度财务月</button><p v-if="yearError" class="error" role="alert">{{yearError}}</p><RecordTable v-if="yearResult" :rows="facts(yearResult.items)" :columns="cols({period:'周期开始',income_fen:'收入',expense_fen:'支出',fees_fen:'手续费',refund_received_fen:'实际收到退款',refund_against_original_fen:'冲减本期原支出',bill_cash_flow_fen:'账单现金流',net_fen:'结余'})"/><h3>基础净资产趋势（按月末，当前月截至查询）</h3><p>当前账本/行情版本重算，非历史知识回放，未知值保留空缺。</p><label>月份数 <select v-model.number="netMonths"><option :value="1">1</option><option :value="3">3</option><option :value="6">6</option><option :value="12">12</option></select></label><button @click="loadNetTrend">查询净资产趋势</button><button :disabled="!netTrend" @click="exportNetTrend">导出摘要 CSV（分）</button><p v-if="netTrendError" class="error">{{netTrendError}}</p><template v-if="netTrend"><p>账本 {{netTrend.ledger_revision}} / 行情 {{netTrend.quote_revision}}</p><RecordTable :rows="facts(netTrend.items)" :columns="cols({as_of:'估值时点',total_assets_fen:'总资产',total_liabilities_fen:'总负债',net_worth_fen:'净资产',liquid_net_worth_fen:'流动净资产',liquidity_reasons:'流动性原因',securities_equity_fen:'证券权益',quality:'质量',reasons:'原因'})"/></template><h3>历史余额与净资产</h3><label>截止时间（北京时间） <input type="datetime-local" step="1" v-model="historyTime"/></label><button @click="loadHistory">查询历史</button><template v-if="historical"><RecordTable :rows="[historical]" :columns="cols({as_of:'估值时点',net_worth_fen:'净资产',liquid_net_worth_fen:'流动净资产',liquid_assets_fen:'流动资产',total_assets_fen:'总资产',total_liabilities_fen:'总负债',quality:'质量',ledger_revision:'账本版本',quote_revision:'报价版本',reasons:'原因'})"/><RecordTable :rows="facts(historical.accounts)" :columns="accountColumns"/></template>
         <details><summary>手工余额历史</summary><PagedRecords path="/finance/balances" :refresh="refresh" :columns="cols({account_id:'账户ID',before_fen:'原余额',after_fen:'新余额',occurred_at:'生效时间',reason:'原因',status:'状态'})"/></details>
       </section>
     </template>
-    <section v-if="tab==='系统'"><h2>系统与维护</h2><p>运行模式：{{display(system?.mode)}}；{{system?.writable===true?'允许写入':'禁止写入'}}。断线不会切换数据库。</p><details v-if="system?.identity" open><summary>已验证数据库身份</summary><pre>{{JSON.stringify(system.identity,null,2)}}</pre></details><h3>行情及日历</h3><p v-if="market && market.calendar_coverage" class="notice">交易日历：{{display((market.calendar_coverage as Fact).start)}} 至 {{display((market.calendar_coverage as Fact).end)}}；剩余 {{display((market.calendar_coverage as Fact).days_remaining)}} 天。</p><p v-if="market && market.calendar_coverage && (market.calendar_coverage as Fact).status !== 'valid'" class="error" role="alert">交易日历即将到期或已超出可信范围。请按本地验收说明核实交易所公告并更新锁定日历依赖并执行 tools/verify_calendar.py 审查；超出范围不生成正式交易建议。</p><pre v-if="market">{{JSON.stringify({calendar_coverage:market.calendar_coverage,calendar_release:market.calendar_release,market_phase:market.market_phase,last_refresh:market.last_refresh},null,2)}}</pre><p v-else>行情状态不可用。</p><button :disabled="!writable" @click="refreshMarket">手动刷新行情</button><h3>维护命令（在服务端终端显式执行）</h3><p>正式库身份检查：<code>python start.py check-database</code></p><p>一致性备份：<code>python start.py backup --destination &lt;新备份目录绝对路径&gt;</code></p><p>数据库升级：停止写服务，执行 <code>python start.py upgrade-database --destination &lt;新备份目录绝对路径&gt; --confirm</code>。不从网页自动接管或恢复正式库。</p><h3>备份与迁移对账</h3><p class="notice">查询只读取服务端现状；请通过上述服务端维护命令创建备份，网页端不会自动接管、还原或删除任何备份。</p><div class="toolbar"><button :disabled="maintenanceLoading" @click="loadMaintenance">{{maintenanceLoading?'正在读取…':'查询备份状态与迁移对账'}}</button></div><p v-if="maintenanceError" class="error" role="alert">{{maintenanceError}}</p><template v-if="backupState"><h4>备份状态</h4><RecordTable :rows="facts(backupState.items).length?facts(backupState.items):[backupState]" :columns="cols({name:'备份名称',path:'位置',backup_at:'创建时间',file_size:'体积（字节）',verified:'已校验',status:'状态'})"/><p v-if="facts(backupState.items).length===0" class="notice">服务端尚未返回任何备份条目。</p></template><template v-if="migrationState"><h4>迁移对账报告</h4><pre>{{JSON.stringify(migrationState,null,2)}}</pre></template><p class="notice">V9/G2 集成待审查，证券实网验证尚未完成。当前只用于本机开发/隔离测试，不开放公网。</p></section>
+    <section v-if="tab==='系统'"><h2>系统与维护</h2><p>运行模式：{{display(system?.mode)}}；{{system?.writable===true?'允许写入':'禁止写入'}}。断线不会切换数据库。服务监听端口：{{display(system?.listen_port)}}；端口修改只在停止服务、修改受控配置并重新启动后生效，网页不执行重启。</p><details v-if="system?.identity" open><summary>已验证数据库身份</summary><pre>{{JSON.stringify(system.identity,null,2)}}</pre></details><h3>行情及日历</h3><p v-if="market && market.calendar_coverage" class="notice">交易日历：{{display((market.calendar_coverage as Fact).start)}} 至 {{display((market.calendar_coverage as Fact).end)}}；剩余 {{display((market.calendar_coverage as Fact).days_remaining)}} 天。</p><p v-if="market && market.calendar_coverage && (market.calendar_coverage as Fact).status !== 'valid'" class="error" role="alert">交易日历即将到期或已超出可信范围。请按本地验收说明核实交易所公告并更新锁定日历依赖并执行 tools/verify_calendar.py 审查；超出范围不生成正式交易建议。</p><pre v-if="market">{{JSON.stringify({calendar_coverage:market.calendar_coverage,calendar_release:market.calendar_release,market_phase:market.market_phase,last_refresh:market.last_refresh},null,2)}}</pre><p v-else>行情状态不可用。</p><button :disabled="!writable" @click="refreshMarket">手动刷新行情</button><h3>维护命令（在服务端终端显式执行）</h3><p>正式库身份检查：<code>python start.py check-database</code></p><p>一致性备份：<code>python start.py backup --destination &lt;新备份目录绝对路径&gt;</code></p><p>数据库升级：停止写服务，执行 <code>python start.py upgrade-database --destination &lt;新备份目录绝对路径&gt; --confirm</code>。不从网页自动接管或恢复正式库。</p><h3>备份与迁移对账</h3><p class="notice">一键备份由服务端一致性快照完成；网页端不会自动接管、还原或删除任何备份。</p><div class="toolbar"><button :disabled="!writable||maintenanceLoading" @click="createManualBackup">一键备份</button><button :disabled="maintenanceLoading" @click="loadMaintenance">{{maintenanceLoading?'正在读取…':'查询备份状态与迁移对账'}}</button></div><p v-if="maintenanceError" class="error" role="alert">{{maintenanceError}}</p><template v-if="backupState"><h4>备份状态</h4><RecordTable :rows="facts(backupState.items).length?facts(backupState.items):[backupState]" :columns="cols({name:'备份名称',path:'位置',backup_at:'创建时间',file_size:'体积（字节）',verified:'已校验',status:'状态'})"/><p v-if="facts(backupState.items).length===0" class="notice">服务端尚未返回任何备份条目。</p></template><template v-if="migrationState"><h4>迁移对账报告</h4><pre>{{JSON.stringify(migrationState,null,2)}}</pre></template><p class="notice">V9/G2 集成待审查，证券实网验证尚未完成。当前只用于本机开发/隔离测试，不开放公网。</p></section>
   </main>
 </template>
 

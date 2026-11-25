@@ -164,3 +164,19 @@ def test_ndx_manual_sale_actual_allocation_rebuild(ledger):
     assert manual['status']=='effective'
     plan=s.advise('2026-07-01')
     assert plan['actual_quantity']==10000 and plan['last_actual_buy_day']=='2026-06-02' and plan['status']=='ALLOW'
+
+
+def test_t5_portfolio_evidence_is_not_atr(ledger):
+    s=Scenario(ledger); advice=s.advise('2026-06-01')
+    assert s.buy(advice,'evidence-buy',15000,external_id='fill')['strategy_evidence']
+    now=datetime.fromisoformat('2026-06-05T16:00:00+08:00')
+    p=PortfolioService(s.svc.db,clock=lambda:now)
+    item=p.strategy_evidence(s.account,now)['items'][0]
+    assert item['evidence_status']=='verified' and item['strategy'] is None and item['frozen_atr'] is None
+    assert item['signal_evidence']['kind']=='ndx_aux_advice_link'
+    result=s.svc.submit(TradeInput(request_id='manual-t5-proof',account_id=s.account,instrument_id=s.instrument,side='buy',quantity=100,
+        price='10',fees_fen=0,executed_at='2026-06-03T10:00:00+08:00',trading_day='2026-06-03',strategy_id='NDX_AUX_T5',lot_role='main',strategy_deviation=True,note='manual deviation'))
+    assert result['status']=='effective' and result['strategy_evidence'] is None
+    items=p.strategy_evidence(s.account,now)['items']
+    assert {x['evidence_status'] for x in items}=={'verified','unverified'}
+    assert all(x['strategy'] is None for x in items)

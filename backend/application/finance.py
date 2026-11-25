@@ -2,6 +2,7 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 import sqlite3
+from decimal import Decimal
 from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
@@ -41,7 +42,8 @@ class BalanceInput(FactInput):
 
 class BillInput(FactInput):
     account_id: str
-    kind: Literal['income', 'expense', 'fee']
+    kind: Literal['income', 'expense', 'fee', 'refund']
+    related_transaction_id: str | None = None
     category_id: str
     amount_fen: int = Field(strict=True, gt=0, le=MAX_FEN)
 
@@ -106,6 +108,8 @@ class VoidInput(RequestInput):
 
 def value_of(data: RequestInput) -> dict:
     value = data.model_dump(mode='json', exclude={'request_id'})
+    if isinstance(data, BillInput) and data.related_transaction_id is None:
+        value.pop('related_transaction_id',None) # preserve previous request fingerprints
     if isinstance(data, FactInput):
         value['occurred_at'] = utc(data.occurred_at)
     return value
@@ -272,31 +276,54 @@ class FinanceService:
 
     @staticmethod
     def _bill(conn, data: BillInput, v: dict, correction: str | None = None) -> dict:
-        require_account(conn,data.account_id,securities=False,active=True,at=v['occurred_at'])
+        account=require_account(conn,data.account_id,securities=False,active=True,at=v['occurred_at'])
         category=one(conn,'SELECT * FROM finance_categories WHERE id=?',(data.category_id,))
-        if category['kind']!=data.kind:
-            raise TradeError('category does not match bill kind')
+        if data.kind=='refund':
+            if not data.related_transaction_id or account['asset_class']!='asset' or account['balance_mode']!='manual_snapshot':
+                raise TradeError('refund requires explicit original expense and eligible manual asset account')
+            original=one(conn,'SELECT * FROM finance_transactions WHERE id=?',(data.related_transaction_id,))
+            if original['kind'] not in ('expense','fee') or original['status']!='effective' or original['occurred_at']>v['occurred_at'] or original['category_id']!=data.category_id:
+                raise TradeError('refund must refer to an effective original expense/fee in its category')
+            recovered=conn.execute("SELECT COALESCE(SUM(amount_fen),0) FROM finance_transactions WHERE related_transaction_id=? AND status='effective'",(original['id'],)).fetchone()[0]
+            if recovered+data.amount_fen>original['amount_fen']:
+                raise Conflict('cumulative refunds exceed original expense')
+        elif data.related_transaction_id is not None or category['kind']!=data.kind:
+            raise TradeError('category or refund reference does not match bill kind')
         id_=uid()
-        conn.execute("INSERT INTO finance_transactions VALUES (?,?,?,?,?,?,?,?,'effective')",
-                     (id_,data.account_id,data.kind,data.amount_fen,data.category_id,v['occurred_at'],data.note,correction))
+        conn.execute("INSERT INTO finance_transactions (id,account_id,kind,amount_fen,category_id,occurred_at,note,correction_of,status,related_transaction_id) VALUES (?,?,?,?,?,?,?,?,'effective',?)",
+                     (id_,data.account_id,data.kind,data.amount_fen,data.category_id,v['occurred_at'],data.note,correction,data.related_transaction_id))
         result=one(conn,'SELECT * FROM finance_transactions WHERE id=?',(id_,))
         audit(conn,'bill',id_,'created' if correction is None else 'corrected',data.request_id,result)
         return result
 
     def bill(self,data: BillInput) -> dict:
         data = BillInput.model_validate(data)
-        return self._write('bill',data,lambda c,v:(self._bill(c,data,v),v['occurred_at']))
+        def work(conn,v):
+            result=self._bill(conn,data,v)
+            affected=v['occurred_at']
+            if data.related_transaction_id:
+                affected=min(affected,one(conn,'SELECT occurred_at FROM finance_transactions WHERE id=?',(data.related_transaction_id,))['occurred_at'])
+            return result,affected
+        return self._write('bill',data,work)
 
     def change_bill(self,id_: str,data: BillInput | VoidInput) -> dict:
         data = type(data).model_validate(data)
         def work(conn,v):
             old=one(conn,'SELECT * FROM finance_transactions WHERE id=?',(id_,))
             if old['status']!='effective': raise Conflict('bill already reversed')
+            if conn.execute("SELECT 1 FROM finance_transactions WHERE related_transaction_id=? AND status='effective'",(id_,)).fetchone():
+                raise Conflict('reverse or correct linked refunds before changing original expense')
             conn.execute("UPDATE finance_transactions SET status='reversed' WHERE id=?",(id_,))
             audit(conn,'bill',id_,'reversed',data.request_id,{'reason':data.note if isinstance(data,BillInput) else data.reason})
+            affected=old['occurred_at']
+            if old['related_transaction_id']:
+                affected=min(affected,one(conn,'SELECT occurred_at FROM finance_transactions WHERE id=?',(old['related_transaction_id'],))['occurred_at'])
             if isinstance(data,BillInput):
-                return self._bill(conn,data,v,id_),min(old['occurred_at'],v['occurred_at'])
-            return one(conn,'SELECT * FROM finance_transactions WHERE id=?',(id_,)),old['occurred_at']
+                result=self._bill(conn,data,v,id_)
+                if data.related_transaction_id:
+                    affected=min(affected,one(conn,'SELECT occurred_at FROM finance_transactions WHERE id=?',(data.related_transaction_id,))['occurred_at'])
+                return result,min(affected,v['occurred_at'])
+            return one(conn,'SELECT * FROM finance_transactions WHERE id=?',(id_,)),affected
         return self._write('bill_correction' if isinstance(data,BillInput) else 'bill_void',data,work,target=id_)
 
     @staticmethod
@@ -456,12 +483,22 @@ class FinanceService:
         begin,end=month_bounds(start)
         items=rows(conn,"SELECT * FROM finance_transactions WHERE status='effective' AND occurred_at>=? AND occurred_at<? AND occurred_at<=? ORDER BY occurred_at,rowid",(begin,end,cutoff))
         totals={kind:sum(r['amount_fen'] for r in items if r['kind']==kind) for kind in ('income','expense','fee')}
-        categories={}
+        categories={}; refund_received=sum(r['amount_fen'] for r in items if r['kind']=='refund'); recovered=0
         for item in items:
-            key=item['category_id'];categories[key]=categories.get(key,0)+item['amount_fen']
+            if item['kind']=='refund': continue
+            reduction=0
+            if item['kind'] in ('expense','fee'):
+                reduction=conn.execute("SELECT COALESCE(SUM(amount_fen),0) FROM finance_transactions WHERE related_transaction_id=? AND status='effective' AND occurred_at<=?",(item['id'],cutoff)).fetchone()[0]
+                totals[item['kind']]-=reduction; recovered+=reduction
+            item['net_amount_fen']=item['amount_fen']-reduction
+            key=item['category_id'];categories[key]=categories.get(key,0)+item['net_amount_fen']
+        gross_expense=sum(r['amount_fen'] for r in items if r['kind'] in ('expense','fee'))
         return {'period':start.isoformat(),'start_at':begin,'end_exclusive':end,
                 'income_fen':totals['income'],'expense_fen':totals['expense'],'fees_fen':totals['fee'],
-                'net_fen':totals['income']-totals['expense']-totals['fee'],'categories':categories,'items':items}
+                'net_fen':totals['income']-totals['expense']-totals['fee'],'categories':categories,'items':items,
+                'refund_received_fen':refund_received,'refund_against_original_fen':recovered,
+                'bill_cash_flow_fen':totals['income']-gross_expense+refund_received,
+                'refund_basis':'original_expense_period; receipt_cash_flow_at_actual_date'}
 
     def month(self,start: date,as_of: datetime) -> dict:
         cutoff=PortfolioService(self.db,self.clock)._cutoff(as_of)
@@ -539,9 +576,9 @@ class FinanceService:
                 try: window=market_window(point)
                 except CalendarUnavailable: window=None
                 value=self._overview(conn,portfolio,point,utc(point),window,ledger,revision)
-                row={k:value[k] for k in ('as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','securities_equity_fen','quality','reasons')}
+                row={k:value[k] for k in ('as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','liquid_assets_fen','liquid_net_worth_fen','liquidity_reasons','securities_equity_fen','quality','reasons')}
                 if not any(a['included'] for a in value['accounts']):
-                    row.update(total_assets_fen=None,total_liabilities_fen=None,net_worth_fen=None,securities_equity_fen=None,quality='unavailable',reasons=['no_included_account_evidence'])
+                    row.update(total_assets_fen=None,total_liabilities_fen=None,net_worth_fen=None,liquid_assets_fen=None,liquid_net_worth_fen=None,securities_equity_fen=None,quality='unavailable',reasons=['no_included_account_evidence'])
                 items.append(row)
             return {'as_of':cutoff,'ledger_revision':ledger,'quote_revision':revision,'source':'current_ledger_projection_not_knowledge_replay','items':items}
 
@@ -551,7 +588,7 @@ class FinanceService:
             if account['kind']=='securities':
                 valuation=portfolio._valuation(conn,account['id'],as_of,window,revision)
                 amount=valuation['equity_fen']
-                details={k:valuation[k] for k in ('cash_fen','cash_quality','market_value_fen','known_market_value_fen','equity_fen','daily_pnl_fen','cumulative_pnl_fen','reasons')}
+                details={k:valuation[k] for k in ('cash_fen','cash_quality','market_value_fen','known_market_value_fen','equity_fen','daily_pnl_fen','daily_return_pct','daily_return_reason','previous_close_equity_fen','previous_close_as_of','cumulative_pnl_fen','reasons')}
             else:
                 balance=balance_at(conn,account['id'],cutoff)
                 amount=balance['after_fen'] if balance else None
@@ -607,10 +644,23 @@ class FinanceService:
         securities=[r for r in included if r['kind']=='securities']
         def total(field):
             return sum(r[field] for r in securities) if all(r[field] is not None for r in securities) else None
+        denominator=total('previous_close_equity_fen'); numerator=total('daily_pnl_fen')
+        return_pct=None
+        if securities and all(r['daily_return_pct'] is not None for r in securities) and denominator and denominator>0 and numerator is not None:
+            return_pct=format(Decimal(numerator)*100/Decimal(denominator),'.6f')
+        # Old Finance classifies liabilities by maturity and restricted/other assets by type.
+        # 2.0 loses that distinction for other_* kinds. Do not silently classify them.
+        liquidity_unknown=[r['id'] for r in included if r['kind'] in ('other_asset','other_liability')]
+        liquid_assets=[r for r in included if r['asset_class']=='asset' and r['kind'] in ('bank','cash','payment','securities')]
+        liquid_asset_total=sum(r['balance_fen'] for r in liquid_assets) if all(r['balance_fen'] is not None for r in liquid_assets) and not any(r['kind']=='other_asset' for r in included) and assets_ok else None
+        liquid_net=liquid_asset_total-liabilities if liquid_asset_total is not None and liabilities_ok and not liquidity_unknown else None
+        liquidity_reasons=(['liquidity_classification_unknown:'+i for i in liquidity_unknown] + ([] if assets_ok and liabilities_ok else ['balance_or_valuation_unavailable']))
         return {'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
                 'securities_cash_fen':total('cash_fen') if all(r['cash_quality']=='valid' for r in securities) else None,
                 'securities_market_value_fen':total('market_value_fen'),'securities_equity_fen':total('equity_fen'),
-                'investment_daily_pnl_fen':total('daily_pnl_fen'),
+                'investment_daily_pnl_fen':numerator,'investment_daily_return_pct':return_pct,'investment_daily_return_reason':None if return_pct is not None else 'account_return_or_denominator_unavailable','investment_previous_close_equity_fen':denominator,
+                'liquid_assets_fen':liquid_asset_total,'liquid_net_worth_fen':liquid_net,'liquidity_reasons':liquidity_reasons,
+                'liquidity_basis':'legacy_current_liabilities; unclassified other assets/liabilities withheld',
                 'reasons':reasons,'accounts':items,'known_assets_fen':assets,'known_liabilities_fen':liabilities,
                 'total_assets_fen':assets if assets_ok else None,'total_liabilities_fen':liabilities if liabilities_ok else None,
                 'net_worth_fen':assets-liabilities if assets_ok and liabilities_ok else None,

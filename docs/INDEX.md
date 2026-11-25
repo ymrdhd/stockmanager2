@@ -26,3 +26,6 @@
 09C 交接：`09C_REPORT.md`（实际测试、限制）、`09C_FUNCTION_MATRIX.md`（规格/服务/界面/测试对应及覆盖差距）、`09C_LOCAL_ACCEPTANCE.md`（未来经明确批准的本地构建、日历更新及验收任务）。非发布授权。
 
 09E 交接：`09E_REPORT.md`（三个 S1 的前后复现、实际测试、环境限制及回退），`ISSUES.md` 保留 09D 编号，非关闭裁决或发布授权。
+
+
+09F 本轮入口：`09F_REPORT.md`、`09F_FUNCTION_MATRIX.md`、`09F_PRODUCT_CANDIDATES.md`、`09F_LOCAL_ACCEPTANCE.md`。

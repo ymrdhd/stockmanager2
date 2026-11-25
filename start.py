@@ -129,6 +129,7 @@ def main() -> int:
         serve = commands.add_parser(mode, help=f'run {mode} backend on loopback')
         _identity_args(serve, local=mode == 'local')
         serve.add_argument('--port', type=int, default=9091)
+        serve.add_argument('--near-stop-bps', type=int, choices=range(0,1001), default=200, metavar='0-1000')
         serve.add_argument('--market-refresh-seconds', type=int, choices=range(10,301), default=20, metavar='10-300')
         serve.add_argument('--no-market-refresh', action='store_true', help='disable automatic network refresh')
         serve.add_argument('--auth-file', type=Path, default=DEFAULT_AUTH_FILE)
@@ -262,6 +263,7 @@ def main() -> int:
                                 'run npm ci && npm run build in frontend/, or pass '
                                 '--allow-missing-web-build to serve the API alone')
         settings = AppConfig(
+            near_stop_bps=args.near_stop_bps,
             market_auto_refresh=not args.no_market_refresh,
             market_refresh_seconds=args.market_refresh_seconds,
             static_dir=root, require_write_identity=True, auth=auth)

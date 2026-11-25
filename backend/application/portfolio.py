@@ -15,7 +15,7 @@ from backend.application.trading.service import (
 )
 from backend.infrastructure.database import Database
 from backend.application.market_calendar import (
-    CalendarUnavailable, MarketWindow, freshness_reference, market_window, quote_time,
+    CalendarUnavailable, MarketWindow, freshness_reference, market_window, quote_time, session_bounds,
 )
 
 SHANGHAI = ZoneInfo('Asia/Shanghai')
@@ -359,7 +359,7 @@ class PortfolioService:
             remember(conn,request,payload,result)
             return result
 
-    def openings(self,account_id: str|None=None,limit: int=100,offset: int=0) -> dict:
+    def openings(self,account_id: str|None=None,limit: int=100,offset: int=0,ledger_revision: int|None=None) -> dict:
         """Every recorded baseline row, including replaced and voided history."""
         sql="""SELECT o.*,CASE WHEN o.superseded_by IS NULL AND o.voided_at IS NULL THEN 1 ELSE 0 END AS is_current,
             l.id AS lot_id,l.remaining_qty AS remaining_qty,l.opened_qty AS opened_qty,
@@ -372,6 +372,8 @@ class PortfolioService:
             args=(account_id,)
         with self.db.read() as conn:
             revision=one(conn,'SELECT ledger_revision,earliest_affected_day FROM ledger_state')
+            if ledger_revision is not None and revision['ledger_revision'] != ledger_revision:
+                raise Conflict('opening records changed; reload from first page')
             items=rows(conn,sql+' ORDER BY o.occurred_at,o.rowid LIMIT ? OFFSET ?',(*args,limit,offset))
             for item in items:
                 item['is_current']=bool(item['is_current'])
@@ -820,7 +822,7 @@ class PortfolioService:
             items, reasons = self._evidence_items(lots, positions, codes, cutoff, invalidated)
             if invalidated:
                 reasons = sorted(set(reasons) | {'company_action_invalidated_strategy_scale'})
-            return {**versions,'account_id':account,'as_of':cutoff,
+            return {**versions,'database_uuid':self.db.identity.database_uuid,'generation':self.db.identity.generation,'account_id':account,'as_of':cutoff,
                     'status':self._evidence_status(items),'reason_codes':reasons,
                     'items':items,
                     'note':'策略证据只说明该批次来自哪一条已记录的 V9/G2 决策；成交、数量与现金仍以账本为准。'}
@@ -867,6 +869,10 @@ class PortfolioService:
                 # The batch itself is intact, but its frozen ATR and protective stop
                 # belong to the pre-action price scale and cannot be reused silently.
                 status, codes_out = 'unverified', codes_out + ['company_action_invalidated_strategy_scale']
+            elif lot.get('strategy_id') == 'NDX_AUX_T5':
+                proof = lot.get('signal_evidence') or {}
+                status = 'verified' if index_id == 'NDX' and proof.get('kind') == 'ndx_aux_advice_link' and not lot.get('strategy_deviation') else 'unverified'
+                if status != 'verified': codes_out.append('ndx_aux_evidence_unverified')
             elif lot['frozen_atr'] is None or signal_date is None:
                 status, codes_out = 'unverified', codes_out + ['frozen_atr_or_signal_date_missing']
             elif index_id is None:
@@ -877,13 +883,13 @@ class PortfolioService:
                 status, codes_out = 'unverified', codes_out + ['strategy_position_not_recorded']
             else:
                 status, codes_out = 'unverified', codes_out + ['strategy_signal_link_not_verified']
-            if lot.get('strategy_deviation') and lot.get('strategy_id') != 'NDX_AUX_T5':
+            if lot.get('strategy_deviation'):
                 status = 'unverified'
                 codes_out.append('strategy_deviation')
             reasons.update(codes_out)
             items.append({**lot,'instrument_code':code,'index_id':index_id,
                           'evidence_status':status,'reason_codes':codes_out,
-                          'strategy':None if record is None or status!='verified' or record['main_lot_id']!=lot['lot_id'] else {
+                          'strategy':None if lot.get('strategy_id') == 'NDX_AUX_T5' or record is None or status!='verified' or record['main_lot_id']!=lot['lot_id'] else {
                               'entry_date':record['entry_date'],'entry_price':record['entry_price'],
                               'stop_price':record['stop_price'],'trail_trigger':record['trail_trigger'],
                               'stage':record['stage'],'highest_price':record['highest_price'],
@@ -912,7 +918,8 @@ class PortfolioService:
         return 'partial' if 'verified' in marks or 'partial' in marks else 'unavailable'
 
     def valuation(self, account: str, as_of: datetime, previous_trading_day: date | None = None,
-                  quote_revision: int | None = None) -> dict:
+                  quote_revision: int | None = None, ledger_revision: int | None = None,
+                  database_uuid: str | None = None, generation: int | None = None) -> dict:
         self._cutoff(as_of)
         try:
             window = market_window(as_of)
@@ -922,6 +929,11 @@ class PortfolioService:
             raise TradeError('previous trading day conflicts with exchange calendar')
         with self.db.read() as conn:
             require_account(conn,account,securities=True,at=utc(as_of))
+            current = one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision']
+            current_quote = self._revision(conn,None)
+            identity = self.db.identity
+            if ledger_revision is not None and (current != ledger_revision or quote_revision != current_quote or database_uuid != identity.database_uuid or generation != identity.generation):
+                raise Conflict('valuation snapshot changed; reload monthly summary')
             revision = self._revision(conn, quote_revision)
             result = self._valuation(conn, account, as_of, window, revision)
             if window is None:
@@ -938,7 +950,7 @@ class PortfolioService:
                 result.update(latest_completed_trading_day=window.latest_completed.isoformat(),
                               latest_trading_day_pnl_fen=historical['daily_pnl_fen'],
                               latest_trading_day_quality=historical['daily_pnl_quality'])
-            return result
+            return {**result,'database_uuid':identity.database_uuid,'generation':identity.generation}
 
     def monthly_pnl(self, account: str, month: date) -> dict:
         """One current-ledger/quote revision, daily rows only; not a historical knowledge replay."""
@@ -965,13 +977,18 @@ class PortfolioService:
                     else:
                         value=self._valuation(conn,account,cutoff,window,revision)
                         row.update(daily_pnl_fen=value['daily_pnl_fen'],equity_fen=value['equity_fen'],quality=value['daily_pnl_quality'],
-                                   reasons=value['reasons'],market_phase=window.phase)
+                                   reasons=value['reasons'],market_phase=window.phase,daily_return_pct=value['daily_return_pct'],daily_return_reason=value['daily_return_reason'])
                 items.append(row); day+=timedelta(days=1)
             return {'account_id':account,'month':month.isoformat(),'as_of':utc(now),'ledger_revision':ledger,'quote_revision':revision,
+                    'database_uuid':self.db.identity.database_uuid,'generation':self.db.identity.generation,
                     'source':'current_ledger_projection_not_knowledge_replay','items':items}
 
     def _valuation(self, conn: sqlite3.Connection, account: str, as_of: datetime,
                    window: MarketWindow | None, revision: int) -> dict:
+        return self._valuation_projection(conn,account,as_of,window,revision,include_return=True)
+
+    def _valuation_projection(self, conn: sqlite3.Connection, account: str, as_of: datetime,
+                              window: MarketWindow | None, revision: int, *, include_return: bool) -> dict:
         cutoff = utc(as_of)
         day = day_of(as_of)
         start = utc(datetime.combine(day,time.min,SHANGHAI))
@@ -1008,7 +1025,7 @@ class PortfolioService:
         prev_market=0; prev_ok=window is not None
         opening_today_any=False
         for instrument in sorted(ids):
-            master=one(conn,'SELECT code,market FROM instruments WHERE id=?',(instrument,))
+            master=one(conn,"SELECT code,market,name,name_source,name_observed_at,CASE WHEN name IS NULL THEN 'missing' ELSE 'valid' END AS name_quality FROM instruments WHERE id=?",(instrument,))
             current=[r for r in lots if r['instrument_id']==instrument and r['quantity']>0]
             previous=[r for r in prev_lots if r['instrument_id']==instrument and r['quantity']>0]
             quantity=sum(r['quantity'] for r in current); prev_qty=sum(r['quantity'] for r in previous)
@@ -1070,4 +1087,19 @@ class PortfolioService:
                 cumulative=equity-base['amount_fen']-total_flows
             else: reasons.append('cumulative_baseline_incomplete')
         if not openings: reasons.append('cumulative_baseline_missing')
-        return {**rev,'account_id':account,'as_of':cutoff,'trading_day':day.isoformat(),'market_phase':window.phase if window else 'unknown','valuation_trading_day':window.valuation_day.isoformat() if window else None,'is_trading_day':window.is_session if window else None,'previous_trading_day':previous_trading_day.isoformat() if previous_trading_day else None,'source':'sqlite_ledger_and_explicit_quotes','quality':'valid' if equity is not None and daily is not None and cumulative is not None and equity_pnl is not None else 'derived_unverified','reasons':sorted(set(reasons)),'cash_fen':balance,'cash_quality':cash_quality,'known_market_value_fen':market_known,'market_value_fen':market_known if market_ok else None,'equity_fen':equity,'daily_pnl_fen':daily,'daily_pnl_quality':'valid' if daily is not None else 'unavailable','equity_pnl_fen':equity_pnl,'reconciliation_difference_fen':daily_known-equity_pnl if daily_ok and equity_pnl is not None else None,'external_flow_fen':external,'adjustments_fen':adjustments,'dividends_fen':sum(r['amount_fen'] for r in actions if r['kind']=='dividend'),'daily_dividends_fen':sum(r['amount_fen'] for r in actions if r['kind']=='dividend' and r['occurred_at']>=start),'realized_fen':sum(realized.values()) if not blocked else None,'unrealized_fen':unrealized_known if market_ok else None,'cumulative_pnl_fen':cumulative,'cumulative_from':coverage,'cumulative_cash_baseline_fen':openings[0]['amount_fen'] if len(openings)==1 else None,'positions':[r for r in positions if r['quantity']>0],'instrument_results':positions}
+        prior_equity=None; return_reason='not_trading_session'; return_pct=None; prior_as_of=None
+        if include_return and window and window.is_session:
+            return_reason='prior_close_equity_unavailable'
+            try:
+                prior_time=session_bounds(window.previous)[1]
+                prior_as_of=utc(prior_time)
+                master=one(conn,'SELECT effective_at FROM accounts WHERE id=?',(account,))
+                if master['effective_at'] and master['effective_at']<=prior_as_of:
+                    prior_equity=self._valuation_projection(conn,account,prior_time,market_window(prior_time),revision,include_return=False)['equity_fen']
+            except CalendarUnavailable:
+                pass
+            if daily is None: return_reason='daily_pnl_unavailable'
+            elif prior_equity is not None and prior_equity<=0: return_reason='prior_close_equity_nonpositive'
+            elif prior_equity is not None:
+                return_pct=format(Decimal(daily)*100/Decimal(prior_equity),'.6f'); return_reason=None
+        return {**rev,'account_id':account,'as_of':cutoff,'trading_day':day.isoformat(),'market_phase':window.phase if window else 'unknown','valuation_trading_day':window.valuation_day.isoformat() if window else None,'is_trading_day':window.is_session if window else None,'previous_trading_day':previous_trading_day.isoformat() if previous_trading_day else None,'source':'sqlite_ledger_and_explicit_quotes','quality':'valid' if equity is not None and daily is not None and cumulative is not None and equity_pnl is not None else 'derived_unverified','reasons':sorted(set(reasons)),'cash_fen':balance,'cash_quality':cash_quality,'known_market_value_fen':market_known,'market_value_fen':market_known if market_ok else None,'equity_fen':equity,'daily_pnl_fen':daily,'daily_return_pct':return_pct,'daily_return_reason':return_reason,'previous_close_equity_fen':prior_equity,'previous_close_as_of':prior_as_of,'daily_pnl_quality':'valid' if daily is not None else 'unavailable','equity_pnl_fen':equity_pnl,'reconciliation_difference_fen':daily_known-equity_pnl if daily_ok and equity_pnl is not None else None,'external_flow_fen':external,'adjustments_fen':adjustments,'dividends_fen':sum(r['amount_fen'] for r in actions if r['kind']=='dividend'),'daily_dividends_fen':sum(r['amount_fen'] for r in actions if r['kind']=='dividend' and r['occurred_at']>=start),'realized_fen':sum(realized.values()) if not blocked else None,'unrealized_fen':unrealized_known if market_ok else None,'cumulative_pnl_fen':cumulative,'cumulative_from':coverage,'cumulative_cash_baseline_fen':openings[0]['amount_fen'] if len(openings)==1 else None,'positions':[r for r in positions if r['quantity']>0],'instrument_results':positions}
