@@ -267,7 +267,7 @@ def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
         return None
     signal = conn.execute("""SELECT s.signal_id,s.strategy_version,s.config_version,s.input_version
         FROM strategy_signals s JOIN instruments i ON i.code=s.instrument_code
-        WHERE s.signal_id=? AND (s.account_id=? OR s.account_id IS NULL) AND i.id=?
+        WHERE s.signal_id=? AND s.account_id=? AND i.id=?
           AND i.kind='etf' AND s.status='SIGNAL' AND s.source_verified=1 AND s.is_proxy=0
           AND s.price_basis='etf_unadjusted' AND s.price_unit='元'
           AND s.signal_date=? AND s.created_at<=? AND s.config_version LIKE 'cfg:%'
@@ -275,6 +275,16 @@ def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
         (value['signal_id'],value['account_id'],value['instrument_id'],value.get('signal_date'),
          value['executed_at'],value.get('frozen_atr'))).fetchone()
     if signal is None: return None
+    from backend.domain.strategy.calendars import market_clock
+    expected = market_clock('CN').next_trading_day(value['signal_date'])
+    if expected is None or value['trading_day'] != expected:
+        return None
+    # Ambiguous repeated consumption retains real executions but withdraws proof.
+    count = conn.execute("""SELECT count(*) FROM trade_executions WHERE account_id=?
+        AND side='buy' AND status='effective' AND json_extract(payload,'$.signal_id')=?""",
+        (value['account_id'], value['signal_id'])).fetchone()[0]
+    if count != 1:
+        return None
     return dict(zip(('signal_id','strategy_version','config_version','input_version'),signal))
 
 
@@ -396,7 +406,7 @@ class TradeService:
         trade['strategy_deviation'] = bool(v['strategy_deviation'])
         trade['signal_id'] = v.get('signal_id')
         trade['strategy_exit_action'] = v.get('strategy_exit_action')
-        trade['strategy_evidence'] = verified_trade_signal(conn, v)
+        trade['strategy_evidence'] = verified_trade_signal(conn, v) if trade['status'] == 'effective' else None
         trade['strategy_evidence_missing'] = bool(trade['side'] == 'buy' and trade['strategy_id'] and trade['strategy_evidence'] is None)
         return trade
 
@@ -633,7 +643,7 @@ class TradeService:
                     record['strategy_deviation'] = bool(v['strategy_deviation'])
                     record['signal_id'] = v.get('signal_id')
                     record['strategy_exit_action'] = v.get('strategy_exit_action')
-                    record['strategy_evidence'] = verified_trade_signal(conn, v)
+                    record['strategy_evidence'] = verified_trade_signal(conn, v) if record['status'] == 'effective' else None
                     record['strategy_evidence_missing'] = bool(record['side'] == 'buy' and record['strategy_id'] and record['strategy_evidence'] is None)
             incomplete = rows(conn, "SELECT DISTINCT account_id,instrument_id FROM trade_executions WHERE status='pending' ORDER BY account_id,instrument_id")
             result = {'items': records, **revision, 'data_incomplete': bool(incomplete), 'incomplete_scopes': incomplete}

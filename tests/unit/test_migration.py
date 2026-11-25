@@ -413,3 +413,44 @@ def test_cli_probe_dry_run_and_migrate(sources, tmp_path):
     code, output = cli("report", "--report-file", str(tmp_path / "report.json"))
     assert code == 0
     assert json.loads(output)["stock"]["migrated_trades"] == 4
+
+
+def test_rc_1000_cached_vs_600_actual_is_blocked(sources, tmp_path):
+    stock, finance = sources
+    with closing(sqlite3.connect(stock)) as conn:
+        trades = json.loads(conn.execute("SELECT value FROM kv_store WHERE key='trade_history'").fetchone()[0])
+        trades[1]['qty'] = 0
+        conn.execute("UPDATE kv_store SET value=? WHERE key='trade_history'", (json.dumps(trades),))
+        portfolio = json.loads(conn.execute("SELECT value FROM kv_store WHERE key='portfolio'").fetchone()[0])
+        next(p for p in portfolio if p['code']=='510300')['lots'][0]['qty'] = 1000
+        conn.execute("UPDATE kv_store SET value=? WHERE key='portfolio'", (json.dumps(portfolio),))
+        conn.commit()
+    report = migrate(sources, tmp_path / 'mismatch.sqlite')
+    assert next(p for p in report['stock']['positions'] if p['code']=='510300')['quantity'] == 600
+    assert any(d['kind']=='source_target_quantity_unreconciled' and '1000' in d['detail'] and '600' in d['detail'] and d['blocks_takeover'] for d in report['differences'])
+    assert report['blocks_formal_takeover']
+    assert report['formal_projection']['overview']['net_worth_fen'] is None
+
+
+def test_rc_interrupted_run_cannot_be_restarted(sources, tmp_path):
+    target = tmp_path / 'interrupted.sqlite'
+    migrate(sources, target)
+    with closing(sqlite3.connect(target)) as conn:
+        conn.execute("UPDATE migration_runs SET status='running'")
+        conn.commit()
+    before = digest(target)
+    with pytest.raises(Refused, match='interrupted'):
+        migrate(sources, target)
+    assert report_from_target(target)['blocks_formal_takeover'] is True
+    assert query(target, "SELECT count(*) FROM trade_executions WHERE status='effective'")[0][0] == 4
+
+
+def test_rc_unsupported_source_version_creates_no_target(sources, tmp_path):
+    stock, finance = sources
+    with closing(sqlite3.connect(finance)) as conn:
+        conn.execute("UPDATE finance_meta SET value='999' WHERE key='schema_version'")
+        conn.commit()
+    target = tmp_path / 'unsupported.sqlite'
+    with pytest.raises(Refused, match='unsupported legacy schema'):
+        migrate(sources, target)
+    assert not target.exists()

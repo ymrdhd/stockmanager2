@@ -139,7 +139,7 @@ def quote_for(svc, instrument, *, day, price):
 
 
 def service(db, data=None):
-    return StrategyService(db, data=data if data is not None else FakeData())
+    return StrategyService(db, data=data if data is not None else FakeData(), clock=lambda: datetime.fromisoformat('2026-11-24T16:00:00+08:00'))
 
 
 def signals(db):
@@ -219,9 +219,10 @@ def test_history_replay_never_sees_the_future_bar(ledger):
     with svc.db.read() as conn:
         assert conn.execute('SELECT count(*) FROM strategy_signals').fetchone() == (0,)
         assert conn.execute('SELECT count(*) FROM strategy_plans').fetchone() == (0,)
-    late = strategy.pool(account, as_of=days[-1], persist=True)
-    assert next(item for item in late['items']
-                if item['index_id'] == '000300.SH')['status'] == 'SIGNAL'
+    # Isolate the one technical opportunity; the pool's simultaneous capacity
+    # gate has its own regression and must not silently rank multiple signals.
+    late = strategy.evaluate('000300.SH', account_id=account, as_of=days[-1], persist=True)
+    assert late['status'] == 'SIGNAL'
     with svc.db.read() as conn:
         dates = [r[0] for r in conn.execute(
             'SELECT DISTINCT signal_date FROM strategy_signals ORDER BY signal_date')]
@@ -292,7 +293,8 @@ def test_unavailable_index_degrades_instead_of_inventing(ledger):
     assert broken['price_basis'] == 'etf_unadjusted'
     assert broken['series'] == {'available': False}
     healthy = next(item for item in view['items'] if item['index_id'] == '000300.SH')
-    assert healthy['status'] == 'SIGNAL'
+    assert healthy.get('technical_status', healthy['status']) == 'SIGNAL'
+    assert healthy['series']['available'] and not healthy['tradable']
 
 
 def test_signal_records_its_price_basis_and_input_version(ledger):
@@ -423,9 +425,9 @@ def test_real_main_buy_establishes_the_strategy_state(ledger):
     assert position['signal_atr'] == pytest.approx(0.05)
     assert position['shares'] == 100
     # 保护价与冻结 ATR 处于同一人民币尺度：3.4567 - 0.25×0.05 = 3.44495，按 tick 向上取整。
-    assert position['initial_stop'] == pytest.approx(3.445, abs=1e-6)
-    # stop_price 会被模型推进上移（跟踪只上移不下移），但永远不低于初始止损。
-    assert position['stop_price'] >= position['initial_stop'] - 1e-9
+    assert position['unverified_reference']['initial_stop'] == pytest.approx(3.445, abs=1e-6)
+    assert position['stop_price'] is None and position['action'] == 'UNVERIFIED'
+    assert row['model_exit'] is None
     assert position['model_only'] is True
     # 证据只来自账本，没有凭空写入策略表。
     with svc.db.read() as conn:
@@ -444,13 +446,14 @@ def test_sub_lot_keeps_its_own_protective_price(ledger):
                      strategy_id='INDEX_STRATEGY_ATR', lot_role='sub',
                      signal_date='2026-01-05', frozen_atr='0.0833'))
     row = service(svc.db, etf_fixture()).position_rows(account, as_of=as_of)['items'][0]
-    adds = row['position']['adds']
+    assert row['position']['adds'][0]['stop_price'] is None
+    adds = row['position']['unverified_reference']['adds']
     assert len(adds) == 1
     assert adds[0]['signal_atr'] == pytest.approx(0.0833)
     # 子仓独立止损以**自己的**成交价与 ATR 为准：3.6 - 0.25×0.0833 = 3.579175 → tick 上取整。
     assert adds[0]['initial_stop'] == pytest.approx(3.580, abs=1e-6)
     # 子仓保护价与主仓不同：绝不借用主仓冻结 ATR 的尺度。
-    assert adds[0]['initial_stop'] != pytest.approx(row['position']['initial_stop'])
+    assert adds[0]['initial_stop'] != pytest.approx(row['position']['unverified_reference']['initial_stop'])
 
 
 def test_model_exit_never_closes_or_cools_down_the_real_position(ledger):
@@ -458,8 +461,12 @@ def test_model_exit_never_closes_or_cools_down_the_real_position(ledger):
     svc, account, instrument = ledger
     fund(svc, account)
     as_of = sessions(80)[-1]
-    svc.submit(main_lot_trade(account, instrument, 'main-buy', signal_date='2026-01-05',
-                              frozen_atr='0.05'))
+    signal = StrategyStore(svc.db, clock=lambda: datetime.fromisoformat('2026-01-05T15:30:00+08:00')).save_signal(
+        account_id=account,index_id='000300.SH',instrument_code='510300',signal_date='2026-01-05',
+        input_version='fixture-exit',strategy_version='index-strategy-atr-v9.2',config_version='cfg:fixture',
+        status='SIGNAL',price_basis='etf_unadjusted',price_unit='元',atr14=.05,source_verified=True)
+    svc.submit(trade(account, instrument, 'main-buy', day=6, lot_role='main', strategy_id='INDEX_STRATEGY_ATR',
+                     signal_date='2026-01-05', frozen_atr='0.05', signal_id=signal['signal_id']))
     strategy = service(svc.db, etf_fixture())
     before = snapshot(svc)
     view = strategy.position_rows(account, as_of=as_of, persist=True)
@@ -527,7 +534,9 @@ def test_correction_rebuilds_the_state_from_the_new_lot(ledger):
     assert row['position']['shares'] == 250
     assert row['position']['entry_price'] == pytest.approx(3.5)
     # 保护价按更正后的成交价与冻结 ATR 重算：3.5 - 0.25×0.05 = 3.4875 → tick 上取整 3.488。
-    assert row['position']['initial_stop'] == pytest.approx(3.488, abs=1e-6)
+    assert row['position']['unverified_reference']['initial_stop'] == pytest.approx(3.488, abs=1e-6)
+    assert row['position']['initial_stop'] is None
+    assert row['position']['action'] == 'UNVERIFIED'
     # 只有一条有效批次，作废的那条不得出现在 custody 里。
     assert len(view['custody']) == 1
     assert view['custody'][0]['lot_id'] == row['position']['main_lot_id']
@@ -680,3 +689,31 @@ def test_actual_exit_cooldown_is_derived_not_model_or_cache(ledger):
     assert strategy._cooldown_state(account,'000300.SH','2026-01-07',clock,'UP')['required_days']==3
     svc.void(corrected['id'],'undo-exit','actual sell not executed')
     assert strategy._cooldown_state(account,'000300.SH','2026-01-07',clock,'RANGE')['active'] is False
+
+
+def test_repeated_signal_keeps_real_trades_but_withdraws_ambiguous_evidence(ledger):
+    svc, account, instrument = ledger
+    fund(svc, account)
+    signal = StrategyStore(svc.db, clock=lambda: datetime.fromisoformat('2026-01-05T15:30:00+08:00')).save_signal(
+        account_id=account,index_id='000300.SH',instrument_code='510300',signal_date='2026-01-05',
+        input_version='fixture-raw-ohlcv',strategy_version='index-strategy-atr-v9.2',config_version='cfg:fixture',
+        status='SIGNAL',price_basis='etf_unadjusted',price_unit='元',atr14=.05,source_verified=True)
+    def buy(request):
+        return svc.submit(trade(account,instrument,request,day=6,lot_role='main',strategy_id='INDEX_STRATEGY_ATR',
+                                frozen_atr='0.05',signal_date='2026-01-05',signal_id=signal['signal_id']))
+    first, second = buy('dup-one'), buy('dup-two')
+    assert first['status'] == second['status'] == 'effective'
+    assert svc.get(first['id'])['strategy_evidence'] is None
+    assert svc.get(second['id'])['strategy_evidence'] is None
+
+
+def test_expired_signal_is_not_proof_but_late_execution_is_kept(ledger):
+    svc, account, instrument = ledger
+    fund(svc, account)
+    signal = StrategyStore(svc.db, clock=lambda: datetime.fromisoformat('2026-01-05T15:30:00+08:00')).save_signal(
+        account_id=account,index_id='000300.SH',instrument_code='510300',signal_date='2026-01-05',
+        input_version='fixture-raw-ohlcv',strategy_version='index-strategy-atr-v9.2',config_version='cfg:fixture',
+        status='SIGNAL',price_basis='etf_unadjusted',price_unit='元',atr14=.05,source_verified=True)
+    actual = svc.submit(trade(account,instrument,'late-real',day=7,lot_role='main',strategy_id='INDEX_STRATEGY_ATR',
+                              frozen_atr='0.05',signal_date='2026-01-05',signal_id=signal['signal_id']))
+    assert actual['status'] == 'effective' and actual['strategy_evidence'] is None

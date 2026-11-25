@@ -101,6 +101,7 @@ CATEGORY_BY_NATURE = {"INCOME": "other_income", "EXPENSE": "other_expense", "FEE
 
 STRATEGY_KEY = "index_strategy:v1:position:"
 STRATEGY_VERSION = "index-strategy-atr-v9.2"
+MIGRATION_PROTOCOL = "09-rc1"
 UNADJUSTED_BASIS = "unadjusted_etf_price"
 
 #: Migration writes are stamped against a clock that always postdates the facts.
@@ -639,6 +640,8 @@ class _Run:
         self.baseline_coverage: list[str] = []
         self.bills_informational_only = False
         self.unverifiable: dict[str, int] = {}
+        self.account_dates: dict[str, list[tuple[datetime, str]]] = {}
+        self.stock_dates: list[tuple[datetime, str]] = []
 
     def skip(self, db, category: str, reason: str, source_id: str = "",
              detail: dict[str, Any] | None = None) -> None:
@@ -704,28 +707,51 @@ def migrate_accounts(db, run: _Run, svc: TradeService,
                            f"{name} has legacy type {legacy_type} with no 2.0 equivalent",
                            True)
             continue
-        effective = parse_legacy_time(account["created_at"]) or datetime(2025, 1, 1,
-                                                                        tzinfo=SHANGHAI)
+        candidates = list(run.account_dates.get(str(account['id']), []))
+        created_at = parse_legacy_time(account['created_at'])
+        if created_at is not None:
+            candidates.append((created_at, 'finance_account.created_at'))
+        if kind == 'securities' and not seen_securities:
+            candidates.extend(run.stock_dates)
+        if not candidates:
+            run.skip(db, 'account', 'account_effective_date_unknown', source_id, {'name': name})
+            run.difference('account_effective_date_unknown', f'{name}: no dated account evidence; manual confirmation required', True)
+            continue
+        effective, date_source = min(candidates, key=lambda item: item[0])
+        if effective > reference_clock():
+            run.skip(db, 'account', 'account_effective_date_future', source_id, {'name': name})
+            run.difference('account_effective_date_future', f'{name}: only future evidence; manual confirmation required', True)
+            continue
+        if created_at is None or effective < created_at:
+            run.difference('account_effective_date_from_fact', f'{name}: {effective.isoformat()} from {date_source}; earliest observed fact, not a proven opening date', True)
         created = svc.create_account(AccountInput(
             request_id=request_id(run.stock_sha, "acct", source_id),
             name=name, kind=kind, included=bool(account["include_in_balance_sheet"]),
             effective_at=effective))
         record(db, run, "account", source_id, "accounts", created["id"],
-               {"legacy_type": legacy_type, "kind": kind, "name": name})
+               {"legacy_type": legacy_type, "kind": kind, "name": name, "effective_at": effective.isoformat(), "effective_source": date_source})
         run.accounts[name] = {"target_id": created["id"], "kind": kind,
                               "legacy_type": legacy_type}
         if kind == "securities" and not seen_securities:
             primary, seen_securities = name, True
     if primary is None:
+        if not run.stock_dates or any(a['account_type']=='SECURITIES_CASH' for a in legacy_accounts):
+            run.difference('securities_account_date_unresolved', 'No confirmed securities account mapping/effective date; manual review required', True)
+            return None
+        effective, date_source = min(run.stock_dates, key=lambda item: item[0])
+        if effective > reference_clock():
+            run.difference('securities_account_date_future', 'Only future stock evidence; manual review required', True)
+            return None
+        run.difference('securities_account_date_inferred', f'{effective.isoformat()} from {date_source}; account mapping must be confirmed', True)
         run.difference(
             "no_legacy_securities_account",
             "the legacy finance database holds no SECURITIES_CASH account; a single "
             "ledger securities account was created to receive the migrated trades")
         created = svc.create_account(AccountInput(
             request_id=request_id(run.stock_sha, "acct", "securities-account:created"),
-            name="证券账户", kind="securities"))
+            name="证券账户", kind="securities", effective_at=effective))
         record(db, run, "account", "securities-account:created", "accounts", created["id"],
-               {"kind": "securities", "name": "证券账户", "origin": "created_by_migration"})
+               {"kind": "securities", "name": "证券账户", "origin": "created_by_migration", "effective_at": effective.isoformat(), "effective_source": date_source})
         run.accounts["证券账户"] = {"target_id": created["id"], "kind": "securities",
                                     "legacy_type": "SECURITIES_CASH"}
         primary = "证券账户"
@@ -1069,8 +1095,11 @@ def migrate_balances(db, run: _Run, svc: FinanceService,
             run.skip(db, "balance", "already_migrated", source_id)
             continue
         amount = abs(int(account["current_balance_fen"]))
-        at = parse_legacy_time(account["updated_at"]) or datetime(2025, 1, 1,
-                                                                  tzinfo=SHANGHAI)
+        at = parse_legacy_time(account['updated_at'])
+        if at is None:
+            run.skip(db, 'balance', 'balance_date_unknown', source_id, {'name': account['name']})
+            run.difference('balance_date_unknown', f"{account['name']}: observation timestamp missing; balance not posted", True)
+            continue
         created = svc.balance(BalanceInput(
             request_id=request_id(run.stock_sha, "balance", source_id),
             account_id=target["target_id"], after_fen=amount, occurred_at=at,
@@ -1530,6 +1559,27 @@ def _execute(db, run: _Run, conn_source: sqlite3.Connection,
     portfolio_svc = PortfolioService(db, reference_clock)
     finance_svc = FinanceService(db, reference_clock)
     ensure_self_schema(db)
+    # Earliest observed dates are evidence, not arbitrary calendar defaults.
+    def add_date(dest, value, source):
+        at = parse_legacy_time(value)
+        if at is not None:
+            dest.append((at, source))
+    for row in legacy['trades']:
+        if row.get('action') in BUY_ACTIONS | SELL_ACTIONS:
+            add_date(run.stock_dates, row.get('trade_date') or row.get('date'), 'trade_history.execution')
+    for row in legacy['portfolio']:
+        for lot in row.get('lots') or []:
+            if isinstance(lot, dict):
+                add_date(run.stock_dates, lot.get('buy_date') or row.get('buy_date'), 'portfolio.lot.buy_date')
+    for row in conn_source.execute('SELECT date FROM daily_snapshot WHERE cash_balance IS NOT NULL'):
+        add_date(run.stock_dates, row[0], 'daily_snapshot.cash_balance')
+    for row in read_transfer_history(conn_source):
+        add_date(run.stock_dates, row.get('date'), 'transfer_data.date')
+    if conn_finance is not None:
+        for row in conn_finance.execute("SELECT occurred_at,source_account_id,target_account_id FROM finance_transaction WHERE status='POSTED'"):
+            for account_id in (row[1], row[2]):
+                if account_id is not None:
+                    add_date(run.account_dates.setdefault(str(account_id), []), row[0], 'finance_transaction.occurred_at')
     securities = migrate_accounts(db, run, trade_svc, legacy["accounts"])
     securities_id = run.accounts[securities]["target_id"] if securities else None
     migrate_instruments(db, run, trade_svc, legacy["codes"])
@@ -1541,6 +1591,16 @@ def _execute(db, run: _Run, conn_source: sqlite3.Connection,
     if conn_finance is not None:
         migrate_finance(db, run, finance_svc, conn_finance, legacy["accounts"])
     migrate_strategy(db, run, conn_source, run.instruments)
+    _, actual = positions_of(read_target_state(db))
+    for entry in legacy['portfolio']:
+        code = str(entry.get('code') or '')
+        quantities = [whole_quantity(lot.get('qty')) for lot in entry.get('lots') or [] if isinstance(lot, dict)]
+        if not code or not quantities or any(q is None for q in quantities):
+            continue
+        expected = sum(quantities)
+        found = actual.get(code, 0)
+        if expected != found:
+            run.difference('source_target_quantity_unreconciled', f'{code}: legacy cached {expected}, migrated ledger {found}; unexplained difference requires review', True)
 
 
 def _finish(db, run: _Run, source: dict[str, Any], *, previous_run: bool,
@@ -1548,20 +1608,45 @@ def _finish(db, run: _Run, source: dict[str, Any], *, previous_run: bool,
             write_run: bool) -> dict[str, Any]:
     state = read_target_state(db)
     report = build_report(run, state, source, previous_run)
+    # Use the same authoritative projection as the application, at one cutoff.
+    # Legacy cache totals remain separate evidence rather than replacing facts.
+    cutoff = reference_clock()
+    service = FinanceService(db, reference_clock)
+    overview = service.overview(cutoff)
+    periods = [service.month(date.fromisoformat(row['period']), cutoff)
+               for row in report['finance']['months']]
+    with db.read() as conn:
+        mapped = conn.execute("SELECT status,count(*) FROM trade_executions GROUP BY status").fetchall()
+        fees = conn.execute("SELECT count(*),sum(fees_fen) FROM trade_executions WHERE status='effective'").fetchone()
+    report['formal_projection'] = {
+        'valuation_at': overview['as_of'], 'ledger_revision': overview['ledger_revision'],
+        'quote_revision': overview['quote_revision'],
+        'overview': {key: overview[key] for key in ('quality','asset_categories','securities_cash_fen',
+            'securities_market_value_fen','securities_equity_fen','total_assets_fen','total_liabilities_fen',
+            'net_worth_fen','reasons','accounts')},
+        'months': [{key: value for key, value in item.items() if key != 'items'} for item in periods],
+        'trade_counts': dict(mapped), 'effective_trade_count': fees[0],
+        'effective_trade_fees_fen': fees[1],
+        'source_valuation_at': None,
+        'source_valuation_status': 'unverified_same_cutoff',
+    }
+    # We cannot certify a source-to-target valuation without source price/time proof.
+    if overview['quality'] != 'valid' or report['formal_projection']['source_valuation_at'] is None:
+        run.difference('formal_valuation_not_reconciled',
+                       'formal projection available; source valuation at the same cutoff is not verified', True)
+        report['blocks_formal_takeover'] = True
+    if sha256_of(run.stock_path) != run.stock_sha or (run.finance_path and sha256_of(run.finance_path) != run.finance_sha):
+        run.difference('source_changed_during_run', 'source checksum changed during migration; discard this sandbox from takeover', True)
+        report['blocks_formal_takeover'] = True
     report["run_id"] = run.run_id
     report["target"] = str(Path(target).resolve())
     report["dry_run"] = dry_run
+    report['migration_protocol'] = MIGRATION_PROTOCOL
     if write_run:
         with db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO migration_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (run.run_id, "stock+finance" if run.finance_sha else "stock",
-                 run.stock_sha, run.finance_sha, str(run.stock_path),
-                 str(run.finance_path) if run.finance_path else None, run.mode,
-                 run.target_role, "completed", started.isoformat(),
-                 datetime.now(UTC).isoformat(), run.migrated_trades, len(run.skips),
-                 len(run.pending), json.dumps(report, ensure_ascii=False,
-                                              sort_keys=True)))
+            conn.execute("UPDATE migration_runs SET status='completed',finished_at=?,migrated=?,skipped=?,pending=?,summary=? WHERE id=? AND status='running'",
+                         (datetime.now(UTC).isoformat(), run.migrated_trades, len(run.skips), len(run.pending),
+                          json.dumps(report, ensure_ascii=False, sort_keys=True), run.run_id))
     return report
 
 
@@ -1589,11 +1674,20 @@ def run_migration(stock_db: Path, finance_db: Path | None, target: Path, *,
         run = _Run(stock_sha=source["stock_sha256"], finance_sha=source["finance_sha256"],
                    run_id=uuid4().hex, stock_path=stock_db, finance_path=finance_db,
                    mode="migrate", target_role=target_role)
+        if source['detected_schema']['stock'] != STOCK_SCHEMA or (finance_db and source['detected_schema']['finance'] != f'legacy-finance-v{FINANCE_SCHEMA}'):
+            raise Refused('unsupported legacy schema; inspect read-only probe before migration')
         legacy = _prepare_legacy(conn_source, conn_finance)
         run.source_trades = len(legacy["trades"])
         with target_database(target) as (db, identity, real):
             ensure_self_schema(db)
+            with db.read() as conn:
+                interrupted = conn.execute("SELECT id FROM migration_runs WHERE status!='completed' LIMIT 1").fetchone()
+                orphaned = conn.execute("SELECT 1 FROM migration_ledger l LEFT JOIN migration_runs r ON r.id=l.run_id WHERE r.id IS NULL LIMIT 1").fetchone()
+            if interrupted or orphaned:
+                raise Refused('interrupted or orphaned migration; preserve target and rehearse into a new sandbox')
             previous = previous_completed(db)
+            if previous and json.loads(previous['summary']).get('migration_protocol') != MIGRATION_PROTOCOL:
+                raise Refused('migration protocol mismatch; use a fresh sandbox')
             same_source = (previous is not None
                            and previous["stock_sha256"] == run.stock_sha
                            and previous["finance_sha256"] == run.finance_sha)
@@ -1610,7 +1704,25 @@ def run_migration(stock_db: Path, finance_db: Path | None, target: Path, *,
                     "target that already holds a completed migration")
                 return _finish(db, run, source, previous_run=True, dry_run=False,
                                target=real, started=started, write_run=False)
+            with db.transaction() as conn:
+                conn.execute('INSERT INTO migration_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                             (run.run_id, 'stock+finance' if run.finance_sha else 'stock', run.stock_sha,
+                              run.finance_sha, str(run.stock_path), str(run.finance_path) if run.finance_path else None,
+                              run.mode, run.target_role, 'running', started.isoformat(), None, 0, 0, 0,
+                              json.dumps({'migration_protocol': MIGRATION_PROTOCOL, 'blocks_formal_takeover': True})))
             _execute(db, run, conn_source, conn_finance, legacy)
+            if previous:
+                old = json.loads(previous['summary'])
+                for item in old.get('differences', []):
+                    if item not in run.differences:
+                        run.differences.append(item)
+                for item in old.get('stock', {}).get('pending_trades_detail', []):
+                    if item not in run.pending:
+                        run.pending.append(item)
+                for key, items in [('legacy_calculation_errors', run.legacy_errors), ('migration_tool_errors', run.tool_errors)]:
+                    for item in old.get(key, []):
+                        if item not in items:
+                            items.append(item)
             return _finish(db, run, source, previous_run=previous is not None,
                            dry_run=False, target=real, started=started, write_run=True)
     finally:
@@ -1632,6 +1744,8 @@ def rehearsal(stock_db: Path, finance_db: Path | None, target: Path) -> dict[str
         run = _Run(stock_sha=source["stock_sha256"], finance_sha=source["finance_sha256"],
                    run_id=uuid4().hex, stock_path=stock_db, finance_path=finance_db,
                    mode="dry-run", target_role="sandbox")
+        if source['detected_schema']['stock'] != STOCK_SCHEMA or (finance_db and source['detected_schema']['finance'] != f'legacy-finance-v{FINANCE_SCHEMA}'):
+            raise Refused('unsupported legacy schema; inspect read-only probe before migration')
         legacy = _prepare_legacy(conn_source, conn_finance)
         run.source_trades = len(legacy["trades"])
         with rehearsal_database() as (db, identity, path):
@@ -1654,16 +1768,26 @@ def report_from_target(target: Path) -> dict[str, Any]:
         identity = read_identity(conn)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT summary FROM migration_runs ORDER BY started_at DESC,rowid DESC "
+            "SELECT summary,status FROM migration_runs ORDER BY started_at DESC,rowid DESC "
             "LIMIT 1").fetchone()
         if row is None:
             raise Refused("the database holds no recorded migration run")
         report = json.loads(row[0])
+        if row[1] != 'completed':
+            report['blocks_formal_takeover'] = True
+            report['migration_status'] = row[1]
+            report['reason'] = 'migration incomplete; preserve target and use a new sandbox'
         counts = tables_with_counts(conn)
         evidence = conn.execute(
             "SELECT count(*) FROM strategy_evidence_legacy").fetchone()[0]
         strategy_positions = conn.execute(
             "SELECT count(*) FROM strategy_positions").fetchone()[0]
+        projection = report.get('formal_projection') or {}
+        ledger_revision = conn.execute('SELECT ledger_revision FROM ledger_state').fetchone()[0]
+        quote_revision = conn.execute('SELECT quote_revision FROM quote_state').fetchone()[0]
+        if (projection.get('ledger_revision'), projection.get('quote_revision')) != (ledger_revision, quote_revision):
+            report['blocks_formal_takeover'] = True
+            report['projection_stale'] = True
     report["reported_from"] = str(target)
     report["reported_role"] = identity.instance_role
     report["reported_tables"] = counts

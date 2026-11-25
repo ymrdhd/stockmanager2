@@ -17,6 +17,13 @@ const valuation=ref<Fact|null>(null), strategy=ref<Fact|null>(null), month=ref<F
 const pool=ref<Fact|null>(null), positionsView=ref<Fact|null>(null), strategyError=ref(''), strategyLoading=ref(false)
 const signalWriting=ref(false), signalFeedback=ref('')
 const selectedAccount=ref(''), asOf=ref(''), period=ref(''), historyTime=ref('')
+const strategyMode=ref<'current'|'historical'>('current'), strategyDay=ref('')
+function strategyQuery(){
+  if(strategyMode.value==='current')return '?mode=current'
+  if(!strategyDay.value)throw new Error('请选择历史策略截止日期')
+  return '?mode=historical&as_of='+encodeURIComponent(strategyDay.value)
+}
+function resetStrategyMode(){poolSequence++;pool.value=null;positionsView.value=null;strategyLoading.value=false;signalFeedback.value='';strategyError.value=''}
 const openings=ref<Fact[]>([]), openingsError=ref('')
 const backupState=ref<Fact|null>(null), migrationState=ref<Fact|null>(null), maintenanceError=ref(''), maintenanceLoading=ref(false)
 const error=ref(''), readError=ref(''), feedback=ref(''), busy=ref(false), loading=ref(false)
@@ -202,24 +209,25 @@ async function refreshStrategy(){
     if(!selectedAccount.value)throw new Error('请先选择证券账户')
     const id=encodeURIComponent(selectedAccount.value)
     // The read-only path only displays evidence; only POST /strategy/refresh writes signals.
-    const [p,pos]=await Promise.all([api(`/strategy/pool/${id}`),api(`/strategy/positions/${id}`)])
+    const query=strategyQuery()
+    const [p,pos]=await Promise.all([api(`/strategy/pool/${id}${query}`),api(`/strategy/positions/${id}${query}`)])
     if(active&&token===poolSequence){pool.value=p;positionsView.value=pos}
   }catch(e){if(active&&token===poolSequence){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
   finally{if(active&&token===poolSequence)strategyLoading.value=false}
 }
 /** An explicit operator action: this is the only path that records formal signals. */
 async function writeStrategySignals(){
-  if(signalWriting.value||!writable.value)return
+  if(signalWriting.value||!writable.value||strategyMode.value!=='current')return
   signalWriting.value=true;strategyError.value='';signalFeedback.value=''
   const token=++poolSequence
   try{
     if(!selectedAccount.value)throw new Error('请先选择证券账户')
     const id=encodeURIComponent(selectedAccount.value)
-    const written=await api(`/strategy/refresh?account_id=${id}`,'POST')
+    const written=await api(`/strategy/refresh?mode=current&account_id=${id}`,'POST')
     if(!active||token!==poolSequence)return
     pool.value=written
     signalFeedback.value=facts(written.items).some(row=>!!row.signal_id)?'已读取服务器保存的信号证据。':'服务端未返回正式信号。'
-    const pos=await api(`/strategy/positions/${id}`)
+    const pos=await api(`/strategy/positions/${id}?mode=current`)
     if(active&&token===poolSequence)positionsView.value=pos
   }catch(e){if(active)strategyError.value=String(e)}
   finally{if(active)signalWriting.value=false}
@@ -341,8 +349,8 @@ const positionRows=computed(()=>positionsView.value?facts(positionsView.value.it
     pyramid_text:pyramid.reason?`${str(pyramid.status)}：${str(pyramid.reason)}`:'—',
     ndx_text:aux.status?`${str(aux.status)}：${str(aux.detail)}`:'—',
     action_text:`【模型建议，非实际成交】${actionLabels[str(p.action)]??display(p.action)}${p.action_price==null?'':` @ ${num(p.action_price)}`}${str(p.action_reason)?`；${str(p.action_reason)}`:''}`,
-    live_text:`策略记录 ${p.add_executed?'已加仓':'主仓'}；账本剩余 ${item.live_quantity??0} 股`,
-    cooldown_text:cooldown.active?str(cooldown.note)||'冷却中':'无冷却限制',
+    live_text:item.live_quantity==null?'真实数量不可核实':`策略记录 ${p.add_executed?'已加仓':'主仓'}；账本剩余 ${item.live_quantity} 股`,
+    cooldown_text:cooldown.active==null?'冷却状态不可核实':cooldown.active?str(cooldown.note)||'冷却中':'无冷却限制',
   }}):[])
 const positionColumns=computed(()=>cols({label:'指数与交易标的',entry_text:'建仓事实（策略证据）',atr_text:'信号日 ATR',stop_text:'当前保护价',trail_text:'跟踪止盈',term_text:'时间退出',pyramid_text:'盈利加仓条件',ndx_text:'NDX 辅助仓',action_text:'策略建议',live_text:'实际持仓对照',cooldown_text:'冷却'}).concat([{key:'warnings',label:'未核对与提示'}]))
 /** Only a recorded formal signal on the unadjusted ETF series may prefill a trade form. */
@@ -350,7 +358,7 @@ function canFill(row:Fact):boolean{
   const status=str(row.status)
   if(status!=='SIGNAL'&&status!=='AWAITING_CONFIRMATION'&&status!=='PLAN_PENDING')return false
   // A number derived from an index level or an adjusted series is not a fillable ETF price.
-  if(row.tradable!==true||str(row.price_basis)!=='etf_unadjusted'||!str(row.signal_id)||typeof row.atr14!=='number'||Number(num(row.atr14))<=0)return false
+  if(strategyMode.value!=='current'||row.tradable!==true||str(row.price_basis)!=='etf_unadjusted'||!str(row.signal_id)||typeof row.atr14!=='number'||Number(num(row.atr14))<=0)return false
   const code=str(row.etf_code)
   return !!code&&instruments.value.some(i=>str(i.code)===code)
 }
@@ -374,7 +382,7 @@ function openTradeFromSignal(row:Fact){
 </script>
 
 <template>
-  <header><div><h1>Stock Manager 2.0</h1><p>V1.0 开发版 · 08-strategy</p></div><div role="status"><strong>后端：{{health.kind==='connected'?'已连接':health.kind==='checking'?'正在连接':'连接失败'}}</strong> · {{display(system?.mode)}} · {{system?.writable===true?'允许写入':'禁止写入'}}<template v-if="sessionName"> · 已登录：{{sessionName}} <button :disabled="busy" @click="signOut">退出登录</button></template> <button :disabled="busy||loading" @click="reload">重新读取</button></div></header>
+  <header><div><h1>Stock Manager 2.0</h1><p>V1.0 候选开发版 · 09-RC（未发布）</p></div><div role="status"><strong>后端：{{health.kind==='connected'?'已连接':health.kind==='checking'?'正在连接':'连接失败'}}</strong> · {{display(system?.mode)}} · {{system?.writable===true?'允许写入':'禁止写入'}}<template v-if="sessionName"> · 已登录：{{sessionName}} <button :disabled="busy" @click="signOut">退出登录</button></template> <button :disabled="busy||loading" @click="reload">重新读取</button></div></header>
   <nav aria-label="主导航"><button v-for="name in tabs" :key="name" :aria-current="tab===name?'page':undefined" :class="{selected:tab===name}" @click="navigate(name)">{{name}}</button></nav>
   <main>
     <section v-if="signIn" class="operation" aria-label="登录">
@@ -428,8 +436,9 @@ function openTradeFromSignal(row:Fact){
         <template v-else><p>请选择证券账户或重新读取。</p></template>
         <h3>V9/G2 策略观察池</h3>
         <p class="notice">默认 <b>ETF 模式</b>下，V9 突破位、ATR 与 BuyMax 全部用<b>ETF 未复权人民币日线</b>计算；<b>G2 基准</b>用 <b>14 只指数真实点位</b>判定。两套价格各自成体系、不混算，也不做点位折算；真实市值用未复权价。表内「信号收盘」列标明每一行用的是哪套价格。策略建议不等于真实成交：真实主仓/子仓/退出只能经「录入真实成交」确认。</p>
-        <div class="toolbar"><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池（只读）'}}</button><button :disabled="signalWriting||!writable||!selectedAccount" @click="writeStrategySignals">{{signalWriting?'正在写入…':'记录正式信号（写入）'}}</button><span v-if="pool">数据日期 {{display(pool.as_of)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(nested(pool.regime).label)}} / ER60 {{display(nested(pool.regime).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
+        <div class="toolbar"><label>策略模式 <select v-model="strategyMode" :disabled="signalWriting" @change="resetStrategyMode"><option value="current">当前决策</option><option value="historical">历史回放（只读）</option></select></label><label v-if="strategyMode==='historical'">截止交易日 <input type="date" v-model="strategyDay" @change="resetStrategyMode"/></label><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池（只读）'}}</button><button :disabled="signalWriting||!writable||!selectedAccount||strategyMode!=='current'" @click="writeStrategySignals">{{signalWriting?'正在写入…':'记录正式信号（写入）'}}</button><span v-if="pool">行情日期 {{display(pool.as_of)}}；账本截止 {{display(pool.ledger_cutoff)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(nested(pool.regime).label)}} / ER60 {{display(nested(pool.regime).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
         <p class="notice">刷新只读取证据、不写库；只有「记录正式信号（写入）」会把信号与数据版本落到账本。</p>
+        <p v-if="pool?.historical_replay_complete===false" class="notice">历史配置和更正时点证据不完整：仅供研究，不可执行，不生成保护指令。</p>
         <p v-if="signalFeedback" class="notice">{{signalFeedback}}</p>
         <p v-if="strategyError" class="error" role="alert">{{strategyError}}</p>
         <p v-if="pool&&Array.isArray(nested(pool.regime).warning)===false&&nested(pool.regime).warning" class="notice">G2 基准提示：{{display(nested(pool.regime).warning)}}</p>
@@ -452,7 +461,7 @@ function openTradeFromSignal(row:Fact){
           </template>
           <h4>真实账本中的策略批次（核对依据）</h4>
           <RecordTable v-if="facts(positionsView.custody).length" :rows="facts(positionsView.custody)" :columns="cols({lot_id:'批次ID',lot_role:'角色',strategy_id:'策略标识',signal_date:'信号日',frozen_atr:'冻结ATR',code:'证券代码',market:'市场',kind:'类型',remaining:'剩余数量'})"/>
-          <p v-else class="notice">账本中没有带策略标记的主仓/子仓批次；策略持仓状态若存在则属于未核对证据。</p>
+          <p v-else class="notice">{{positionsView.custody_quality==='historical_unavailable'?'历史账本版本不可完整核验，不能据此判断持仓为零。':'账本中没有带策略标记的主仓/子仓批次；策略持仓状态若存在则属于未核对证据。'}}</p>
         </template>
         <p v-else class="notice">尚未读取持仓决策。</p>
         <details v-if="strategy"><summary>原批次证据（历史接口）</summary><pre>{{JSON.stringify(strategy,null,2)}}</pre></details>

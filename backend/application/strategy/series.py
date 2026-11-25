@@ -33,6 +33,7 @@ from hashlib import sha256
 from typing import Optional
 
 from backend.application.trading.service import rows, utc
+from backend.application.strategy.decision import active_decision
 from backend.domain.strategy.config import get_config
 from backend.domain.strategy.market_data import Bar, IndexSeries, bars_from_columns
 from backend.domain.strategy.symbols import (
@@ -235,20 +236,22 @@ class StrategyData:
 
     def decision_window(self, completed_on: str, market: str) -> tuple[str, str, bool]:
         """Day-only replay uses the end of that Shanghai day, never today's later inputs."""
-        now = self.clock()
+        context = active_decision.get()
+        now = context.now if context else self.clock()
         try:
             latest = market_clock('CN').last_completed_session(now=now)
             requested = date.fromisoformat(completed_on[:10])
             if latest is None or requested.isoformat() > latest or not market_clock('CN').is_trading_day(requested.isoformat()):
                 raise CalendarCoverageError('请求日期不是已完成的国内交易日')
-            historic = requested < now.astimezone(ZoneInfo('Asia/Shanghai')).date()
-            cutoff = min(now, datetime.combine(requested, time.max, ZoneInfo('Asia/Shanghai')))
+            historic = context.mode == 'historical' if context else requested.isoformat() != latest
+            cutoff = (min(now, datetime.combine(requested, time.max, ZoneInfo('Asia/Shanghai')))
+                      if historic else now)
             target = market_clock(market).last_completed_session(now=cutoff)
             if target is None:
                 raise CalendarCoverageError('无法确定市场收盘交易日')
         except (CalendarCoverageError, ValueError) as exc:
             raise SeriesError('交易日历不可用', detail=str(exc)) from exc
-        return target, utc(cutoff), historic
+        return target, utc(cutoff if historic else self.clock()), historic
 
     # -- 指数点位 --------------------------------------------------------
     def index_series(self, index_id: str, *, completed_on: str,
