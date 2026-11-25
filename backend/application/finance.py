@@ -698,7 +698,7 @@ class FinanceService:
         denominator=total('previous_close_equity_fen'); numerator=total('daily_pnl_fen')
         return_pct=None
         if securities and all(r['daily_return_pct'] is not None for r in securities) and denominator and denominator>0 and numerator is not None:
-            return_pct=format(Decimal(numerator)*100/Decimal(denominator),'.6f')
+            return_pct=format(Decimal(numerator)*100/Decimal(denominator),'.2f')
         # Old Finance classifies liabilities by maturity and restricted/other assets by type.
         # 2.0 loses that distinction for other_* kinds. Do not silently classify them.
         liquidity_unknown=[r['id'] for r in included if r['kind'] in ('other_asset','other_liability')]

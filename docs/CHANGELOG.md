@@ -26,3 +26,12 @@
 - 修复浏览器验收脚本标签定位（Chromium 141 可访问名含选项文本）。
 - 实际执行 Windows 合成演示、真实浏览器 16 项、合成正式库启停/单写者/备份/恢复/旧世代拒绝、实网行情与日历指纹；文档更新见 `10_LOCAL_ACCEPTANCE_REPORT.md`、`10_HANDOFF.md`。
 - 未改数据库 schema、核心策略公式、ATR/冷却规则、产品阈值与依赖锁；未接管或覆盖真实库，未部署发布。
+
+# 10A-final-delivery
+- BASE `26c981551cec7c3b8188b89664e5a5cbedde068f`（`10-local-acceptance`）；分支 `10a-final-delivery`。
+- 产品负责人 2026-11-25 正式批准四项业务口径，记入 `DECISIONS.md` ADR-017（退款冲减原支出期、到账单独记录）、ADR-018（当日投资收益率分母为上一有效交易日收盘证券权益、两位小数、分母缺失或非正不计算）、ADR-019（流动净资产=流动资产−流动负债，含现金/银行卡/支付账户/可变现证券，排除受限资产，未知分类提示待确认）、ADR-020（接近保护价 2% 内风险预警，不改变 V9/G2 规则，NDX T5 独立）。
+- 定向核对：退款、流动净资产、接近止损三项实现与批准文本一致，未改业务代码；当日收益率存在显示精度差异，`backend/application/portfolio.py:1313` 与 `backend/application/finance.py:701` 由 `.6f` 收敛为 `.2f`，同步更新 `tests/unit/test_09f_features.py:44-45` 断言为 `6.67`。分子分母、不可计算判定与原因码均未变。
+- 受影响专项：`pytest tests/unit/test_09f_features.py tests/unit/test_finance.py tests/unit/test_pnl.py -q` → 44 PASS。未重跑全量回归（由独立审查执行），前端源码未改故未重复构建。
+- 文档：`PRODUCT_SPEC.md`（2.1/2.2/2.4 写入四项批准口径）、`DECISIONS.md`（ADR-017～ADR-020）、`INTERFACE_CONTRACT.md`（新增「四项已批准业务口径的接口约束」节）、`STATUS.md`、`ISSUES.md`（09D-009/011/012 状态更新 + 新增 10A 定向核对表与 10A-001～003 观察）、`09F_PRODUCT_CANDIDATES.md`（候选 → 已批准并标注落地状态）、`INDEX.md`、新增 `10A_HANDOFF.md` 与 `10A_FINAL_REVIEW.md`。
+- 未改 schema、策略公式、ATR/冷却规则、保护价/批次逻辑、依赖锁；未操作真实数据库、未正式接管、未发布。
+

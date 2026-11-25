@@ -46,3 +46,12 @@ E2E 必测：当前版本适用的 UI01–09 路由及代表性操作；真实�
 - 财务月 `items` 新增非退款账单 `refund_applied_fen`、退款账单 `original_expense_period`（未知null）；`source=current_effective_finance_facts_not_knowledge_replay`。不改变原期冲减、到账现金流候选语义及手工余额。
 - 页面财务详情按记录、账本版本及数据库身份核对，切换筛选/断线/账本变更时清除，身份不匹配拒绝并标记不可写；历史和趋势仅展示请求对应快照。
 - UI09 端口入口仅生成下次启动的明确参数，建议1024–65535；CLI与PowerShell接受合法1–65535。正式启动命令只在正式服务模式展示，沙盒/只读保留原启动模式。不得通过网页直接改认证文件、自动重启服务或切换库。实际配置与端口验收在服务端进行。
+
+## 四项已批准业务口径的接口约束（2026-11-25 产品负责人批准）
+
+四项口径的批准文本见 `DECISIONS.md` ADR-017～ADR-020、`PRODUCT_SPEC.md` 2.1/2.2/2.4。本节只固化对外表现，不新增账务事实。
+
+- **退款（ADR-017）**：`GET /api/v1/finance/month`、`/finance/year` 的 `expense_fen`/`fees_fen` 已按**原支出所属财务月**冲减；`refund_received_fen` 为该期内**实际到账**退款，`bill_cash_flow_fen = income − gross_expense + refund_received`，退款不进 `income_fen`。账单 `items` 携带 `refund_applied_fen`（本笔支出冲减额）与退款 `original_expense_period`（未知为 `null`）；`source=current_effective_finance_facts_not_knowledge_replay`。`GET /finance/audit/bills/{id}` 的 `original_expense`/`effective_refunds_fen`/`remaining_expense_fen` 为当前账本口径。退款不自动改手工余额。
+- **当日投资收益率（ADR-018）**：`GET /finance/overview` 的 `investment_daily_return_pct` 与 `GET /portfolio/{account_id}/valuation` 的 `daily_return_pct` 为 **两位小数字符串**（如 `6.67`），单位百分数；分子为当日投资盈亏，分母为上一有效交易日收盘证券权益。分母缺失或 ≤0、非交易日、当日盈亏不可用时为 `null`，原因见 `investment_daily_return_reason` / `daily_return_reason`（`not_trading_session`、`prior_close_equity_unavailable`、`prior_close_equity_nonpositive`、`daily_pnl_unavailable`、`account_return_or_denominator_unavailable`）。客户端按字符串原样展示，不得再次四舍五入成别的位数，`null` 显示「不可计算」，不得显示 0。
+- **流动净资产（ADR-019）**：`GET /finance/overview` 与 `/finance/net-worth-trend` 返回 `liquid_assets_fen`、`liquid_net_worth_fen`、`liquidity_reasons`、`liquidity_basis`。流动资产为 `bank`/`cash`/`payment`/`securities`（证券按权益计一次）；受限资产不计入。存在 `other_asset`/`other_liability` 或余额/估值不可用时，`liquid_net_worth_fen=null` 且 `liquidity_reasons` 逐账户给出 `liquidity_classification_unknown:<account_id>` 或 `balance_or_valuation_unavailable`；前端必须显示「待确认」，不得用已知部分顶替。`amount_evidence` 中两字段 `source=known_liquidity_classification`。
+- **接近止损预警（ADR-020）**：`GET /api/v1/strategy/{account_id}/pool`（及工作台风险视图）中持仓条目新增 `near_stop` 数组，元素为 `{role,status,stop_price,quote_price,quote_at,quote_source,threshold_bps,display_only:true}`；`status` 取 `protection_reached`（报价已达保护价）或 `near_stop`（距保护价 ≤ 阈值）。默认阈值 200 bps，可由 `start.py server --near-stop-bps 0..1000` 调整。该字段是**只读风险展示**：不写入成交、不改变 `action`/`model_exit`/保护价/ATR/批次，NDX T5 走独立规则；报价未核实/过期、账本版本变化、未核实信号或策略偏离时不返回该项。

@@ -94,8 +94,8 @@
 | 09D-008 S2 | 基础退款 | PARTIAL |
 | 09D-009 S2 | 当日投资收益比例 | PARTIAL |
 | 09D-010 S2 | 批次核验/账户差额/权益校正入口 | PARTIAL |
-| 09D-011 S2 | 流动净资产口径 | PARTIAL，待产品确认 |
-| 09D-012 S2 | 接近止损预警 | PARTIAL，待产品确认 |
+| 09D-011 S2 | 流动净资产口径 | PARTIAL，口径已于 2026-11-25 产品批准（ADR-019），实现定向核对一致，见「10A」节 |
+| 09D-012 S2 | 接近止损预警 | PARTIAL，口径已于 2026-11-25 产品批准（ADR-020），实现定向核对一致，见「10A」节 |
 | 09D-013 S2 | 一键备份/端口/重启提示 | PARTIAL |
 | 09D-014 S2 | 期初数据分页 | PARTIAL |
 | 09D-015 S2 | 普通恢复跨文件中断故障注入 | NOT RUN |
@@ -117,10 +117,10 @@
 | 09D-006 | FIXED：版本绑定/冲突拒绝专项PASS，真实页面待验证 |
 | 09D-007 | PARTIAL：真实供应方名称入口、合成元数据PASS；实网、历史名称迁移未验收 |
 | 09D-008 | PARTIAL：关联原支出退款、跨期、幂等更正作废PASS；旧退款迁移及口径冲突待审查 |
-| 09D-009 | 候选实现，基础收益率专项PASS，待产品确认 |
+| 09D-009 | 候选实现，基础收益率专项PASS；口径已于 2026-11-25 批准（ADR-018），见「10A」节 |
 | 09D-010 | PARTIAL：现金差额入口与原审计，完整预览及旧批次核验工作流未完 |
-| 09D-011 | PARTIAL：已知分类与不重复计算PASS，未知流动性分类缺配置，待产品确认 |
-| 09D-012 | PARTIAL：展示阈值候选与距离测试PASS，实际主/子仓及过期行情完整测试待补 |
+| 09D-011 | PARTIAL：已知分类与不重复计算PASS；口径已于 2026-11-25 批准（ADR-019），未知流动性分类仍阻止完整指标并提示待确认 |
+| 09D-012 | PARTIAL：展示阈值候选与距离测试PASS；口径已于 2026-11-25 批准（ADR-020），09J 已补主/子仓及过期行情边界 |
 | 09D-013 | 备份API认证身份及去重PASS；页面和端口配置/重启说明实机NOT RUN |
 | 09D-014 | FIXED：202记录分页、账本变化拒绝专项PASS |
 | 09D-015 | 建议升级S1，FIXED：真实进程退出故障注入及回滚PASS，Windows待验收 |
@@ -136,7 +136,7 @@
 |---|---|---|
 | 09D-010 内部批次/权益核验入口 | 新增 `GET /api/v1/portfolio/{account_id}/reconciliation`，同一只读快照检查有效卖出分配数量、剩余批次/持仓投影、证券现金、行情、自然日收益/权益勾稽、待核对成交及未解决公司行为；投资页按当前估值版本显示检查结果和异常，不自动改账。新增4项 Python 测试及2项实际 Workspace setup 测试。 | 内部账本预览已实现，外部券商/旧库核对及完整旧批次证据仍 PARTIAL；待独立审查 |
 | 09D-018 前端构建 | 本轮 `npm ci --fetch-retries=0 --fetch-timeout=15000` 因 `registry.npmjs.org` DNS `EAI_AGAIN` 失败；正式 `vue-tsc`/Vite 未获依赖，不能以 Node 单元测试代替。 | BLOCKED，未生成 dist |
-| 09D-011/012 产品口径 | 流动净资产未知分类和接近止损阈值仍保留 09F 候选口径，不擅自升级为已批准规则。 | 待产品确认/专项验证 |
+| 09D-011/012 产品口径 | 流动净资产未知分类和接近止损阈值仍保留 09F 候选口径，不擅自升级为已批准规则。 | 历史状态；**2026-11-25 产品负责人已批准**（ADR-019/ADR-020），定向核对见「10A」节 |
 
 本轮开发者不关闭 09D-010 历史问题，不裁决 S 级别或发布批准；详细证据见 `09G_REPORT.md`。
 
@@ -148,7 +148,7 @@
 | 09H-001 / 09D-005 | 3项原缺陷复现 FAIL 后修复；会话过期释放 loading、次查询401禁写、重连新 generation 显式确认；迟到401、候选再变化及退出也有自动化覆盖。FIXED（逻辑层），浏览器及独立审查待验。 |
 | 09H-002 / 09D-017 | 09G 审计分支未并入交付 HEAD，恢复实际代码和测试（保留历史分支）。真实审计字段映射/原始JSON、中文原因；合成测试 PASS。退款及其他领域完整审计展示仍 PARTIAL。 |
 | 09D-016 | 财务总览逐金额权威值、来源、截止、账本/行情版本，余额基线及报价证据，未知不填零；合成 PASS。非逐项历史来源全覆盖。PARTIAL。 |
-| 09D-012 | 真实合成主/子仓、已触发/接近、旧版本、未核实及过期价验证 PASS；2%仅候选展示规则，产品确认和实际报价/页面待验。 |
+| 09D-012 | 真实合成主/子仓、已触发/接近、旧版本、未核实及过期价验证 PASS；2% 已于 2026-11-25 批准为风险预警阈值（ADR-020，不改变策略规则），实网/浏览器表现仍待验。 |
 | 09D-007/008/009/010/011/013 | 原功能与保护保留。真实样本、候选口径及实际界面/运维验证仍待完成；详见矩阵，未裁决关闭。 |
 | 09D-018 | 本轮 npm ci NOT RUN（09G DNS FAIL）；实际 typecheck/build 前置 FAIL：vue-tsc Permission denied，127；Vite/真实浏览器 NOT RUN。 |
 | 09D-019 | 未改变可信日历范围，真实官方资料仍 BLOCKED。 |
@@ -159,11 +159,11 @@
 
 | 编号 | 证据及剩余 |
 |---|---|
-| 09D-008/017 | 只读账单、退款、账户、余额及转账审计，原支出/有效退款/直接更正链接、账本版本及身份；合成与认证专项 PASS。旧库退款映射及候选口径仍待核对。 |
+| 09D-008/017 | 只读账单、退款、账户、余额及转账审计，原支出/有效退款/直接更正链接、账本版本及身份；合成与认证专项 PASS。旧库退款映射仍需真实库证据核对（口径本身已批准，见 ADR-017）。 |
 | 09D-016 | 财务月逐笔退款冲减/原支出期、历史估值金额证据、年度截止/版本显示；当前事实重算非知识回放。PARTIAL：实际界面及真实历史数据验收待完成。 |
 | 09I-001 | 新增财务历史查询代次及详情切换隔离，旧响应、断线、账本/身份变化保护自动化 PASS，待浏览器与审查。 |
 | 09D-013 | 端口输入与受控启动命令预览及重启提醒，Python/PowerShell参数校验；网页不保存服务配置、不执行重启，不冒充实机成功。Windows实测与远程 Host/转发配置待验。 |
-| 09D-009/011/012/008 | 09F 产品候选口径未擅自批准，未知流动性分类仍阻止完整指标，原策略计算不变。 |
+| 09D-009/011/012/008 | 09F 产品口径已于 2026-11-25 正式批准（ADR-017～ADR-020）；未知流动性分类仍阻止完整指标，原策略计算不变。 |
 | 09D-018 | typecheck/build 前置 FAIL：vue-tsc not found（127）；npm ci 本轮 NOT RUN，历史环境限制；Vite/浏览器/独立全量回归 NOT RUN。 |
 | 09D-019 | 已锁定日历指纹核验 PASS；可信覆盖未延长，真实2027官方资料仍待取得。 |
 
@@ -202,3 +202,23 @@
 | 观察-1 | 超量卖出且费用留空时，待核对原因为 `unknown_fees`（先于 `insufficient_lots` 判定）；记录为 pending，不生效、不扣批次 | 提示原因不够直观，但拒绝生效路径安全 | 仅记录，待产品/审查决定是否调整原因优先级；不改校验 |
 | 观察-2 | 沙盒模式点「一键备份」返回 403 后，页面进入「禁止写入」直至显式重新读取 | 安全侧 fail-closed；交互略重 | 仅记录；正式服务模式一键备份实测 PASS |
 | 环境 | npm 10.9.7（脚本 `Assert-Node` 锁定 10.9.2） | `windows.ps1 -Action Install/Build` 会拒绝 | 仅记录；本轮按任务书手工 `npm ci`/`build`，未改环境守卫、未降级断言 |
+
+## 10A 四项口径正式批准后的定向核对（开发者实测，非独立关闭裁决）
+
+批准文本见 `DECISIONS.md` ADR-017～ADR-020（2026-11-25 产品负责人）。本节记录逐条核对结论，不关闭任何人历史编号，也不构成发布授权。
+
+| 口径 | 核对位置 | 结论 | 备注 |
+|---|---|---|---|
+| 退款冲减原支出期、到账单独记录 | `backend/application/finance.py::_month`（`refund_against_original_fen`、`refund_received_fen`、`bill_cash_flow_fen`、`original_expense_period`）、`record_detail` | **一致，未改代码** | `test_refund_original_month_and_receipt_cashflow` 已覆盖跨期冲减、到账月现金流、累计上限、更正与作废 |
+| 当日收益率两位小数 | `backend/application/portfolio.py:1313`、`backend/application/finance.py:701` | **差异已修复**：`.6f` → `.2f` | 只改显示精度，不改分子分母、不改变不可计算判定与原因码；同步更新 `tests/unit/test_09f_features.py:44-45` |
+| 流动净资产口径 | `backend/application/finance.py::_overview`（`liquid_assets_fen`、`liquid_net_worth_fen`、`liquidity_reasons`、`liquidity_basis`、`amount_evidence`） | **一致，未改代码** | 已知限制见下条 10A-001 |
+| 接近止损 2% 风险预警 | `backend/application/strategy/service.py::_near_stop`、`stop_distance`、`backend/config.py::near_stop_bps=200`、`start.py --near-stop-bps` | **一致，未改代码** | `held` 仅取 `INDEX_STRATEGY_ATR` 批次，T5 走 `_ndx_advice` 独立轨；仅展示，不写成交、不改 `action`/保护价 |
+
+### 10A 新观察（仅记录，未改实现）
+
+| ID | 现象 | 影响 | 建议 |
+|---|---|---|---|
+| 10A-001 | accounts schema（`migrations/versions/0006_finance.py`）无「受限资产」标记字段，排除受限资产的唯一路径是账户 `kind` 落在 `other_asset`/`other_liability`，触发 `liquidity_classification_unknown:<id>` 并停止计算 `liquid_net_worth_fen` | 真实受限资金（如冻结、保证金）当前无法既「明确排除」又「保持其他流动资产可计算」，只能整体降级为待确认 | 仅在产品明确要求时新增受限资产标记迁移；本轮不动 schema |
+| 10A-002 | 前端 `WorkspacePage.vue:638`、`:665` 直接拼接 `investment_daily_return_pct`/`daily_return_pct` 字符串加 `%`；后端改为两位小数后展示为 `6.67%` | 展示层无需改动即符合口径 | 若后续需要千分位或正负号样式，另立任务 |
+| 10A-003 | `liquidity_basis` 文案仍为 `legacy_current_liabilities; unclassified other assets/liabilities withheld`（`finance.py:714`），未显式写「排除受限资产」 | 接口语义完整，措辞与批准文本不完全对齐 | 文案级差异，未改代码；如需与批准文本逐字一致可单独修 |
+

@@ -30,3 +30,12 @@
 - ADR-015 | 已采纳（05-finance 任务批准） | 04/04B 已实现行情与安全修复获准保留；先完成05财务，再安排正式 V9/G2 策略迁移补充任务。ISS-021 仍为 V1.0 发布必需功能，不降低策略、真实行情及其他核心发布验收标准。
 
 - ADR-016 | 已采纳（09B 任务明确授权） | 完整历史配置/研究回放、高级策略回测/优化、高级加密异地备份和非核心重构延期；V1.0 仍须单库安全、当前策略必需规则及证据闸门、可恢复备份、迁移、真实行情和可运行 Web。受限环境的实网/Windows/浏览器验收移交本地，未实测不得称通过。09B 不授权正式部署。
+
+## 四项业务口径正式批准（2026-11-25，产品负责人）
+
+- ADR-017 | 已采纳（2026-11-25 产品负责人批准，替代 09F 候选状态） | **退款统计**：冲减原支出所属财务月，实际到账时间单独记录（到账现金流按实际发生日计入，不并入收入）。影响 `FinanceService._month` 的 `refund_against_original_fen`/`refund_received_fen`/`bill_cash_flow_fen` 与账单审计 `original_expense_period`；手工余额不自动更新。回退：文档层删除本条并恢复 09F 候选标注，源码无需变更。
+- ADR-018 | 已采纳（同上） | **当日投资收益率**：当日投资盈亏 ÷ 上一有效交易日收盘证券权益，**显示两位小数**；分母缺失或非正数时不计算（返回 `null` 并给出原因码）。非 TWR/MWR。影响 `PortfolioService._valuation` 与 `FinanceService._overview` 的 `daily_return_pct`/`investment_daily_return_pct`；本次由 `.6f` 收敛为 `.2f`。回退：改回 `.6f` 并还原 `test_09f_features` 断言。
+- ADR-019 | 已采纳（同上） | **流动净资产**：流动资产 − 流动负债；纳入现金、银行卡、支付账户和可变现证券（证券按权益计入一次），排除受限资产；`other_asset`/`other_liability` 等未知分类时明确提示待确认并停止计算完整指标，不以已知部分冒充全额。影响 `_overview` 的 `liquid_assets_fen`/`liquid_net_worth_fen`/`liquidity_reasons` 与 `amount_evidence`。回退：同上，仅文档回退。
+- ADR-020 | 已采纳（同上） | **接近止损预警**：距有效保护价 2%（`near_stop_bps=200`）以内提示，仅用于风险预警，**不改变 V9/G2 原始策略规则**（不改 ATR、主/子仓、信号时点、质量闸门、保护动作）；NDX T5 继续使用独立规则。影响 `StrategyService._near_stop`、`stop_distance` 与 `start.py --near-stop-bps`。回退：调整 `--near-stop-bps` 或清空显示字段，策略计算不变。
+
+批准的是产品口径，不是部署授权：真实数据库操作、正式接管与发布仍须用户单独明确授权。

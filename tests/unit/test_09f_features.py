@@ -40,7 +40,9 @@ def test_ratio_and_version_guards(ledger):
     svc.submit(trade(a,i,'purchase',day=5,quantity=1000,price='10',fees_fen=0))
     quote(p,i,5,10);quote(p,i,6,12)
     v=p.valuation(a,at(6)); assert v['daily_pnl_fen']==200000 and v['previous_close_equity_fen']==3000000
-    assert v['daily_return_pct']=='6.666667'
+    # 产品口径（2026-11-25 批准）：当日投资收益率显示两位小数。
+    assert v['daily_return_pct']=='6.67'
+    assert p.valuation(a,at(6))['daily_return_pct']==format(Decimal(200000)*100/Decimal(3000000),'.2f')
     args={k:v[k] for k in ('ledger_revision','quote_revision','database_uuid','generation')}
     assert p.valuation(a,at(6),**args)==v
     quote(p,i,7,13)

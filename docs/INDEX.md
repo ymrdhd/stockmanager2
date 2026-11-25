@@ -44,3 +44,5 @@
 09J 最终交接请以 `09J_REPORT.md` 第7节及 `09J_HANDOFF.md` 末节为准，保留09J-final tag原身份，不以旧tag代替最终交付HEAD。
 
 10 本地验收：`10_LOCAL_ACCEPTANCE_REPORT.md`（实际环境、构建、回归、浏览器与 Windows 运维结果，PASS/FAIL/BLOCKED/NOT RUN 分列）、`10_HANDOFF.md`（剩余授权、阻断与下一步）。当前状态以 `STATUS.md` 为准。
+
+10A 口径批准与最终交付：`10A_FINAL_REVIEW.md`（四项口径定向核对结论、逐条证据、剩余阻断）、`10A_HANDOFF.md`（最终交付包构成、复原顺序、未授权事项）。四项口径的权威文本在 `DECISIONS.md` ADR-017～ADR-020，接口表现见 `INTERFACE_CONTRACT.md` 末节。当前状态以 `STATUS.md` 为准。
