@@ -589,6 +589,20 @@ class FinanceService:
                 valuation=portfolio._valuation(conn,account['id'],as_of,window,revision)
                 amount=valuation['equity_fen']
                 details={k:valuation[k] for k in ('cash_fen','cash_quality','market_value_fen','known_market_value_fen','equity_fen','daily_pnl_fen','daily_return_pct','daily_return_reason','previous_close_equity_fen','previous_close_as_of','cumulative_pnl_fen','reasons')}
+                # Explain the actual valuation inputs, never infer a quote from a market value.
+                details['balance_source']='sqlite_ledger_and_explicit_quotes'
+                details['balance_at']=cutoff
+                details['quote_evidence']=[
+                    {'instrument_id':p['instrument_id'],'code':p['code'],'market':p['market'],'quantity':p['quantity'],
+                     'market_value_fen':p['market_value_fen'],'quality':p['quality'],
+                     'quote_id':p['quote']['id'] if p['quote'] else None,
+                     'quote_source':p['quote']['source'] if p['quote'] else None,
+                     'quote_at':p['quote']['effective_at'] if p['quote'] else None,
+                     'quote_revision':p['quote']['quote_revision'] if p['quote'] else None,
+                     'quote_price_basis':p['quote']['price_basis'] if p['quote'] else None}
+                    for p in valuation['positions']]
+                baseline=rows(conn,"SELECT id,occurred_at,amount_fen FROM effective_cash_movements WHERE account_id=? AND kind='opening' AND occurred_at<=?",(account['id'],cutoff))
+                details['cash_baseline']=baseline[0] if len(baseline)==1 else None
             else:
                 balance=balance_at(conn,account['id'],cutoff)
                 amount=balance['after_fen'] if balance else None
@@ -598,7 +612,7 @@ class FinanceService:
                     WHERE t.status='effective' AND t.occurred_at<=? AND b.occurred_at>? LIMIT 1""",
                     (account['id'],account['id'],cutoff,cutoff)).fetchone()
                 if historical_gap: amount=None
-                details={'balance_id':balance['id'] if balance else None,'balance_at':balance['occurred_at'] if balance else None,
+                details={'balance_source':'manual_balance_snapshot','balance_id':balance['id'] if balance else None,'balance_at':balance['occurred_at'] if balance else None,
                          'last_snapshot_fen':balance['after_fen'] if balance else None,
                          'reasons':(['transfer_inclusion_snapshot_not_yet_effective'] if historical_gap else [] if balance else ['missing_balance'])}
             details['effective_date_quality']='valid' if account['effective_at'] is not None else 'unknown'
@@ -655,7 +669,7 @@ class FinanceService:
         liquid_asset_total=sum(r['balance_fen'] for r in liquid_assets) if all(r['balance_fen'] is not None for r in liquid_assets) and not any(r['kind']=='other_asset' for r in included) and assets_ok else None
         liquid_net=liquid_asset_total-liabilities if liquid_asset_total is not None and liabilities_ok and not liquidity_unknown else None
         liquidity_reasons=(['liquidity_classification_unknown:'+i for i in liquidity_unknown] + ([] if assets_ok and liabilities_ok else ['balance_or_valuation_unavailable']))
-        return {'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
+        result={'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
                 'securities_cash_fen':total('cash_fen') if all(r['cash_quality']=='valid' for r in securities) else None,
                 'securities_market_value_fen':total('market_value_fen'),'securities_equity_fen':total('equity_fen'),
                 'investment_daily_pnl_fen':numerator,'investment_daily_return_pct':return_pct,'investment_daily_return_reason':None if return_pct is not None else 'account_return_or_denominator_unavailable','investment_previous_close_equity_fen':denominator,
@@ -665,3 +679,31 @@ class FinanceService:
                 'total_assets_fen':assets if assets_ok else None,'total_liabilities_fen':liabilities if liabilities_ok else None,
                 'net_worth_fen':assets-liabilities if assets_ok and liabilities_ok else None,
                 'finance_month':self._month(conn,month_start(day_of(as_of)),cutoff)}
+        # Per-amount explanations reuse the authoritative calculated values, in the same read snapshot.
+        # Related reasons are context, not an assertion that each code directly caused the field to be null.
+        security_reasons=sorted(set(r['id']+':'+reason for r in securities for reason in r['reasons']))
+        definitions=[
+            ('net_worth_fen','净资产','included_account_projection','纳入统计的总资产 − 总负债',included,reasons),
+            ('total_assets_fen','总资产','included_account_projection','纳入统计的资产账户余额或证券权益之和',[r for r in included if r['asset_class']=='asset'],reasons),
+            ('total_liabilities_fen','总负债','included_account_projection','纳入统计的负债账户余额之和',[r for r in included if r['asset_class']=='liability'],reasons),
+            ('liquid_assets_fen','流动资产','known_liquidity_classification','按现有可核实分类汇总；未知分类不猜测',included,liquidity_reasons),
+            ('liquid_net_worth_fen','流动净资产','known_liquidity_classification','流动资产减流动负债；未分类不计算',included,liquidity_reasons),
+            ('securities_cash_fen','证券现金','effective_cash_ledger','有效证券现金期初及流水；不使用普通账单改余额',securities,security_reasons),
+            ('securities_market_value_fen','证券市值','sqlite_ledger_and_explicit_quotes','剩余批次数量乘有效证券报价；缺失报价不填零',securities,security_reasons),
+            ('securities_equity_fen','证券权益','sqlite_ledger_and_explicit_quotes','证券现金加证券市值，仅计入个人资产一次',securities,security_reasons),
+            ('investment_daily_pnl_fen','投资当日盈亏','sqlite_ledger_and_explicit_quotes','自然日持仓价值变化、实际交易及公司行为；资金划转不是收益',securities,security_reasons),
+        ]
+        result['amount_evidence']=[
+            {'field':field,'label':label,'amount_fen':result[field],
+             'quality':'valid' if result[field] is not None else 'unavailable',
+             'source':source,'basis':basis,'as_of':cutoff,'ledger_revision':ledger,'quote_revision':revision,
+             'account_ids':[r['id'] for r in scope],'related_reasons':sorted(set(context))}
+            for field,label,source,basis,scope,context in definitions]
+        result['amount_evidence'].append({
+            'field':'finance_month.bill_cash_flow_fen','label':'本财务月账单现金流',
+            'amount_fen':result['finance_month']['bill_cash_flow_fen'],'quality':'valid',
+            'source':'effective_finance_bill_ledger','basis':'本期收入减原始支出及费用加实际到账退款；与手工余额独立',
+            'as_of':cutoff,'ledger_revision':ledger,'quote_revision':revision,
+            'account_ids':sorted({r['account_id'] for r in result['finance_month']['items']}),'related_reasons':[],
+        })
+        return result

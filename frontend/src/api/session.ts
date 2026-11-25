@@ -1,8 +1,9 @@
 /** Single-user browser session: login, CSRF token and declared database identity. */
-import {api, setGuard, str, fact, type Fact} from './client.ts'
+import {api, ApiError, setGuard, str, fact, type Fact} from './client.ts'
 
 export type Session = {username: string; csrf: string; expires_at: string}
 const state: {session: Session | null; identity: [string, number] | null} = {session: null, identity: null}
+let epoch=0
 setGuard(() => ({...(state.session ? {csrf: state.session.csrf} : {}), ...(state.identity ? {identity: state.identity} : {})}))
 
 function session(value: Fact): Session {
@@ -18,15 +19,31 @@ export function declare(status: Fact): void {
   const value = fact(identity)
   state.identity = [str(value.database_uuid), Number(value.generation)]
 }
-export function forgetIdentity(): void { state.identity = null }
+export function forgetIdentity(): void { epoch++;state.identity = null }
+export function forgetSession(): void { forgetIdentity();state.session=null }
 export async function login(username: string, password: string): Promise<Session> {
-  state.session = session(await api('/auth/login', 'POST', {username, password}))
-  return state.session
+  const token=++epoch
+  const value=session(await api('/auth/login', 'POST', {username,password}))
+  if(token!==epoch)throw new Error('登录请求已失效，请重新登录')
+  state.session=value
+  return value
 }
 export async function stored(): Promise<Session | null> {
-  try { state.session = session(await api('/auth/session')); return state.session }
-  catch { state.session = null; return null }
+  const token=++epoch
+  try {
+    const value=session(await api('/auth/session'))
+    if(token!==epoch)return null
+    state.session=value
+    return value
+  }catch(e){
+    if(token!==epoch)return null
+    state.session=null
+    if(e instanceof ApiError&&e.status===401)return null
+    throw e
+  }
 }
 export async function logout(): Promise<void> {
-  try { await api('/auth/logout', 'POST', {}) } finally { state.session = null }
+  const pending=api('/auth/logout', 'POST', {})
+  forgetSession()
+  await pending
 }

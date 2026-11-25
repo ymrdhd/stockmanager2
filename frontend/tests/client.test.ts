@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {api, ApiError, setGuard, WriteAttempt, page, type Fact} from '../src/api/client.ts'
-import {fen,money,shanghaiTime,yuan} from '../src/ui.ts'
+import {auditDetails,display,fen,money,reasonText,shanghaiTime,yuan} from '../src/ui.ts'
 import {companyForm,dividendCorrectionForm,dividendForm,openingForm,quoteResolutionForm,reconciliationForm,tradeForm,transferForm,accountForm} from '../src/forms.ts'
 
 test('integer cents and unknown values are displayed without float accounting',()=>{
@@ -104,3 +104,20 @@ test('trade form keeps exact price and explicit specified batch, account creatio
   assert.equal(form.path,'/company-events')
   assert.deepEqual(form.build({account_id:'a',instrument_id:'i',kind:'split',ratio_from:'1',ratio_to:'2',cash_tail:'',occurred_at:'2026-01-06T09:00',note:'confirmed fixture'}),{account_id:'a',instrument_id:'i',kind:'split',ratio_from:1,ratio_to:2,cash_tail_fen:null,occurred_at:'2026-01-06T09:00:00+08:00',note:'confirmed fixture'})
  })
+
+
+test('data-quality reason codes are readable without hiding unknown codes',()=>{
+  assert.equal(reasonText('pending_trade'),'存在待核对成交')
+  assert.equal(reasonText('account-1:unverified_balance_or_equity'),'account-1：账户余额或证券权益尚未核实')
+  assert.equal(reasonText('liquidity_classification_unknown:account-2'),'账户 account-2：其他资产/负债的流动性分类未核实')
+  assert.equal(reasonText('510300:current_quote_stale'),'510300：当前报价已过期')
+  assert.equal(reasonText('future_reason_code'),'future_reason_code')
+  assert.equal(display(['pending_trade','equity_reconciliation_difference'],'reasons'),'存在待核对成交；证券权益与真实资金/持仓事实存在差额')
+})
+
+test('audit details are parsed into concise labelled Chinese fields',()=>{
+  assert.equal(auditDetails(JSON.stringify({reason:'strategy_deviation',strategy_deviation:true,correction_of:'trade-1',fees_fen:125})),
+    '原因：实际成交偏离策略规则；策略偏离：是；更正原记录：trade-1；费用：¥1.25')
+  assert.equal(auditDetails('not-json details'),'not-json details')
+  assert.equal(auditDetails(null),'无附加审计详情')
+})
