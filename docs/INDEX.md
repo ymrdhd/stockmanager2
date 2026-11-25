@@ -22,3 +22,5 @@
 首次只从 STATUS 对应迭代开始。文档权威：产品=PRODUCT_SPEC，数据=DATA_CONTRACTS，策略=STRATEGY_CONTRACT，页面/API=INTERFACE_CONTRACT，架构=ARCHITECTURE，运维安全=OPERATIONS_SECURITY，代码=CODE_STANDARDS，排程=DELIVERY_PLAN，验收=ACCEPTANCE_TESTS，工作流=AGENT_WORKFLOW。冲突按 AGENTS 处理。
 
 09B 交接：`09B_REPORT.md`（实际测试、限制）及 `09B_LOCAL_ACCEPTANCE.md`（Windows/生产构建、迁移审批、演示和双机验收），不得视为发布授权。
+
+09C 交接：`09C_REPORT.md`（实际测试、限制）、`09C_FUNCTION_MATRIX.md`（规格/服务/界面/测试对应及覆盖差距）、`09C_LOCAL_ACCEPTANCE.md`（未来经明确批准的本地构建、日历更新及验收任务）。非发布授权。

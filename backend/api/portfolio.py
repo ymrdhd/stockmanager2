@@ -78,3 +78,8 @@ def quotes(instrument_id: str,as_of: datetime,svc: Service,quote_revision: int|N
 @router.get('/portfolio/{account_id}')
 def valuation(account_id: str,as_of: datetime,svc: Service,previous_trading_day: date|None=None,quote_revision: int|None=None):
     return invoke(svc.valuation,account_id,as_of,previous_trading_day,quote_revision)
+
+
+@router.get('/portfolio/{account_id}/month')
+def monthly_pnl(account_id: str, month: date, svc: Service):
+    return invoke(svc.monthly_pnl,account_id,month)

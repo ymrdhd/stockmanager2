@@ -933,6 +933,36 @@ class PortfolioService:
                               latest_trading_day_quality=historical['daily_pnl_quality'])
             return result
 
+    def monthly_pnl(self, account: str, month: date) -> dict:
+        """One current-ledger/quote revision, daily rows only; not a historical knowledge replay."""
+        if month.day!=1 or not 1900<=month.year<=9997:
+            raise TradeError('month must be its first date')
+        now=self.clock(); self._cutoff(now)
+        end=(month.replace(day=28)+timedelta(days=4)).replace(day=1)
+        if month>day_of(now): raise TradeError('future month is not supported')
+        with self.db.read() as conn:
+            master=require_account(conn,account,securities=True)
+            revision=self._revision(conn,None)
+            ledger=one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision']
+            items=[]; day=month
+            while day<end and day<=day_of(now):
+                cutoff=min(now,datetime.combine(day,time.max,SHANGHAI))
+                row={'day':day.isoformat(),'as_of':utc(cutoff),'daily_pnl_fen':None,'equity_fen':None,'quality':'unavailable'}
+                try: window=market_window(cutoff)
+                except CalendarUnavailable:
+                    row['reason']='calendar_unavailable'
+                else:
+                    row['is_session']=window.is_session
+                    if master['effective_at'] is None or utc(cutoff)<master['effective_at']:
+                        row['reason']='account_effective_date_unavailable'
+                    else:
+                        value=self._valuation(conn,account,cutoff,window,revision)
+                        row.update(daily_pnl_fen=value['daily_pnl_fen'],equity_fen=value['equity_fen'],quality=value['daily_pnl_quality'],
+                                   reasons=value['reasons'],market_phase=window.phase)
+                items.append(row); day+=timedelta(days=1)
+            return {'account_id':account,'month':month.isoformat(),'as_of':utc(now),'ledger_revision':ledger,'quote_revision':revision,
+                    'source':'current_ledger_projection_not_knowledge_replay','items':items}
+
     def _valuation(self, conn: sqlite3.Connection, account: str, as_of: datetime,
                    window: MarketWindow | None, revision: int) -> dict:
         cutoff = utc(as_of)

@@ -89,6 +89,11 @@ def overview(svc: Service, as_of: datetime | None=None, quote_revision: int | No
     return invoke(svc.overview,as_of or datetime.now(UTC),quote_revision)
 
 
+@router.get('/finance/net-worth-trend')
+def net_worth_trend(svc: Service, months: int=12, as_of: datetime | None=None):
+    return invoke(svc.net_worth_trend,months,as_of or datetime.now(UTC))
+
+
 @router.get('/finance/month')
 def month(svc: Service, period: date | None=None, as_of: datetime | None=None):
     at=as_of or datetime.now(UTC)

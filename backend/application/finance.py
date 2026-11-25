@@ -1,6 +1,6 @@
 """Personal finance facts and snapshot-consistent net worth projections."""
 from collections.abc import Callable
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 import sqlite3
 from typing import Literal
 from pydantic import Field, field_validator, model_validator
@@ -519,72 +519,99 @@ class FinanceService:
         with self.db.read() as conn:
             ledger=one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision']
             revision=portfolio._revision(conn,quote_revision)
-            items=[]; assets=liabilities=0; assets_ok=liabilities_ok=True; reasons=[]
-            for account in rows(conn,'SELECT * FROM accounts WHERE effective_at IS NULL OR effective_at<=? ORDER BY id',(cutoff,)):
-                if account['kind']=='securities':
-                    valuation=portfolio._valuation(conn,account['id'],as_of,window,revision)
-                    amount=valuation['equity_fen']
-                    details={k:valuation[k] for k in ('cash_fen','cash_quality','market_value_fen','known_market_value_fen','equity_fen','daily_pnl_fen','cumulative_pnl_fen','reasons')}
-                else:
-                    balance=balance_at(conn,account['id'],cutoff)
-                    amount=balance['after_fen'] if balance else None
-                    historical_gap=conn.execute("""SELECT 1 FROM finance_transfers t JOIN balance_adjustments b ON
-                        (t.from_account_id=? AND t.from_included=1 AND t.from_balance_id=b.id) OR
-                        (t.to_account_id=? AND t.to_included=1 AND t.to_balance_id=b.id)
-                        WHERE t.status='effective' AND t.occurred_at<=? AND b.occurred_at>? LIMIT 1""",
-                        (account['id'],account['id'],cutoff,cutoff)).fetchone()
-                    if historical_gap: amount=None
-                    details={'balance_id':balance['id'] if balance else None,'balance_at':balance['occurred_at'] if balance else None,
-                             'last_snapshot_fen':balance['after_fen'] if balance else None,
-                             'reasons':(['transfer_inclusion_snapshot_not_yet_effective'] if historical_gap else [] if balance else ['missing_balance'])}
-                details['effective_date_quality']='valid' if account['effective_at'] is not None else 'unknown'
-                if account['effective_at'] is None:
-                    first=first_account_fact(conn,account['id'])
-                    details['effective_date_quality']='unknown'
-                    if first is None or first>cutoff:
-                        amount=None
-                        details['reasons']=[*details['reasons'],'account_existence_unverified']
-                if conn.execute('SELECT 1 FROM transfer_reconciliation_gaps WHERE account_id=? AND from_at<=? AND until_at>? LIMIT 1',(account['id'],cutoff,cutoff)).fetchone():
+            return self._overview(conn,portfolio,as_of,cutoff,window,ledger,revision)
+
+    def net_worth_trend(self, months: int, as_of: datetime) -> dict:
+        if months not in (1,3,6,12): raise TradeError('supported trend windows: 1,3,6,12 months')
+        portfolio=PortfolioService(self.db,self.clock)
+        cutoff=portfolio._cutoff(as_of)
+        today=day_of(as_of)
+        with self.db.read() as conn:
+            ledger=one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision']
+            revision=portfolio._revision(conn,None)
+            items=[]
+            for offset in range(months-1,-1,-1):
+                year,month0=divmod(today.year*12+today.month-1-offset,12)
+                first=date(year,month0+1,1)
+                if year<1900: raise TradeError('trend outside supported timestamp range')
+                last=(first.replace(day=28)+timedelta(days=4)).replace(day=1)-timedelta(days=1)
+                point=min(as_of,datetime.combine(last,time.max,SHANGHAI))
+                try: window=market_window(point)
+                except CalendarUnavailable: window=None
+                value=self._overview(conn,portfolio,point,utc(point),window,ledger,revision)
+                row={k:value[k] for k in ('as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','securities_equity_fen','quality','reasons')}
+                if not any(a['included'] for a in value['accounts']):
+                    row.update(total_assets_fen=None,total_liabilities_fen=None,net_worth_fen=None,securities_equity_fen=None,quality='unavailable',reasons=['no_included_account_evidence'])
+                items.append(row)
+            return {'as_of':cutoff,'ledger_revision':ledger,'quote_revision':revision,'source':'current_ledger_projection_not_knowledge_replay','items':items}
+
+    def _overview(self,conn,portfolio,as_of,cutoff,window,ledger,revision):
+        items=[]; assets=liabilities=0; assets_ok=liabilities_ok=True; reasons=[]
+        for account in rows(conn,'SELECT * FROM accounts WHERE effective_at IS NULL OR effective_at<=? ORDER BY id',(cutoff,)):
+            if account['kind']=='securities':
+                valuation=portfolio._valuation(conn,account['id'],as_of,window,revision)
+                amount=valuation['equity_fen']
+                details={k:valuation[k] for k in ('cash_fen','cash_quality','market_value_fen','known_market_value_fen','equity_fen','daily_pnl_fen','cumulative_pnl_fen','reasons')}
+            else:
+                balance=balance_at(conn,account['id'],cutoff)
+                amount=balance['after_fen'] if balance else None
+                historical_gap=conn.execute("""SELECT 1 FROM finance_transfers t JOIN balance_adjustments b ON
+                    (t.from_account_id=? AND t.from_included=1 AND t.from_balance_id=b.id) OR
+                    (t.to_account_id=? AND t.to_included=1 AND t.to_balance_id=b.id)
+                    WHERE t.status='effective' AND t.occurred_at<=? AND b.occurred_at>? LIMIT 1""",
+                    (account['id'],account['id'],cutoff,cutoff)).fetchone()
+                if historical_gap: amount=None
+                details={'balance_id':balance['id'] if balance else None,'balance_at':balance['occurred_at'] if balance else None,
+                         'last_snapshot_fen':balance['after_fen'] if balance else None,
+                         'reasons':(['transfer_inclusion_snapshot_not_yet_effective'] if historical_gap else [] if balance else ['missing_balance'])}
+            details['effective_date_quality']='valid' if account['effective_at'] is not None else 'unknown'
+            if account['effective_at'] is None:
+                first=first_account_fact(conn,account['id'])
+                details['effective_date_quality']='unknown'
+                if first is None or first>cutoff:
                     amount=None
-                    details['reasons']=[*details['reasons'],'transfer_reconciliation_historical_gap']
-                included_now=scope_at(conn,account,cutoff)
-                items.append({**account,**details,'included':included_now,'balance_fen':amount,'quality':'valid' if amount is not None else 'unavailable'})
-                if not included_now: continue
-                if account['asset_class']=='asset':
-                    if amount is None: assets_ok=False
-                    else: assets+=amount
-                else:
-                    if amount is None: liabilities_ok=False
-                    else: liabilities+=amount
-                if amount is None:
-                    reasons.extend(account['id']+':'+reason for reason in details['reasons'])
-                    reasons.append(account['id']+':unverified_balance_or_equity')
-            # Imported pre-0006 single-sided transfer references remain evidence,
-            # but cannot silently be presented as a reconciled personal total.
-            orphan=rows(conn,"""SELECT m.id,m.account_id FROM effective_cash_movements m JOIN accounts a ON a.id=m.account_id
-                WHERE m.transfer_id IS NOT NULL AND m.occurred_at<=?
-                AND NOT EXISTS (SELECT 1 FROM finance_transfers t WHERE t.id=m.transfer_id AND t.status='effective')""",(cutoff,))
-            included_ids={r['id'] for r in items if r['included']}
-            orphan=[r for r in orphan if r['account_id'] in included_ids]
-            if orphan:
-                assets_ok=False
-                reasons.extend(r['account_id']+':legacy_unpaired_transfer' for r in orphan)
-            included=[r for r in items if r['included']]
-            categories={}
-            for item in included:
-                group=categories.setdefault(item['kind'],{'asset_class':item['asset_class'],'known_fen':0,'quality':'valid'})
-                if item['balance_fen'] is None: group['quality']='unavailable'
-                else: group['known_fen']+=item['balance_fen']
-            for group in categories.values():
-                group['amount_fen']=group['known_fen'] if group['quality']=='valid' else None
-            securities=[r for r in included if r['kind']=='securities']
-            def total(field):
-                return sum(r[field] for r in securities) if all(r[field] is not None for r in securities) else None
-            return {'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
-                    'securities_cash_fen':total('cash_fen') if all(r['cash_quality']=='valid' for r in securities) else None,
-                    'securities_market_value_fen':total('market_value_fen'),'securities_equity_fen':total('equity_fen'),
-                    'investment_daily_pnl_fen':total('daily_pnl_fen'),
-                    'reasons':reasons,'accounts':items,'known_assets_fen':assets,'known_liabilities_fen':liabilities,
-                    'total_assets_fen':assets if assets_ok else None,'total_liabilities_fen':liabilities if liabilities_ok else None,
-                    'net_worth_fen':assets-liabilities if assets_ok and liabilities_ok else None,
-                    'finance_month':self._month(conn,month_start(day_of(as_of)),cutoff)}
+                    details['reasons']=[*details['reasons'],'account_existence_unverified']
+            if conn.execute('SELECT 1 FROM transfer_reconciliation_gaps WHERE account_id=? AND from_at<=? AND until_at>? LIMIT 1',(account['id'],cutoff,cutoff)).fetchone():
+                amount=None
+                details['reasons']=[*details['reasons'],'transfer_reconciliation_historical_gap']
+            included_now=scope_at(conn,account,cutoff)
+            items.append({**account,**details,'included':included_now,'balance_fen':amount,'quality':'valid' if amount is not None else 'unavailable'})
+            if not included_now: continue
+            if account['asset_class']=='asset':
+                if amount is None: assets_ok=False
+                else: assets+=amount
+            else:
+                if amount is None: liabilities_ok=False
+                else: liabilities+=amount
+            if amount is None:
+                reasons.extend(account['id']+':'+reason for reason in details['reasons'])
+                reasons.append(account['id']+':unverified_balance_or_equity')
+        # Imported pre-0006 single-sided transfer references remain evidence,
+        # but cannot silently be presented as a reconciled personal total.
+        orphan=rows(conn,"""SELECT m.id,m.account_id FROM effective_cash_movements m JOIN accounts a ON a.id=m.account_id
+            WHERE m.transfer_id IS NOT NULL AND m.occurred_at<=?
+            AND NOT EXISTS (SELECT 1 FROM finance_transfers t WHERE t.id=m.transfer_id AND t.status='effective')""",(cutoff,))
+        included_ids={r['id'] for r in items if r['included']}
+        orphan=[r for r in orphan if r['account_id'] in included_ids]
+        if orphan:
+            assets_ok=False
+            reasons.extend(r['account_id']+':legacy_unpaired_transfer' for r in orphan)
+        included=[r for r in items if r['included']]
+        categories={}
+        for item in included:
+            group=categories.setdefault(item['kind'],{'asset_class':item['asset_class'],'known_fen':0,'quality':'valid'})
+            if item['balance_fen'] is None: group['quality']='unavailable'
+            else: group['known_fen']+=item['balance_fen']
+        for group in categories.values():
+            group['amount_fen']=group['known_fen'] if group['quality']=='valid' else None
+        securities=[r for r in included if r['kind']=='securities']
+        def total(field):
+            return sum(r[field] for r in securities) if all(r[field] is not None for r in securities) else None
+        return {'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
+                'securities_cash_fen':total('cash_fen') if all(r['cash_quality']=='valid' for r in securities) else None,
+                'securities_market_value_fen':total('market_value_fen'),'securities_equity_fen':total('equity_fen'),
+                'investment_daily_pnl_fen':total('daily_pnl_fen'),
+                'reasons':reasons,'accounts':items,'known_assets_fen':assets,'known_liabilities_fen':liabilities,
+                'total_assets_fen':assets if assets_ok else None,'total_liabilities_fen':liabilities if liabilities_ok else None,
+                'net_worth_fen':assets-liabilities if assets_ok and liabilities_ok else None,
+                'finance_month':self._month(conn,month_start(day_of(as_of)),cutoff)}

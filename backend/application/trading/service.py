@@ -265,6 +265,8 @@ def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
     """
     if not value.get('signal_id') or value.get('side') != 'buy':
         return None
+    if value.get('strategy_id') == 'NDX_AUX_T5':
+        return verified_ndx_aux_signal(conn, value)
     signal = conn.execute("""SELECT s.signal_id,s.strategy_version,s.config_version,s.input_version
         FROM strategy_signals s JOIN instruments i ON i.code=s.instrument_code
         WHERE s.signal_id=? AND s.account_id=? AND i.id=?
@@ -286,6 +288,40 @@ def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
     if count != 1:
         return None
     return dict(zip(('signal_id','strategy_version','config_version','input_version'),signal))
+
+def verified_ndx_aux_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
+    """T5 evidence is distinct from ATR breakout/stop evidence. Broker facts survive
+    missing proof. Distinct broker fill IDs can identify partial fills of one advice.
+    """
+    if (value.get('strategy_id') != 'NDX_AUX_T5' or value.get('side') != 'buy'
+            or not value.get('signal_id') or value.get('strategy_deviation')
+            or value.get('frozen_atr') is not None):
+        return None
+    from backend.domain.strategy.calendars import market_clock
+    role = {'main': 'ndx_aux_initial', 'sub': 'ndx_aux_add'}.get(value.get('lot_role'))
+    signal = conn.execute("""SELECT s.signal_id,s.strategy_version,s.config_version,s.input_version,s.reason_codes,s.created_at
+        FROM strategy_signals s JOIN instruments i ON i.code=s.instrument_code
+        WHERE s.signal_id=? AND s.account_id=? AND i.id=? AND i.code='159941' AND i.kind='etf'
+        AND s.index_id='NDX' AND s.status='NDX_AUX_ADVICE' AND s.source_verified=1 AND s.is_proxy=0
+        AND s.price_basis='etf_unadjusted' AND s.price_unit='元' AND s.signal_date=?
+        AND s.created_at<=? AND s.config_version LIKE 'cfg:%'""",
+        (value['signal_id'],value['account_id'],value['instrument_id'],value.get('signal_date'),value['executed_at'])).fetchone()
+    if not role or not signal or json.loads(signal[4]) != [role]:
+        return None
+    if market_clock('CN').next_trading_day(value['signal_date']) != value['trading_day']:
+        return None
+    fills = rows(conn,"""SELECT payload,external_id FROM trade_executions WHERE account_id=?
+        AND side='buy' AND status='effective' AND json_extract(payload,'$.signal_id')=?""",
+        (value['account_id'],value['signal_id']))
+    if not fills or (len(fills)>1 and (any(not f['external_id'] for f in fills)
+                        or len({f['external_id'] for f in fills})!=len(fills))):
+        return None
+    for fill in fills:
+        fact=json.loads(fill['payload'])
+        if any(fact.get(k)!=value.get(k) for k in ('account_id','instrument_id','strategy_id','lot_role','signal_date','trading_day','frozen_atr')) or fact.get('strategy_deviation') or fact['executed_at']<signal[5]:
+            return None
+    return {**dict(zip(('signal_id','strategy_version','config_version','input_version'),signal[:4])), 'kind':'ndx_aux_advice_link'}
+
 
 
 def post_cash(conn: sqlite3.Connection, *, account: str, kind: str, amount: int,
@@ -624,17 +660,27 @@ class TradeService:
             remember(conn, data.request_id, payload, result)
             return result
 
-    def list_records(self, name: str, limit: int | None = None, offset: int = 0, expected_revision: int | None = None) -> dict:
+    def list_records(self, name: str, limit: int | None = None, offset: int = 0, expected_revision: int | None = None, account_id: str | None = None, instrument_id: str | None = None, from_at: datetime | None = None, to_at: datetime | None = None) -> dict:
         queries = {'accounts': 'SELECT * FROM accounts ORDER BY id', 'instruments': 'SELECT * FROM instruments ORDER BY market,code', 'trades': 'SELECT * FROM trade_executions ORDER BY executed_at,rowid', 'pending': "SELECT * FROM trade_executions WHERE status='pending' ORDER BY executed_at,rowid", 'lots': ('SELECT l.*, COALESCE(t.account_id,o.account_id) AS account_id, COALESCE(t.instrument_id,o.instrument_id) AS instrument_id FROM trade_lots l LEFT JOIN trade_executions t ON t.id=l.open_execution_id LEFT JOIN opening_positions o ON o.id=l.opening_id ORDER BY l.rowid'), 'allocations': 'SELECT a.*,t.status AS execution_status FROM lot_allocations a JOIN trade_executions t ON t.id=a.sell_execution_id ORDER BY a.rowid', 'cash': "SELECT * FROM cash_movements ORDER BY occurred_at,CASE kind WHEN 'opening' THEN 0 ELSE 1 END,rowid"}
         with self.db.read() as conn:
             revision = one(conn, 'SELECT ledger_revision,earliest_affected_day FROM ledger_state')
             if expected_revision is not None and revision['ledger_revision'] != expected_revision:
                 raise Conflict('ledger changed; restart paginated query')
             query = queries[name]
+            args = []
+            if any(v is not None for v in (account_id,instrument_id,from_at,to_at)):
+                if name!='trades': raise TradeError('filters supported only for trades')
+                if any(v is not None and (v.tzinfo is None or v.utcoffset() is None) for v in (from_at,to_at)):
+                    raise TradeError('history cutoff requires timezone')
+                if from_at and to_at and from_at>=to_at: raise TradeError('invalid history interval')
+                conditions=[]
+                for column,op,value in [('account_id','=',account_id),('instrument_id','=',instrument_id),('executed_at','>=',utc(from_at) if from_at else None),('executed_at','<',utc(to_at) if to_at else None)]:
+                    if value is not None: conditions.append(column+op+'?'); args.append(value)
+                query='SELECT * FROM trade_executions WHERE '+' AND '.join(conditions)+' ORDER BY executed_at,rowid'
             if limit is None:
-                records = rows(conn, query)
+                records = rows(conn, query, args)
             else:
-                records = rows(conn, query + ' LIMIT ? OFFSET ?', (limit, offset))
+                records = rows(conn, query + ' LIMIT ? OFFSET ?', (*args,limit,offset))
             for record in records:
                 if 'payload' in record:
                     v = json.loads(record.pop('payload'))
@@ -648,7 +694,7 @@ class TradeService:
             incomplete = rows(conn, "SELECT DISTINCT account_id,instrument_id FROM trade_executions WHERE status='pending' ORDER BY account_id,instrument_id")
             result = {'items': records, **revision, 'data_incomplete': bool(incomplete), 'incomplete_scopes': incomplete}
             if limit is not None:
-                result['total'] = conn.execute('SELECT count(*) FROM (' + query + ')').fetchone()[0]
+                result['total'] = conn.execute('SELECT count(*) FROM (' + query + ')',args).fetchone()[0]
                 result['limit'] = limit
                 result['offset'] = offset
             if name == 'cash':
@@ -660,6 +706,8 @@ class TradeService:
                 result['balances'] = balances
             return result
 
-    def get(self, id_: str) -> dict:
+    def get(self, id_: str, include_audit: bool=False) -> dict:
         with self.db.read() as conn:
-            return self._trade(conn, id_)
+            result=self._trade(conn, id_)
+            if include_audit: result['audit_events']=rows(conn,"SELECT id,event,request_id,at,actor,details FROM audit_events WHERE entity='trade' AND entity_id=? ORDER BY at,rowid",(id_,))
+            return result

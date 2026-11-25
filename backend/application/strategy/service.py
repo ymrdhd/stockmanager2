@@ -27,6 +27,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, time
+from hashlib import sha256
 import json
 import logging
 import math
@@ -41,7 +42,7 @@ from backend.application.strategy.series import (
     config_fingerprint, series_summary,
 )
 from backend.application.strategy.store import CapacityRefused, StrategyStore
-from backend.application.trading.service import SCALE, rows, utc, verified_trade_signal
+from backend.application.trading.service import SCALE, rows, utc, verified_trade_signal, require_account
 from backend.domain.strategy.calendars import CalendarCoverageError, market_clock
 from backend.domain.strategy.config import (
     INDEX_STRATEGY_VERSION, PORTFOLIO_MAX_POSITIONS, G2_ENABLED, get_config, NDX_AUX_INITIAL_RATIO, NDX_AUX_CASH_BUFFER,
@@ -187,6 +188,17 @@ class StrategyService:
                     item['input_version'] = signal['input_version']
                     item['tradable'] = item['price_basis'] == ETF_UNADJUSTED and bool(item['etf_code'])
                     item['capacity_kind'] = 'plan_capacity_checked_not_cash_escrow'
+        # T5 advice is not a reservation. When refreshing a whole pool, record
+        # it only after the core plans have actually claimed their capacity.
+        if persist:
+            ndx=next((item for item in items if item['index_id']=='NDX'),None)
+            if ndx and (ndx.get('ndx_aux') or {}).get('actionable'):
+                try:
+                    ndx_series=self.data.etf_series('NDX',completed_on=day,basis=ETF_UNADJUSTED,allow_network=False)
+                    ndx['ndx_aux']=self._ndx_advice(account_id,day,get_config('NDX'),ndx_series,[],persist=True,
+                        competing_entry=ndx['status'] in (STATUS_SIGNAL,'PLAN_PENDING','AWAITING_CONFIRMATION'))
+                except SeriesError:
+                    ndx['ndx_aux']={'status':'DATA_UNAVAILABLE','detail':'记录建议时 ETF 行情无法复核','tradable':False,'actionable':False}
         return {
             'as_of': day, **self._time_payload(day),
             'strategy_version': INDEX_STRATEGY_VERSION,
@@ -270,7 +282,8 @@ class StrategyService:
 
         # ---- 真实持仓：账本优先；缺策略证据就从真实批次重建 -------------------
         custody = self._custody(account_id, as_of)
-        held = [lot for lot in custody if self._lot_index(lot) == canonical]
+        all_held = [lot for lot in custody if self._lot_index(lot) == canonical]
+        held = [lot for lot in all_held if lot['strategy_id'] == 'INDEX_STRATEGY_ATR']
         position, evidence = self._position_for(account_id, canonical, cfg, held, clock,
                                                 as_of, warnings)
         if historical:
@@ -305,13 +318,13 @@ class StrategyService:
             if persist and safe:
                 self.store.clear_plan(account_id, canonical, reason='真实成交已使用该信号，旧计划不再可执行')
             plan_row = None
-        if safe and plan_row is not None and not held and not (position and position.is_open):
+        if safe and plan_row is not None and not all_held and not (position and position.is_open):
             fill = self._evaluate_pending_plan(account_id, canonical, cfg, series, plan_row,
                                                clock, warnings, persist)
 
         cooldown = ({'active': None, 'until': None, 'remaining': None, 'note': '历史真实退出证据不可核实'} if historical else self._cooldown_state(account_id, canonical, as_of, clock, regime.state))
-        has_open = bool(held)
-        live_qty = sum(int(lot['remaining'] or 0) for lot in held)
+        has_open = bool(all_held)
+        live_qty = sum(int(lot['remaining'] or 0) for lot in all_held)
         if live_qty > 0:
             has_open = True
 
@@ -423,13 +436,11 @@ class StrategyService:
                 prior_closes=list(series.closes[:-1]), holding_days=position.holding_days,
                 regime_state=regime.state, regime_label=regime.label,
             ).to_payload()
-            if cfg.is_us_track and not historical:
-                ndx_aux = self._ndx_advice(account_id, as_of, cfg, series, held)
-
-        # Initial NDX T5 advice is independent of the A-share core slots. It is
-        # not a reserved plan and never supplies an executable order.
-        if cfg.is_us_track and not held and safe and not historical:
-            ndx_aux = self._ndx_advice(account_id, as_of, cfg, series, held)
+        # T5 is a separate, non-reserved advisory track. It is never an ATR stop
+        # or a broker order; actual fills may link to its own evidence ID.
+        if cfg.is_us_track and safe and not historical and basis == ETF_UNADJUSTED:
+            ndx_aux = self._ndx_advice(account_id, as_of, cfg, series, held,
+                                      persist=persist and deferred_entries is None, competing_entry=status == STATUS_SIGNAL)
         if cfg.is_us_track and ndx_aux is None:
             ndx_aux = {'status':'DATA_UNAVAILABLE','detail':'历史或真实 NDX 策略证据不足，不提供执行建议','tradable':False,'capacity_kind':'advice_only_no_reservation'}
 
@@ -550,7 +561,10 @@ class StrategyService:
         created, pending = [], []
         for index_id, lots in self._group_by_index(custody).items():
             cfg = get_config(index_id)
-            state, reason = self._state_from_lots(index_id, cfg, lots)
+            atr_lots = [lot for lot in lots if lot['strategy_id'] == 'INDEX_STRATEGY_ATR']
+            if not atr_lots:
+                continue  # T5 derives directly from actual executions; no ATR state
+            state, reason = self._state_from_lots(index_id, cfg, atr_lots)
             if state is None or state.execution_source != SOURCE_LEDGER:
                 pending.append({'index_id': index_id, 'lots': [lot['lot_id'] for lot in lots],
                                 'reason': reason})
@@ -572,7 +586,7 @@ class StrategyService:
         custody = self._custody(account_id, as_of)
         from_lots = set()
         for lot in custody:
-            if str(lot['lot_role']) != 'main':
+            if str(lot['lot_role']) != 'main' or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
                 continue
             index_id = self._lot_index(lot)
             if index_id and get_config(index_id).counts_against_core_slots:
@@ -720,10 +734,14 @@ class StrategyService:
             raise CapacityRefused('signal already consumed')
         held = set()
         for lot in self.portfolio._lots(conn, account_id, cutoff):
-            if lot['quantity'] <= 0 or lot['lot_role'] != 'main' or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
+            if lot['quantity'] <= 0:
                 continue
             code = conn.execute('SELECT code FROM instruments WHERE id=?', (lot['instrument_id'],)).fetchone()[0]
             idx = self._lot_index({'code':code})
+            if index_id == 'NDX' and idx == 'NDX':
+                raise CapacityRefused('actual NDX holding already exists')
+            if lot['lot_role'] != 'main' or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
+                continue
             if idx is None:
                 raise CapacityRefused('unmapped actual strategy holding')
             held.add(idx)
@@ -740,45 +758,118 @@ class StrategyService:
         if slots > PORTFOLIO_MAX_POSITIONS or budget + buffer > cash:
             raise CapacityRefused('account cash or core slots exhausted by active plans')
 
-    def _ndx_advice(self, account_id, as_of, cfg, series, held):
+    def _ndx_advice(self, account_id, as_of, cfg, series, held, *, persist=False, competing_entry=False):
+        """T5 reference amounts from a single ledger snapshot, no cash reservation.
+
+        Explicit T5-linked actuals reconstruct the active cycle on every request,
+        including fully sold sub-lots. Never turn an ATR signal into T5 proof.
+        """
         unavailable = {'status':'DATA_UNAVAILABLE','detail':'NDX 实际持仓/现金/行情证据不足',
                        'current_ratio':None,'target_ratio':None,'target_amount':None,
-                       'tradable':False,'capacity_kind':'advice_only_no_reservation'}
+                       'tradable':False,'actionable':False,'capacity_kind':'advice_only_no_reservation'}
         try:
-            value = self.portfolio.valuation(account_id,self._decision_time(as_of))
-            equity,cash = value['equity_fen'],value['cash_fen']
-            if equity is None or equity<=0 or cash is None or value['cash_quality']!='valid':
+            if self._historical(as_of) or not self._fresh(series, as_of) or series.is_proxy or series.market != 'CN':
                 return unavailable
-            positions = [p for p in value['positions'] if p['code']==cfg.etf_code]
-            if len(positions)>1 or any(p['market_value_fen'] is None for p in positions):
+            if not validate_series(series, breakout_window=cfg.breakout_window, as_of=as_of)['ok']:
                 return unavailable
-            qty = sum(p['quantity'] for p in positions)
-            if qty != sum(l['remaining'] for l in held) or any(not l['signal_verified'] or l['scale_invalid'] for l in held):
-                return unavailable  # ordinary/mixed holdings and ambiguous scale
-            mv = sum(p['market_value_fen'] for p in positions)
-            us = market_clock('US')
-            completed = us.last_completed_session(now=self._decision_time(as_of))
-            if not completed:
+            cn = market_clock('CN'); us = market_clock('US')
+            at = self._decision_time(as_of); cutoff = utc(at)
+            completed = us.last_completed_session(now=at)
+            next_session = cn.next_trading_day(series.last_date)
+            if not completed or not next_session or at.astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() > next_session:
                 return unavailable
-            # The original T5 function uses the configured series, but measures
-            # add intervals in completed US sessions, not future or calendar days.
-            sub = [l for l in held if l['lot_role']=='sub']
-            last = max((datetime.fromisoformat(l['opened_at']).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() for l in sub),default=None)
-            elapsed = None
-            if last and us.covered(last) and last<=completed:
-                elapsed = sum(d<=completed for d in us.trading_days_after(last,10))
-            plan = asdict(evaluate_ndx_aux(series.closes,equity=equity/100,current_ratio=mv/equity,
-                                    days_since_add=elapsed,last_date=completed))
-            plan.update({'tradable':False,'capacity_kind':'advice_only_no_reservation','actual_cash_fen':cash,'actual_market_value_fen':mv})
-            if plan['status']=='ALLOW' and plan.get('target_amount') is not None:
-                with self.db.read() as conn:
-                    active = {r[0] for r in conn.execute("SELECT index_id FROM strategy_plans WHERE account_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')",(account_id,))}
-                claims = sum(math.ceil(entry_amount(equity,get_config(idx))) for idx in active)
-                need = max(0,math.ceil(plan['target_amount']*100)-mv)
-                if need+claims+math.ceil(NDX_AUX_CASH_BUFFER*100)>cash:
-                    plan.update({'status':'CASH_BLOCKED','detail':'实际现金扣除已有容量计划后不足以保留 25 万元缓冲'})
-            return plan
-        except (ValueError,KeyError,TypeError,CalendarCoverageError,CalendarUnavailable):
+            # The original evaluator uses the selected unadjusted ETF series,
+            # while elapsed add days are completed US exchange sessions.
+            if len(series.bars) < 201 or any(cn.next_trading_day(a.date)!=b.date for a,b in zip(series.bars[-201:-1],series.bars[-200:])):
+                return unavailable
+            context = self.db.transaction() if persist else self.db.read()
+            with context as conn:
+                require_account(conn, account_id, securities=True, at=cutoff)
+                value = self.portfolio._valuation(conn,account_id,at,market_window(at),self.portfolio._revision(conn,None))
+                equity,cash = value['equity_fen'],value['cash_fen']
+                if equity is None or equity<=0 or cash is None or value['cash_quality']!='valid':
+                    return unavailable
+                positions = [p for p in value['positions'] if p['code']==cfg.etf_code]
+                if len(positions)>1 or any(p['market_value_fen'] is None for p in positions):
+                    return unavailable
+                qty = sum(p['quantity'] for p in positions)
+                mv = sum(p['market_value_fen'] for p in positions)
+                lots = [l for p in positions for l in p['lots']]
+                if any(l['strategy_id']!='NDX_AUX_T5' for l in lots):
+                    return {**unavailable,'detail':'已有普通或 ATR NDX 仓位；不得自动归为 T5 辅助仓'}
+                # Corporate actions may invalidate strategy quantities or scales.
+                if qty and conn.execute("""SELECT 1 FROM company_events e JOIN instruments i ON i.id=e.instrument_id
+                        WHERE e.account_id=? AND i.code=? AND e.voided_at IS NULL AND e.strategy_evidence_invalid=1
+                        AND e.occurred_at BETWEEN ? AND ?""",(account_id,cfg.etf_code,min(l['opened_at'] for l in lots),cutoff)).fetchone():
+                    return unavailable
+                facts = rows(conn,"""SELECT t.*, CASE WHEN t.side='buy' THEN t.quantity ELSE COALESCE((SELECT SUM(a.quantity)
+                    FROM lot_allocations a JOIN trade_lots l ON l.id=a.lot_id WHERE a.sell_execution_id=t.id
+                    AND l.strategy_id='NDX_AUX_T5' AND l.status!='reversed'),0) END AS t5_qty
+                    FROM trade_executions t JOIN instruments i ON i.id=t.instrument_id
+                    WHERE t.account_id=? AND i.code=? AND t.status='effective'
+                    AND (t.side='sell' OR t.strategy_id='NDX_AUX_T5')
+                    AND t.executed_at<=? ORDER BY t.executed_at,t.rowid""",(account_id,cfg.etf_code,cutoff))
+                cycle=[]; running=0
+                for fact in facts:
+                    if fact['side']=='buy':
+                        running+=fact['quantity']; cycle.append(fact)
+                    else:
+                        running-=fact['t5_qty']
+                    if running<0: return unavailable
+                    if running==0: cycle=[]
+                if running!=qty or (qty and (not cycle or cycle[0]['lot_role']!='main' or any(not verified_trade_signal(conn,json.loads(f['payload'])) for f in cycle))):
+                    return unavailable
+                # Distinct refreshed advice IDs for the same action/day cannot
+                # establish which target the actual fills were following.
+                linked={}
+                for fact in cycle:
+                    payload=json.loads(fact['payload'])
+                    key=(payload.get('signal_date'),fact['lot_role'])
+                    linked.setdefault(key,set()).add(payload.get('signal_id'))
+                if any(len(ids)>1 for ids in linked.values()):
+                    return {**unavailable,'detail':'同日同角色关联多个建议版本，实际成交保留，策略证据待核对'}
+                # Initial actual fill anchors the first interval; later actual
+                # adds (even if trimmed away) reset it. No guessed KV timestamp.
+                last=max((f['trading_day'] for f in cycle),default=None)
+                elapsed=None
+                if last and us.covered(last) and last<=completed:
+                    elapsed=sum(d<=completed for d in us.trading_days_after(last,10))
+                elif last and us.covered(last) and last>completed:
+                    elapsed=0
+                plan=asdict(evaluate_ndx_aux(series.closes,equity=equity/100,current_ratio=mv/equity,
+                            days_since_add=elapsed,last_date=series.last_date))
+                plan['detail']=plan['detail'].replace('下一美股合法开盘','下一合法 ETF 交易日').replace('下一美股开盘','下一合法 ETF 交易日')
+                plan.update({'tradable':False,'capacity_kind':'advice_only_no_reservation',
+                    'actual_cash_fen':cash,'actual_market_value_fen':mv,'actual_quantity':qty,
+                    'last_actual_buy_day':last,'us_completed_session':completed,'next_etf_session':next_session,
+                    'verified_advice':True,'actionable':False,'signal_id':None,'strategy_id':'NDX_AUX_T5'})
+                if plan['status']=='EXIT' and not qty:
+                    plan.update(status='NO_POSITION',detail='无真实 T5 持仓，无需退出')
+                if plan['status']=='ALLOW' and plan.get('target_amount') is not None:
+                    active={r[0] for r in conn.execute("SELECT index_id FROM strategy_plans WHERE account_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')",(account_id,))}
+                    if 'NDX' in active or competing_entry:
+                        plan.update(status='CAPACITY_BLOCKED',detail='NDX 已有或同时出现 ATR 计划；不得重复配置同一标的')
+                        return plan
+                    claims=sum(math.ceil(entry_amount(equity,get_config(idx))) for idx in active)
+                    need=max(0,math.ceil(plan['target_amount']*100)-mv)
+                    if need+claims+math.ceil(NDX_AUX_CASH_BUFFER*100)>cash:
+                        plan.update(status='CASH_BLOCKED',detail='实际现金扣除已有容量计划后不足以保留 25 万元缓冲')
+                        return plan
+                    plan['actionable']=True
+                    if persist:
+                        role='ndx_aux_add' if qty else 'ndx_aux_initial'
+                        version=self.data.input_version('NDX',completed_on=as_of,basis=ETF_UNADJUSTED)
+                        fingerprint=sha256(json.dumps([version,role,value['ledger_revision'],value['quote_revision'],plan['target_amount']],separators=(',',':')).encode()).hexdigest()
+                        signal=self.store.save_signal(account_id=account_id,index_id='NDX',instrument_code=cfg.etf_code,
+                            signal_date=series.last_date,input_version='t5:'+fingerprint,strategy_version=INDEX_STRATEGY_VERSION,
+                            config_version=config_fingerprint('NDX'),status='NDX_AUX_ADVICE',reason_codes=[role],detail=plan['detail'],
+                            price_basis=ETF_UNADJUSTED,price_unit='元',signal_close=plan['close'],data_source=series.source,
+                            is_proxy=False,source_verified=True,connection=conn)
+                        plan.update(signal_id=signal['signal_id'],signal_date=series.last_date,lot_role='sub' if qty else 'main')
+                elif plan['status'] in ('TRIM','EXIT') and qty:
+                    plan['actionable']=True
+                return plan
+        except (ValueError,KeyError,TypeError,CalendarCoverageError,CalendarUnavailable,SeriesError):
             return unavailable
 
     def _custody(self, account_id: str, as_of: str) -> list[dict]:
@@ -794,7 +885,7 @@ class StrategyService:
         result = []
         with self.db.read() as conn:
             for lot in self.portfolio._lots(conn, account_id, cutoff):
-                if lot['lot_role'] not in ('main','sub') or lot['quantity'] <= 0 or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
+                if lot['lot_role'] not in ('main','sub') or lot['quantity'] <= 0 or lot['strategy_id'] not in ('INDEX_STRATEGY_ATR','NDX_AUX_T5'):
                     continue
                 instrument = rows(conn, 'SELECT code,market,kind FROM instruments WHERE id=?', (lot['instrument_id'],))[0]
                 trade = rows(conn, 'SELECT * FROM trade_executions WHERE id=?', (lot['open_execution_id'],)) if lot['open_execution_id'] else []

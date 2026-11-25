@@ -52,7 +52,11 @@ def _load_calendar(name: str):
     try:
         import exchange_calendars as xcals
 
-        calendar = xcals.get_calendar(name)
+        if name == 'XSHG':
+            from .calendar_release import reviewed_xshg
+            calendar = reviewed_xshg()
+        else:
+            calendar = xcals.get_calendar(name)
     except Exception:
         calendar = None
     _CALENDAR_CACHE[name] = calendar
@@ -118,13 +122,13 @@ class MarketClock:
         labels = _session_labels(calendar)
         if not labels:
             return False
-        return labels[0] <= text <= labels[-1]
+        return labels[0] <= text <= (str(calendar.bound_max().date()) if self.calendar_name == 'XSHG' else labels[-1])
 
     def is_trading_day(self, value: str) -> bool:
         text = str(value)[:10]
         calendar = self._calendar()
         labels = _session_labels(calendar)
-        if not labels or not (labels[0] <= text <= labels[-1]):
+        if not labels or not self.covered(text):
             raise CalendarCoverageError(
                 "交易日历未覆盖该日期",
                 detail=f"calendar_out_of_coverage:{self.calendar_name}:{text}")

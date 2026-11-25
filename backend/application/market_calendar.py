@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from functools import lru_cache
 from zoneinfo import ZoneInfo
+from backend.domain.strategy.calendar_release import reviewed_xshg
 
 
 SHANGHAI = ZoneInfo('Asia/Shanghai')
@@ -17,11 +18,8 @@ def calendar():
     # XSHG is a precomputed mainland holiday calendar. Use its actual published
     # bounds, not exchange_calendars' rolling default start/end dates.
     try:
-        import exchange_calendars as xc
-        from exchange_calendars.exchange_calendar_xshg import XSHGExchangeCalendar
-        return xc.get_calendar('XSHG', start=XSHGExchangeCalendar.bound_min(),
-                               end=XSHGExchangeCalendar.bound_max())
-    except (ImportError, ValueError) as exc:
+        return reviewed_xshg()
+    except (ImportError, ValueError, OSError, KeyError, TypeError) as exc:
         raise CalendarUnavailable('verified exchange calendar unavailable') from exc
 
 

@@ -88,8 +88,8 @@ def trade(data: TradeInput, svc: Service):
 
 
 @router.get('/trades/{id}')
-def get_trade(id: str, svc: Service):
-    return invoke(svc.get, id)
+def get_trade(id: str, svc: Service, include_audit: bool=False):
+    return invoke(svc.get, id, include_audit)
 
 
 @router.post('/trades/{id}/corrections')
@@ -114,8 +114,10 @@ def cash(data: CashInput, svc: Service):
 def reader(name: str):
     def endpoint(svc: Service, limit: Annotated[int, Query(ge=1, le=500)] = 100,
                  offset: Annotated[int, Query(ge=0, le=10**9)] = 0,
-                 ledger_revision: Annotated[int | None, Query(ge=0)] = None):
-        result = invoke(svc.list_records, name, limit, offset, ledger_revision)
+                 ledger_revision: Annotated[int | None, Query(ge=0)] = None,
+                 account_id: str | None=None, instrument_id: str | None=None,
+                 from_at: datetime | None=None, to_at: datetime | None=None):
+        result = invoke(svc.list_records, name, limit, offset, ledger_revision, account_id, instrument_id, from_at, to_at)
         result['source'] = 'sqlite_ledger'
         result['quality'] = 'derived_unverified' if result['data_incomplete'] else 'valid'
         result['as_of'] = datetime.now(UTC).isoformat()

@@ -1,0 +1,9 @@
+{
+  "calendar": "XSHG",
+  "package_version": "4.13.1",
+  "start": "1990-12-03",
+  "end": "2026-12-31",
+  "schedule_sha256": "3a0560be39018463c229c0b7d4a5414d58ed2995825007cc110968f8975c5c2f",
+  "source": "existing locked exchange_calendars XSHG precomputed calendar; 09B trusted range retained",
+  "official_sources": []
+}

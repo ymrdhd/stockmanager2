@@ -10,6 +10,7 @@ from typing import Protocol
 from backend.application.market_calendar import (
     CalendarUnavailable, SHANGHAI, calendar_coverage, market_window, session_bounds,
 )
+from backend.domain.strategy.calendar_release import load_release
 from backend.application.portfolio import PortfolioService, QuoteInput
 from backend.application.trading.service import TradeError, dump, one, rows, utc
 from backend.infrastructure.database import Database, DatabaseError
@@ -63,9 +64,13 @@ class MarketService:
         provider, provider_available = self._provider_state()
         with self._state_lock:
             last_result = self._last_result
+        try:
+            calendar_release = load_release()
+        except (OSError, ValueError):
+            calendar_release = None
         return {'as_of':cutoff, 'quote_revision':revision, 'market_phase':window.phase if window else 'unknown',
                 'latest_completed_trading_day':window.latest_completed.isoformat() if window else None,
-                'calendar_coverage':calendar_coverage(now),'last_refresh':last_result,
+                'calendar_coverage':calendar_coverage(now),'calendar_release':calendar_release,'last_refresh':last_result,
                 'provider':provider,'provider_available':provider_available,'items':items}
 
     def _provider_state(self) -> tuple[str, bool]:
