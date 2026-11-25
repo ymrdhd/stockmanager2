@@ -84,6 +84,10 @@ export type Operation = {
 }
 type Storage = {getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void}
 const PENDING_KEY = 'sm2.pending-write'
+// A single origin-wide write slot. A completed/abandoned slot leaves a durable
+// fence, not a payload fingerprint. Old forms cannot reopen it even after reload.
+const INTENT_KEY = 'sm2.write-intent-fence'
+export type WriteIntent = string | null
 const STORAGE_EVENT = 'sm2.pending-write-changed'
 const STORAGE_MESSAGE = '浏览器存储不可用或已满，无法可靠记录待核实请求；请改用可持久化的浏览器配置后人工核对账本'
 /** Refusing is the only safe answer when two tabs cannot be serialised for real. */
@@ -309,7 +313,12 @@ export class WriteAttempt {
       this.state(current.pending, false)
       return false
     }
-    try { this.target.removeItem(PENDING_KEY) } catch {
+    try {
+      // Publish the terminal fence BEFORE removing the pending record. If either
+      // storage operation fails, the original request remains recoverable.
+      this.target.setItem(INTENT_KEY, expectedRequestId)
+      this.target.removeItem(PENDING_KEY)
+    } catch {
       this.state(current.pending, false)
       this.storageError = STORAGE_MESSAGE
       throw new ApiError(this.storageError, false, undefined, 'storage_unavailable')
@@ -324,9 +333,18 @@ export class WriteAttempt {
    * Persist the new request and send it, deciding *inside* the lock: a record
    * written by another tab between this object's last read and now still wins.
    */
-  async start(path: string, body: Fact, method = 'POST'): Promise<Fact> {
-    const op: Operation = {path, method, body: structuredClone({...body, request_id: this.newId()}),
-      identity: identityOf(guard().identity), createdAt: new Date().toISOString()}
+  /** Capture at explicit form opening, not after async confirmation or lock acquisition.
+   * Two forms opened in the same slot share the intent fence. Starting a new
+   * form after completion explicitly authorizes a new slot, even for identical facts.
+   */
+  beginIntent(): WriteIntent {
+    try { return this.target.getItem(INTENT_KEY) } catch {
+      throw new ApiError(STORAGE_MESSAGE, false, undefined, 'storage_unavailable')
+    }
+  }
+  async start(path: string, body: Fact, method = 'POST', intent: WriteIntent = this.beginIntent()): Promise<Fact> {
+    const payload = structuredClone(body)
+    const identity = identityOf(guard().identity)
     return this.locked(async () => {
       const current = this.read()
       this.quiet(current)
@@ -336,7 +354,10 @@ export class WriteAttempt {
       if (current.pending) {
         throw new ApiError('上一笔写入尚未核实，请先重试', false, undefined, 'pending_exists')
       }
-      if (!sameIdentity(op.identity, identityOf(guard().identity))) throw new ApiError('数据库身份已变化，未发送新请求',false,undefined,'identity_changed')
+      if (intent !== this.beginIntent()) throw new ApiError('此写入意图已由其他标签页处理或失效；请核对账本，若确有另一笔真实交易，请重新打开表单',false,undefined,'intent_stale')
+      if (!sameIdentity(identity, identityOf(guard().identity))) throw new ApiError('数据库身份已变化，未发送新请求',false,undefined,'identity_changed')
+      const op: Operation = {path, method, body: {...payload, request_id: this.newId()},
+        identity, createdAt: new Date().toISOString()}
       this.save(op)
       return this.attempt(true)
     })
@@ -345,8 +366,7 @@ export class WriteAttempt {
    * Ask the server whether the unconfirmed request already reached the ledger.
    * Only an answer carrying the *same* database UUID and generation is accepted.
    */
-  async check(): Promise<Fact> {
-    const expected=this.requestId
+  async check(expected = this.requestId): Promise<Fact> {
     return this.locked(async () => {
       const current = this.read()
       this.quiet(current)
@@ -381,8 +401,7 @@ export class WriteAttempt {
    * failure or a later retry rejection never proves the original write did not
    * commit, so the operator can still reconcile it by request ID.
    */
-  async retry(): Promise<Fact> {
-    const expected=this.requestId
+  async retry(expected = this.requestId): Promise<Fact> {
     return this.locked(async () => {
       this.quiet(this.read())
       if (!expected||this.requestId!==expected) throw new Error('待重试请求已变化，请重新核对')
@@ -416,9 +435,8 @@ export class WriteAttempt {
    * needs a manual check. The durable delete is confirmed inside the lock against
    * the original request ID, and the local state only follows that verdict.
    */
-  discard(): Promise<boolean> {
+  discard(expected = this.requestId): Promise<boolean> {
     this.requireMutex()
-    const expected = this.requestId
     return this.locked(async () => {
       const current = this.read()
       if (current.pending && !sameIdentity(current.pending.identity, identityOf(guard().identity)))
@@ -432,7 +450,10 @@ export class WriteAttempt {
     return this.locked(async () => {
       const current = this.read()
       if (!current.corrupt) { this.state(current.pending, false); return false }
-      try { this.target.removeItem(PENDING_KEY) } catch {
+      try {
+        this.target.setItem(INTENT_KEY, this.newId())
+        this.target.removeItem(PENDING_KEY)
+      } catch {
         this.state(null, true)
         this.storageError = STORAGE_MESSAGE
         throw new ApiError(this.storageError, false, undefined, 'storage_unavailable')

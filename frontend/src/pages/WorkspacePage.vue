@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {computed, onMounted, onBeforeUnmount, ref, watch} from 'vue'
-import {api, ApiError, fact, facts, page, str, WriteAttempt, type Fact} from '../api/client'
+import {api, ApiError, fact, facts, page, str, WriteAttempt, type Fact, type WriteIntent} from '../api/client'
+import {AccountScope} from '../api/accountScope'
 import {getHealth, type HealthState} from '../api/health'
 import * as session from '../api/session'
 import {display, localTime, money, shanghaiTime, type FormSpec} from '../ui'
@@ -16,6 +17,9 @@ const accounts=ref<Fact[]>([]), instruments=ref<Fact[]>([]), categories=ref<Fact
 const valuation=ref<Fact|null>(null), strategy=ref<Fact|null>(null), month=ref<Fact|null>(null), historical=ref<Fact|null>(null)
 const pool=ref<Fact|null>(null), positionsView=ref<Fact|null>(null), strategyError=ref(''), strategyLoading=ref(false)
 const signalWriting=ref(false), signalFeedback=ref('')
+const accountScope=new AccountScope(), tradeScope=new AccountScope()
+const investmentLoading=ref(false), investmentError=ref(''), tradeEpoch=ref(0)
+let pnlSequence=0, tradeSequence=0
 const selectedAccount=ref(''), asOf=ref(''), period=ref(''), historyTime=ref(''),holdingSearch=ref('')
 const netMonths=ref(12),netTrend=ref<Fact|null>(null),netTrendError=ref('')
 async function loadNetTrend(){
@@ -40,18 +44,18 @@ function filterBills(){
 }
 const todo=ref<Fact|null>(null),todoError=ref('')
 async function refreshWorkstation(){
-  todo.value=null;todoError.value='';const token=sequence
+  todo.value=null;todoError.value='';const token=sequence,ticket=accountScope.capture()
   try{const result=await api('/pending?limit=1');if(active&&token===sequence)todo.value=result}catch(e){if(active&&token===sequence)todoError.value=String(e)}
-  if(active&&token===sequence&&selectedAccount.value){strategyMode.value='current';resetStrategyMode();await refreshStrategy()}
+  if(active&&token===sequence&&accountScope.current(ticket)&&selectedAccount.value){strategyMode.value='current';resetStrategyMode();await refreshStrategy()}
 }
 const pnlMonth=ref(''),pnlHistory=ref<Fact|null>(null),pnlError=ref('')
 async function loadPnlMonth(){
-  pnlHistory.value=null;pnlError.value='';const token=sequence,account=selectedAccount.value
+  pnlHistory.value=null;pnlError.value='';const token=++pnlSequence,ticket=accountScope.capture(),account=ticket.account
   try{
     if(!account||!pnlMonth.value)throw new Error('请选择证券账户与月份')
     const result=await api('/portfolio/'+encodeURIComponent(account)+'/month?month='+pnlMonth.value+'-01')
-    if(active&&token===sequence&&account===selectedAccount.value)pnlHistory.value=result
-  }catch(e){if(active&&token===sequence)pnlError.value=String(e)}
+    if(active&&token===pnlSequence&&accountScope.accepts(ticket,result))pnlHistory.value=result
+  }catch(e){if(active&&token===pnlSequence&&accountScope.current(ticket))pnlError.value=String(e)}
 }
 async function pnlDay(row:Fact){
   if(!pnlHistory.value||str(pnlHistory.value.account_id)!==selectedAccount.value)return
@@ -67,7 +71,7 @@ function resetStrategyMode(){poolSequence++;pool.value=null;positionsView.value=
 const openings=ref<Fact[]>([]), openingsError=ref('')
 const tradeAccount=ref(''),tradeInstrument=ref(''),tradeFrom=ref(''),tradeTo=ref(''),tradePath=ref('/trades'),tradeDetail=ref<Fact|null>(null),tradeReadError=ref('')
 function filterTrades(){
-  tradeReadError.value='';tradeDetail.value=null
+  tradeScope.reset(tradeAccount.value,()=>{tradeSequence++;tradeEpoch.value++;tradeReadError.value='';tradeDetail.value=null;tradePath.value='/trades'+(tradeAccount.value?'?account_id='+encodeURIComponent(tradeAccount.value):'')})
   try{
     const params=new URLSearchParams()
     if(tradeAccount.value)params.set('account_id',tradeAccount.value)
@@ -79,8 +83,15 @@ function filterTrades(){
 }
 async function readTrade(row:Fact){
   tradeReadError.value='';tradeDetail.value=null
-  const token=sequence
-  try{const result=await api('/trades/'+encodeURIComponent(str(row.id))+'?include_audit=true');if(active&&token===sequence)tradeDetail.value=result}catch(e){if(active&&token===sequence)tradeReadError.value=String(e)}
+  const token=++tradeSequence,ticket=tradeScope.capture(),expected=str(row.account_id),id=str(row.id)
+  try{
+    if(!expected||!id||(ticket.account&&ticket.account!==expected))throw new Error('成交不属于当前筛选账户')
+    const result=await api('/trades/'+encodeURIComponent(id)+'?include_audit=true')
+    if(active&&token===tradeSequence&&tradeScope.current(ticket)){
+      if(result.account_id!==expected||result.id!==id)throw new Error('成交身份与查询不一致，拒绝展示')
+      tradeDetail.value=result
+    }
+  }catch(e){if(active&&token===tradeSequence&&tradeScope.current(ticket))tradeReadError.value=String(e)}
 }
 const financeYear=ref(new Date().getFullYear()),yearResult=ref<Fact|null>(null),yearError=ref('')
 async function loadYear(){
@@ -97,6 +108,7 @@ const quoteInstrument=ref(''), quoteEvidence=ref<Fact|null>(null), quoteError=re
 const writer=new WriteAttempt()
 let active=true, sequence=0, valuationSequence=0, quoteSequence=0, poolSequence=0
 let pendingIdentity: string|null=null, formIdentity: string|null=null
+let formIntent:WriteIntent=null
 /** Any unconfirmed (or unreadable) write blocks every new business write, in every tab. */
 const blocked=computed(()=>retryPending.value||pendingCorrupt.value)
 function identityKey(status:Fact): string {
@@ -126,8 +138,11 @@ const cashColumns=cols({id:'流水ID',account_id:'证券账户ID',kind:'类型',
 const billColumns=cols({id:'账单ID',account_id:'账户ID',kind:'类型',category_id:'分类',amount_fen:'金额',occurred_at:'日期',status:'状态',note:'备注'})
 const transferColumns=cols({id:'转账ID',from_account_id:'转出账户ID',to_account_id:'转入账户ID',amount_fen:'金额',occurred_at:'日期',status:'状态',from_included:'转出已包含',to_included:'转入已包含',note:'备注'})
 // Use actual returned IDs and versions for every write; never estimate a balance in the browser.
-function openForm(make:()=>FormSpec) {if(!writable.value)return;error.value='';feedback.value='';try{formIdentity=identityKey(system.value??{});spec.value=make();formKey.value++}catch(e){error.value=String(e)}}
-function navigate(next:typeof tabs[number]) {tab.value=next;if(!retryPending.value){spec.value=null;error.value='';feedback.value=''}}
+function openForm(make:()=>FormSpec) {if(!writable.value)return;error.value='';feedback.value='';try{formIdentity=identityKey(system.value??{});formIntent=writer.beginIntent();spec.value=make();formKey.value++}catch(e){error.value=String(e)}}
+function navigate(next:typeof tabs[number]) {tab.value=next;if(!retryPending.value){spec.value=null;error.value='';feedback.value=''}
+  if(next==='投资'&&selectedAccount.value)void loadInvestment()
+  if(next==='交易'&&selectedAccount.value)tradeAccount.value=selectedAccount.value
+}
 async function loadMaster(path:string):Promise<Fact[]> {
   const result=page(await api(`${path}?limit=500&offset=0`))
   const items=[...result.items]
@@ -139,7 +154,7 @@ async function loadMaster(path:string):Promise<Fact[]> {
   return items
 }
 async function reload() {
-  const token=++sequence;loading.value=true;readError.value='';valuation.value=null;strategy.value=null;month.value=null;historical.value=null
+  const token=++sequence;loading.value=true;readError.value='';clearAccountViews();month.value=null;historical.value=null
   clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[]
   session.forgetIdentity()
   try {
@@ -152,6 +167,7 @@ async function reload() {
     if(!active||token!==sequence)return
     overview.value=o;market.value=m;accounts.value=a;instruments.value=i;categories.value=c;lots.value=l
     if(!securities.value.some(a=>a.id===selectedAccount.value))selectedAccount.value=str(securities.value[0]?.id)
+    if(tradeAccount.value&&!securities.value.some(a=>a.id===tradeAccount.value))tradeAccount.value=''
     if(!instruments.value.some(x=>x.id===quoteInstrument.value))quoteInstrument.value=str(instruments.value[0]?.id)
     refresh.value++
     if(selectedAccount.value)await loadInvestment()
@@ -164,7 +180,7 @@ function handleRead(e:unknown) {
   readError.value=String(e)
   if(e instanceof ApiError&&e.status===401){signIn.value=true;sessionName.value='';readError.value='会话已过期或被撤销，请重新登录。';forget()}
 }
-function forget() {sequence++;valuationSequence++;quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
+function forget() {sequence++;clearAccountViews();quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
 async function signInSubmit() {
   if(busy.value)return
   error.value='';authState.value='正在登录…';busy.value=true
@@ -182,15 +198,17 @@ async function signOut() {
 }
 async function loadInvestment(){await refreshInvestment(false)}
 async function refreshInvestment(quiet:boolean){
-  const token=++valuationSequence
+  const token=++valuationSequence,ticket=accountScope.capture()
   if(!quiet){valuation.value=null;strategy.value=null}
-  if(!selectedAccount.value)return
+  investmentError.value='';investmentLoading.value=!!ticket.account
+  if(!ticket.account)return
   try {
     const time=asOf.value?shanghaiTime(asOf.value):new Date().toISOString()
-    const id=encodeURIComponent(selectedAccount.value), query=`?as_of=${encodeURIComponent(time)}`
+    const id=encodeURIComponent(ticket.account), query=`?as_of=${encodeURIComponent(time)}`
     const [v,s]=await Promise.all([api(`/portfolio/${id}${query}`),api(`/strategy/evidence/${id}${query}`)])
-    if(active&&token===valuationSequence){valuation.value=v;strategy.value=s}
-  }catch(e){if(active&&token===valuationSequence)readError.value=String(e)}
+    if(active&&token===valuationSequence&&accountScope.accepts(ticket,v,s)){valuation.value=v;strategy.value=s}
+  }catch(e){if(active&&token===valuationSequence&&accountScope.current(ticket)){valuation.value=null;strategy.value=null;investmentError.value=String(e)}}
+  finally{if(active&&token===valuationSequence&&accountScope.current(ticket))investmentLoading.value=false}
 }
 async function loadQuotes() {
   quoteError.value='';quoteEvidence.value=null
@@ -213,11 +231,12 @@ async function loadHistory(){historical.value=null;try{if(!historyTime.value)thr
 async function submit(values:Record<string,string>) {
   if(!spec.value||!writable.value)return
   error.value='';feedback.value=''
+  const submitted=spec.value,intent=formIntent,originalIdentity=formIdentity
   let body:Fact
-  try{body=spec.value.build(values)}catch(e){error.value=String(e);return}
+  try{body=submitted.build(values)}catch(e){error.value=String(e);return}
   if(!window.confirm(`${spec.value.title}\n${spec.value.confirm??'请核对真实事实及金额。'}\n确定提交？`))return
   busy.value=true
-  try{const expected=identityKey(system.value??{});const checked=await api('/system/status');if(expected!==formIdentity||identityKey(checked)!==expected)throw new Error('数据库身份已变化，拒绝提交；请重新读取并重新打开表单');session.declare(checked);pendingIdentity=expected;await writer.start(spec.value.path,body,spec.value.method);feedback.value='提交已确认。正在重新读取实际账本。';spec.value=null;await reload()}
+  try{const expected=identityKey(system.value??{});const checked=await api('/system/status');if(spec.value!==submitted||intent!==formIntent||expected!==originalIdentity||identityKey(checked)!==expected)throw new Error('数据库身份已变化，拒绝提交；请重新读取并重新打开表单');session.declare(checked);pendingIdentity=expected;await writer.start(submitted.path,body,submitted.method,intent);feedback.value='提交已确认。正在重新读取实际账本。';spec.value=null;await reload()}
   catch(e){error.value=String(e)}finally{syncPending();busy.value=false}
 }
 /**
@@ -234,13 +253,13 @@ async function retry(){
     const checked=await api('/system/status')
     session.declare(checked)
     if(pendingIdentity!==null&&safeKey(checked)!==pendingIdentity)throw new Error('数据库身份与原请求不一致，禁止跨库重试')
-    const state=await writer.check()
+    const state=await writer.check(requestId)
     if(state.committed===true){
-      await writer.discard();spec.value=null
+      await writer.discard(requestId);spec.value=null
       feedback.value=`原请求 ${requestId} 已在账本中入账，未生成新请求。已按实际账本重新读取。`
       await reload();return
     }
-    await writer.retry();feedback.value=`原请求 ${requestId} 尚未入账，已用同一请求 ID 与相同内容重新提交。`;spec.value=null;await reload()
+    await writer.retry(requestId);feedback.value=`原请求 ${requestId} 尚未入账，已用同一请求 ID 与相同内容重新提交。`;spec.value=null;await reload()
   }catch(e){error.value=String(e)}
   finally{syncPending();busy.value=false}
 }
@@ -250,7 +269,7 @@ async function discardPending(){
   if(!window.confirm('放弃这条待确认写入？之后再提交将生成新的请求 ID，可能与已入账记录重复。请先核对服务器账本中是否存在该请求编号。'))return
   const requestId=writer.requestId
   let removed=true
-  try{removed=await writer.discard()}catch(e){error.value=String(e)}
+  try{removed=await writer.discard(requestId)}catch(e){error.value=String(e)}
   syncPending();spec.value=null
   feedback.value=removed
     ?`已放弃待确认写入 ${requestId}。原请求仍可能已入账，请按该请求编号核对成交历史。`
@@ -266,35 +285,35 @@ async function clearCorruptPending(){
   feedback.value=removed?'已清除无法解析的待核实记录。请按成交历史继续人工核对。':'待核实记录已不是无法解析的状态（可能已被另一个标签页处理），本机未删除任何记录。'
 }
 async function refreshStrategy(){
-  if(strategyLoading.value)return
+  if(strategyLoading.value||signalWriting.value)return
   strategyError.value='';strategyLoading.value=true
-  const token=++poolSequence
+  const token=++poolSequence,ticket=accountScope.capture()
   try{
-    if(!selectedAccount.value)throw new Error('请先选择证券账户')
-    const id=encodeURIComponent(selectedAccount.value)
+    if(!ticket.account)throw new Error('请先选择证券账户')
+    const id=encodeURIComponent(ticket.account)
     // The read-only path only displays evidence; only POST /strategy/refresh writes signals.
     const query=strategyQuery()
     const [p,pos]=await Promise.all([api(`/strategy/pool/${id}${query}`),api(`/strategy/positions/${id}${query}`)])
-    if(active&&token===poolSequence){pool.value=p;positionsView.value=pos}
-  }catch(e){if(active&&token===poolSequence){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
-  finally{if(active&&token===poolSequence)strategyLoading.value=false}
+    if(active&&token===poolSequence&&accountScope.accepts(ticket,p,pos)){pool.value=p;positionsView.value=pos}
+  }catch(e){if(active&&token===poolSequence&&accountScope.current(ticket)){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
+  finally{if(active&&token===poolSequence&&accountScope.current(ticket))strategyLoading.value=false}
 }
 /** An explicit operator action: this is the only path that records formal signals. */
 async function writeStrategySignals(){
-  if(signalWriting.value||!writable.value||strategyMode.value!=='current')return
+  if(signalWriting.value||strategyLoading.value||!writable.value||strategyMode.value!=='current')return
   signalWriting.value=true;strategyError.value='';signalFeedback.value=''
-  const token=++poolSequence
+  const token=++poolSequence,ticket=accountScope.capture()
   try{
-    if(!selectedAccount.value)throw new Error('请先选择证券账户')
-    const id=encodeURIComponent(selectedAccount.value)
+    if(!ticket.account)throw new Error('请先选择证券账户')
+    const id=encodeURIComponent(ticket.account)
     const written=await api(`/strategy/refresh?mode=current&account_id=${id}`,'POST')
-    if(!active||token!==poolSequence)return
+    if(!active||token!==poolSequence||!accountScope.accepts(ticket,written))return
     pool.value=written
     signalFeedback.value=facts(written.items).some(row=>!!row.signal_id||!!nested(row.ndx_aux).signal_id)?'已读取服务器保存的信号证据。':'服务端未返回正式信号。'
     const pos=await api(`/strategy/positions/${id}?mode=current`)
-    if(active&&token===poolSequence)positionsView.value=pos
-  }catch(e){if(active)strategyError.value=String(e)}
-  finally{if(active)signalWriting.value=false}
+    if(active&&token===poolSequence&&accountScope.accepts(ticket,pos))positionsView.value=pos
+  }catch(e){if(active&&token===poolSequence&&accountScope.current(ticket)){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
+  finally{if(active&&token===poolSequence&&accountScope.current(ticket))signalWriting.value=false}
 }
 async function loadMaintenance(){
   maintenanceError.value='';maintenanceLoading.value=true;backupState.value=null;migrationState.value=null
@@ -364,9 +383,21 @@ function clearStrategyView():void{
   poolSequence++
   pool.value=null;positionsView.value=null;strategyError.value='';signalFeedback.value='';signalWriting.value=false;strategyLoading.value=false
 }
-watch(selectedAccount,()=>{clearStrategyView();pnlHistory.value=null},{flush:'sync'})
+function clearAccountViews():void{
+  accountScope.reset(selectedAccount.value,()=>{
+    valuationSequence++;pnlSequence++;valuation.value=null;strategy.value=null;pnlHistory.value=null;pnlError.value='';investmentError.value='';investmentLoading.value=!!selectedAccount.value
+    clearStrategyView()
+  })
+  filterTrades()
+}
+watch(tradeAccount,filterTrades,{flush:'sync'})
+watch(selectedAccount,()=>{
+  clearAccountViews();tradeAccount.value=selectedAccount.value
+  if(!retryPending.value)spec.value=null
+  if(tab.value==='投资'&&!loading.value&&selectedAccount.value)void loadInvestment()
+},{flush:'sync'})
 onMounted(()=>{void boot();window.addEventListener('beforeunload',beforeUnload);window.addEventListener('storage',onStorage);timer=setInterval(()=>{void poll()},20000)})
-onBeforeUnmount(()=>{active=false;sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage)})
+onBeforeUnmount(()=>{active=false;accountScope.reset('',()=>{});tradeScope.reset('',()=>{});sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage)})
 const validTransfer=(r:Fact)=>r.status==='effective'
 const accountById=(id:unknown)=>accountRows.value.find(a=>a.id===id)
 
@@ -508,7 +539,8 @@ function openTradeFromSignal(row:Fact){
       </section>
       <section v-if="tab==='投资'">
         <h2>持仓与行情</h2>
-        <div class="toolbar"><label>证券账户 <select v-model="selectedAccount" @change="pnlHistory=null;loadInvestment()"><option value="">选择账户</option><option v-for="a in securities" :key="String(a.id)" :value="a.id">{{a.name}}</option></select></label><label>历史截止时间（北京时间，留空为当前） <input v-model="asOf" type="datetime-local" step="1"/></label><button @click="loadInvestment">查询持仓</button><button :disabled="!writable" @click="refreshMarket">刷新真实行情</button><button :disabled="!writable" @click="openForm(()=>forms.quoteForm(instruments))">录入核实价格</button></div>
+        <div class="toolbar"><label>证券账户 <select v-model="selectedAccount"><option value="">选择账户</option><option v-for="a in securities" :key="String(a.id)" :value="a.id">{{a.name}}</option></select></label><label>历史截止时间（北京时间，留空为当前） <input v-model="asOf" type="datetime-local" step="1"/></label><button @click="loadInvestment">查询持仓</button><button :disabled="!writable" @click="refreshMarket">刷新真实行情</button><button :disabled="!writable" @click="openForm(()=>forms.quoteForm(instruments))">录入核实价格</button></div>
+        <p v-if="investmentLoading" role="status">正在读取选定证券账户…</p><p v-if="investmentError" class="error" role="alert">{{investmentError}}</p>
         <template v-if="valuation"><p>数据时点 {{display(valuation.as_of,'as_of')}}；账本 {{valuation.ledger_revision}} / 行情 {{valuation.quote_revision}}；质量 {{display(valuation.quality)}}；{{display(valuation.reasons)}}</p>
           <dl class="metrics"><div v-for="item in cols({cash_fen:'证券现金',market_value_fen:'市值',equity_fen:'账户权益',daily_pnl_fen:'自然日收益',latest_trading_day_pnl_fen:'最近交易日收益',realized_fen:'已实现收益',unrealized_fen:'未实现收益',cumulative_pnl_fen:'累计收益'})" :key="item.key"><dt>{{item.label}}</dt><dd>{{money(valuation[item.key])}}</dd></div></dl>
           <p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
@@ -543,7 +575,7 @@ function openTradeFromSignal(row:Fact){
             <RecordTable :rows="facts(positionsView.unrealized_model_actions)" :columns="cols({index_id:'指数',etf_code:'ETF 代码',action:'建议动作',action_price:'参考价（元）',action_reason:'原因',price_basis:'价格口径'})"/>
           </template>
           <h4>真实账本中的策略批次（核对依据）</h4>
-          <RecordTable v-if="facts(positionsView.custody).length" :rows="facts(positionsView.custody)" :columns="cols({lot_id:'批次ID',lot_role:'角色',strategy_id:'策略标识',signal_date:'信号日',frozen_atr:'冻结ATR',code:'证券代码',market:'市场',kind:'类型',remaining:'剩余数量'})"/>
+          <RecordTable v-if="facts(positionsView.custody).length" :rows="facts(positionsView.custody)" :columns="cols({lot_id:'批次ID',lot_role:'角色',strategy_id:'策略标识',strategy_deviation:'偏离策略',deviation_note:'偏离依据',signal_verified:'信号核实',signal_date:'信号日',frozen_atr:'冻结ATR',code:'证券代码',market:'市场',kind:'类型',remaining:'剩余数量'})"/>
           <p v-else class="notice">{{positionsView.custody_quality==='historical_unavailable'?'历史账本版本不可完整核验，不能据此判断持仓为零。':'账本中没有带策略标记的主仓/子仓批次；策略持仓状态若存在则属于未核对证据。'}}</p>
         </template>
         <p v-else class="notice">尚未读取持仓决策。</p>
@@ -564,7 +596,7 @@ function openTradeFromSignal(row:Fact){
         <h3>成交历史（包括待核对和冲正）</h3>
         <div class="toolbar"><label>证券账户 <select v-model="tradeAccount"><option value="">全部</option><option v-for="a in securities" :key="str(a.id)" :value="str(a.id)">{{a.name}}</option></select></label><label>证券 <select v-model="tradeInstrument"><option value="">全部</option><option v-for="i in instruments" :key="str(i.id)" :value="str(i.id)">{{i.code}}</option></select></label><label>起始（北京时间，含） <input type="datetime-local" v-model="tradeFrom"/></label><label>结束（北京时间，不含） <input type="datetime-local" v-model="tradeTo"/></label><button @click="filterTrades">筛选成交</button></div>
         <p v-if="tradeReadError" class="error" role="alert">{{tradeReadError}}</p>
-        <PagedRecords :path="tradePath" :refresh="refresh" :columns="cols({id:'成交ID',account_id:'账户ID',instrument_id:'标的ID',side:'方向',quantity:'数量',price:'价格（元）',fees_fen:'费用',amount_fen:'金额',executed_at:'成交时间',status:'状态',pending_reason:'待核对原因',note:'备注'})"><template #actions="{row}"><button @click="readTrade(row)">查看事实与审计</button><button v-if="row.status==='pending'" :disabled="!writable" @click="openForm(()=>forms.confirmation(`/trades/${row.id}/confirm`))">确认</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots,row))">更正</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/trades/${row.id}/void`,'作废成交'))">作废</button></template></PagedRecords>
+        <PagedRecords :key="tradeEpoch" :path="tradePath" :account-id="tradeAccount" :refresh="refresh" :columns="cols({id:'成交ID',account_id:'账户ID',instrument_id:'标的ID',side:'方向',quantity:'数量',price:'价格（元）',fees_fen:'费用',amount_fen:'金额',executed_at:'成交时间',status:'状态',pending_reason:'待核对原因',note:'备注'})"><template #actions="{row}"><button @click="readTrade(row)">查看事实与审计</button><button v-if="row.status==='pending'" :disabled="!writable" @click="openForm(()=>forms.confirmation(`/trades/${row.id}/confirm`))">确认</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots,row))">更正</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/trades/${row.id}/void`,'作废成交'))">作废</button></template></PagedRecords>
         <details v-if="tradeDetail" open><summary>成交事实与审计记录</summary><pre>{{JSON.stringify(tradeDetail,null,2)}}</pre></details>
         <h3>证券资金记录</h3><PagedRecords path="/cash" :refresh="refresh" :columns="cashColumns"><template #actions="{row}"><template v-if="!row.transfer_id&&!row.execution_id&&['opening','deposit','withdrawal','adjustment'].includes(String(row.kind))"><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/cash/${row.id}/void`,'作废资金记录'))">作废</button></template></template></PagedRecords>
         <details><summary>账户及证券标的 ID 对照</summary><RecordTable :rows="accounts" :columns="cols({id:'账户ID',name:'名称',kind:'类型'})"/><RecordTable :rows="instruments" :columns="cols({id:'标的ID',market:'市场',code:'代码',kind:'类型'})"/></details>

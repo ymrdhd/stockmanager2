@@ -1,8 +1,6 @@
 # 当前状态（每轮覆盖，不累计日志）
 
-- `09C-final-web-completion`：**CHANGES_REQUIRED / 待独立审查，不建议无条件源码冻结，未正式发布**。BASE `9b88513c360a70473ef1b340415fb1a81b979ff3`，09B bundle 与源码130/130字节一致；原策略 SHA256 一致。
-- NDX T5 原计算保留、独立建议证据/实际批次生命周期与现金缓冲、槽位隔离、重新打开 DB；原 ATR 及动态 G2 3/10 日冷却保留。合成生命周期和公开入口通过，不证明实网或真实成交遵从目标。
-- 真实迁移程序证券/混合合成正例完成独立对账、审批、接管、应用启动及旧 generation 拒绝；999股差异阻断；真实报告中断回滚通过，09B纯财务正例保留。真实旧库和Windows中断未验收。
-- 可信 XSHG 日历元数据/指纹、离线审查更新入口；保持2026-12-31上限，未导入2027。新增成交筛选/审计、月度投资日级收益、年度财务月入口与 T5 页面。
-- 集中受影响专项82 PASS（16.08s），最后补测9 PASS（3.98s），不相加重叠组；git diff --check/compileall/日历校验 PASS。生产构建、前端真实浏览器、Windows、实网、双机、真实库与独立全量均 NOT RUN；保留09失败证据。不提供运行包。
-- `09C_FUNCTION_MATRIX.md` 记录工作台风险/待办、持仓搜索、多时点净资产趋势/摘要CSV、账单筛选已补齐；接近止损阈值及流动净资产独立口径仍待产品/审查确认；`09C_REPORT.md` 实际测试与风险，`09C_LOCAL_ACCEPTANCE.md` 未来经授权本地任务。不得将缺口或环境未验收标 PASS。未操作真实正式库、未部署、未启动本地 Agent，停止开发提交独立审查。
+- `09E-web-S1-integrity-fixes`，BASE `9d9ad14ca629d1f563a370077d9426035efbf36b`，分支 `09E-web-S1-fixes`。09C ZIP 与原 Git 140/140 一致。**CHANGES_REQUIRED，待独立审查**。
+- 仅修复 09D-001/002/003：持久化写槽终态 fence、偏离成交合规证明撤销（真实事实保留）、账户请求代次/响应账户校验与同步清空。三项修复前 FAIL、修复后专项 PASS；跨运行时真实 FastAPI/SQLite 合成集成 PASS，SFC setup 模拟逻辑 PASS，非真实浏览器。未改原 V9/G2 公式或 T5 独立分类问题。
+- 全量 Python 302 PASS；compileall PASS；前端43 PASS；限定 TS 严格检查 PASS。npm ci FAIL（EAI_AGAIN/退出异常），vue-tsc/build FAIL，实际 Vite NOT RUN，真实浏览器 BLOCKED。保留锁定依赖与类型检查，不提供运行包。
+- `09E_REPORT.md` 记录实测、限制、回退；`ISSUES.md` 保留 09D 编号及全部历史。三项待独立关闭；其他 09D 问题不处理，生产验收关卡保留。不启动本地 Agent，不操作真实库、不部署，不开启下一阶段。

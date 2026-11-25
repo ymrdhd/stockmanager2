@@ -234,11 +234,23 @@ def bump(conn: sqlite3.Connection, day: str) -> None:
     conn.execute('UPDATE ledger_state SET ledger_revision=ledger_revision+1, earliest_affected_day=CASE WHEN earliest_affected_day IS NULL OR earliest_affected_day>? THEN ? ELSE earliest_affected_day END WHERE id=1', (day, day))
 
 
+def safe_trade_receipt(result: dict) -> dict:
+    """Historical request receipts are immutable facts, not current compliance proof.
+
+    Pre-09E receipts may include an erroneous verified link for a deviating buy.
+    Redact that derived claim at read time without rewriting the receipt or ledger.
+    """
+    if result.get('strategy_deviation') and result.get('side') == 'buy':
+        return {**result, 'strategy_evidence': None,
+                'strategy_evidence_missing': bool(result.get('strategy_id'))}
+    return result
+
+
 def prior(conn: sqlite3.Connection, request: str, payload: str) -> dict | None:
     row = conn.execute('SELECT payload,result_json FROM ledger_requests WHERE request_id=?', (request,)).fetchone()
     if row is not None and row[0] != payload:
         raise Conflict('request_id already used with different content')
-    return json.loads(row[1]) if row else None
+    return safe_trade_receipt(json.loads(row[1])) if row else None
 
 
 def remember(conn: sqlite3.Connection, request: str, payload: str, result: dict) -> None:
@@ -263,7 +275,7 @@ def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
     Bad/missing evidence never discards a broker execution. The recorded ID is an
     audit reference, not a permission to label a real lot as strategy-verified.
     """
-    if not value.get('signal_id') or value.get('side') != 'buy':
+    if not value.get('signal_id') or value.get('side') != 'buy' or value.get('strategy_deviation'):
         return None
     if value.get('strategy_id') == 'NDX_AUX_T5':
         return verified_ndx_aux_signal(conn, value)

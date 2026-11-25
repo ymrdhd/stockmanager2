@@ -717,3 +717,24 @@ def test_expired_signal_is_not_proof_but_late_execution_is_kept(ledger):
     actual = svc.submit(trade(account,instrument,'late-real',day=7,lot_role='main',strategy_id='INDEX_STRATEGY_ATR',
                               frozen_atr='0.05',signal_date='2026-01-05',signal_id=signal['signal_id']))
     assert actual['status'] == 'effective' and actual['strategy_evidence'] is None
+
+
+def test_deviation_link_preserves_fact_but_not_compliance(ledger):
+    svc, account, instrument = ledger
+    fund(svc, account)
+    signal = StrategyStore(svc.db, clock=lambda: datetime.fromisoformat('2026-01-05T15:30:00+08:00')).save_signal(
+        account_id=account,index_id='000300.SH',instrument_code='510300',signal_date='2026-01-05',
+        input_version='fixture-raw-ohlcv',strategy_version='index-strategy-atr-v9.2',config_version='cfg:fixture',
+        status='SIGNAL',price_basis='etf_unadjusted',price_unit='元',atr14=.05,source_verified=True)
+    data = trade(account,instrument,'deviated-linked',day=6,lot_role='main',strategy_id='INDEX_STRATEGY_ATR',
+                 frozen_atr='0.05',signal_date='2026-01-05',signal_id=signal['signal_id'],strategy_deviation=True)
+    actual = svc.submit(data)
+    assert actual['status']=='effective' and actual['strategy_deviation']
+    assert actual['signal_id']==signal['signal_id']
+    assert actual['strategy_evidence'] is None
+    strategy = service(svc.db, etf_fixture())
+    assert not strategy.sync_from_custody(account)['created']
+    result = strategy.position_rows(account)['items'][0]
+    assert result['position']['shares']==100
+    assert result['position']['stop_price'] is None
+    assert result['position']['action']=='UNVERIFIED'

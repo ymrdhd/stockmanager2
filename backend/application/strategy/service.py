@@ -200,7 +200,7 @@ class StrategyService:
                 except SeriesError:
                     ndx['ndx_aux']={'status':'DATA_UNAVAILABLE','detail':'记录建议时 ETF 行情无法复核','tradable':False,'actionable':False}
         return {
-            'as_of': day, **self._time_payload(day),
+            'as_of': day, **self._time_payload(day), 'account_id': account_id,
             'strategy_version': INDEX_STRATEGY_VERSION,
             'regime': self._regime_payload(regime),
             'equity_fen': equity, 'cash_fen': cash, 'equity_quality': quality,
@@ -567,7 +567,7 @@ class StrategyService:
             state, reason = self._state_from_lots(index_id, cfg, atr_lots)
             if state is None or state.execution_source != SOURCE_LEDGER:
                 pending.append({'index_id': index_id, 'lots': [lot['lot_id'] for lot in lots],
-                                'reason': reason})
+                                'reason': reason or ('strategy_deviation' if any(lot.get('strategy_deviation') for lot in atr_lots) else 'signal_link_unverified')})
                 continue
             self.store.save_position(account_id, state)
             created.append({'index_id': index_id, 'signal_date': state.signal_date,
@@ -894,7 +894,8 @@ class StrategyService:
                 proof = verified_trade_signal(conn, payload) if trade and not self._historical(as_of) else None
                 scale_invalid = bool(conn.execute("SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND occurred_at>=? AND occurred_at<=? AND voided_at IS NULL AND strategy_evidence_invalid=1", (account_id,lot['instrument_id'],lot['opened_at'],cutoff)).fetchone())
                 result.append({**lot, **instrument, 'remaining':lot['quantity'], 'entry_price_fen':trade[0]['price'] if trade else None,
-                               'execution_id':lot['open_execution_id'], 'signal_id':payload.get('signal_id'), 'signal_verified':proof is not None,
+                               'execution_id':lot['open_execution_id'], 'signal_id':payload.get('signal_id'), 'signal_verified':proof is not None, 'strategy_deviation':bool(payload.get('strategy_deviation')),
+                               'deviation_note':payload.get('note') if payload.get('strategy_deviation') else None,
                                'scale_invalid':scale_invalid})
         return result
 
@@ -927,7 +928,7 @@ class StrategyService:
             return None, {'status': 'unverified', 'reason_codes': [reason],
                           'source': 'trade_lots'}
         warnings.append(f'{index_id} 策略状态由真实批次重建（尚未写入策略证据表）')
-        return state, {'status': state.execution_source, 'reason_codes': [] if state.execution_source == SOURCE_LEDGER else ['signal_link_unverified'],
+        return state, {'status': state.execution_source, 'reason_codes': [] if state.execution_source == SOURCE_LEDGER else (['strategy_deviation'] if any(lot.get('strategy_deviation') for lot in lots) else ['signal_link_unverified']),
                        'source': 'trade_lots'}
 
     def _state_from_lots(self, index_id: str, cfg,

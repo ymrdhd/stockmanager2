@@ -5,6 +5,7 @@ import json
 from fastapi import APIRouter, Request
 
 from backend.api.trading import invoke, service, wire
+from backend.application.trading.service import safe_trade_receipt
 
 router = APIRouter(prefix='/api/v1', tags=['requests'])
 
@@ -26,7 +27,7 @@ def request_state(request_id: str, request: Request):
         return {
             'request_id': request_id,
             'committed': row is not None,
-            'result': wire(json.loads(row[0])) if row is not None else None,
+            'result': wire(safe_trade_receipt(json.loads(row[0]))) if row is not None else None,
             'database_uuid': identity.database_uuid,
             'generation': identity.generation,
             'instance_role': identity.instance_role,

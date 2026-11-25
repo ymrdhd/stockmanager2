@@ -808,8 +808,12 @@ class PortfolioService:
             positions = self._strategy_positions(conn, account, cutoff)
             for lot in lots:
                 payload = conn.execute('SELECT payload FROM trade_executions WHERE id=?',(lot['open_execution_id'],)).fetchone()
-                proof = verified_trade_signal(conn,json.loads(payload[0])) if payload else None
+                execution = json.loads(payload[0]) if payload else {}
+                proof = verified_trade_signal(conn,execution) if payload else None
                 lot['signal_evidence'] = proof
+                lot['strategy_deviation'] = bool(execution.get('strategy_deviation'))
+                lot['deviation_note'] = execution.get('note') if lot['strategy_deviation'] else None
+                lot['signal_id'] = execution.get('signal_id')
             codes = {row['id']: row['code'] for row in
                      rows(conn,'SELECT id,code FROM instruments')}
             invalidated = self._scale_invalidated(conn, account, cutoff)
@@ -873,6 +877,9 @@ class PortfolioService:
                 status, codes_out = 'unverified', codes_out + ['strategy_position_not_recorded']
             else:
                 status, codes_out = 'unverified', codes_out + ['strategy_signal_link_not_verified']
+            if lot.get('strategy_deviation') and lot.get('strategy_id') != 'NDX_AUX_T5':
+                status = 'unverified'
+                codes_out.append('strategy_deviation')
             reasons.update(codes_out)
             items.append({**lot,'instrument_code':code,'index_id':index_id,
                           'evidence_status':status,'reason_codes':codes_out,

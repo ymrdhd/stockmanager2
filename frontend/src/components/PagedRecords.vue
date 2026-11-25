@@ -2,19 +2,22 @@
 import {ref, watch, onBeforeUnmount} from 'vue'
 import {api, page, type Page} from '../api/client'
 import RecordTable from './RecordTable.vue'
-const props = defineProps<{path:string; columns:{key:string;label:string}[]; refresh:number}>()
+const props = defineProps<{path:string; columns:{key:string;label:string}[]; refresh:number; accountId?:string}>()
 const result = ref<Page|null>(null), error = ref(''), loading = ref(false)
 let serial = 0
 async function load(offset = 0, revision?:number) {
-  const token = ++serial
+  const token = ++serial, path = props.path, account = props.accountId
   loading.value = true; error.value = ''
   try {
-    const r = page(await api(`${props.path}${props.path.includes('?')?'&':'?'}limit=50&offset=${offset}${revision === undefined?'':`&ledger_revision=${revision}`}`))
-    if (token === serial) result.value = r
+    const r = page(await api(`${path}${path.includes('?')?'&':'?'}limit=50&offset=${offset}${revision === undefined?'':`&ledger_revision=${revision}`}`))
+    if (token === serial && props.path === path && props.accountId === account) {
+      if(account&&r.items.some(row=>row.account_id!==account))throw new Error('列表返回其他账户的记录，已拒绝展示')
+      result.value = r
+    }
   } catch (e) { if(token===serial) {error.value=String(e);result.value=null} }
   finally {if(token===serial) loading.value=false}
 }
-watch(() => [props.path,props.refresh], () => {result.value=null;void load()}, {immediate:true})
+watch(() => [props.path,props.refresh,props.accountId], () => {result.value=null;void load()}, {immediate:true,flush:'sync'})
 onBeforeUnmount(() => {serial++})
 </script>
 <template>

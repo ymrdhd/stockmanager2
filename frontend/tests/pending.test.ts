@@ -41,7 +41,9 @@ test('an unconfirmed write outlives the browser session, not just the tab',async
   assert.equal(second.requestId,'durable-key')
   assert.equal((await second.retry()).request_id,'durable-key')
   assert.equal(second.pending,null)
-  assert.equal(env.data.size,0)
+  assert.equal(env.data.has('sm2.pending-write'),false)
+  assert.equal(env.data.size,1)
+  assert.ok(env.data.get('sm2.write-intent-fence'))
 })
 
 test('the record is written before the request is sent',async()=>{
@@ -149,7 +151,9 @@ test('abandoning a record tells the operator to reconcile by request ID',async()
   await assert.rejects(writer.start('/trades',{quantity:1}))
   assert.equal(await writer.discard(),true)
   assert.equal(writer.pending,null)
-  assert.equal(env.data.size,0)
+  assert.equal(env.data.has('sm2.pending-write'),false)
+  assert.equal(env.data.size,1)
+  assert.ok(env.data.get('sm2.write-intent-fence'))
 })
 
 test('a retry is never sent to a different database',async()=>{
@@ -228,7 +232,9 @@ test('a lost response keeps the record and the retry posts it exactly once',asyn
   assert.deepEqual(attempts,['once-key','once-key'],'the retry must reuse the original request ID, not mint a new one')
   assert.equal(new Set(attempts).size,1)
   assert.equal(writer.pending,null)
-  assert.equal(env.data.size,0)
+  assert.equal(env.data.has('sm2.pending-write'),false)
+  assert.equal(env.data.size,1)
+  assert.ok(env.data.get('sm2.write-intent-fence'))
 })
 
 test('an unparseable record is reported as corrupt, blocks writes, and can be cleared',async()=>{
@@ -244,7 +250,9 @@ test('an unparseable record is reported as corrupt, blocks writes, and can be cl
   assert.equal(env.data.has('sm2.pending-write'),true,'an unreadable record is never deleted silently')
   assert.equal(await writer.clearCorrupt(),true)
   assert.equal(writer.corrupt,false)
-  assert.equal(env.data.size,0)
+  assert.equal(env.data.has('sm2.pending-write'),false)
+  assert.equal(env.data.size,1)
+  assert.ok(env.data.get('sm2.write-intent-fence'))
   // Writing works again only after the operator reconciled and cleared it.
   await writer.start('/trades',{quantity:1})
   assert.equal(sent,1)
@@ -257,4 +265,75 @@ test('without navigator.locks a write is refused instead of racing',async()=>{
   await assert.rejects(writer.start('/trades',{quantity:1}),(e:unknown)=>e instanceof ApiError&&e.code==='mutex_unavailable')
   assert.equal(sent,0)
   assert.equal(env.data.size,0,'nothing may be persisted when the write is refused')
+})
+
+test('09D-001 queued successful duplicate cannot mint a second ID',async()=>{
+  const env=durable(), locks=sharedLocks(), sent:string[]=[]
+  const send:typeof api=async(_p,_m,b)=>{sent.push(String(b?.request_id));return {id:'trade-'+sent.length}}
+  const a=new WriteAttempt(send,()=> 'A',env.store,locks), b=new WriteAttempt(send,()=> 'B',env.store,locks)
+  const results=await Promise.allSettled([a.start('/trades',{account_id:'a',quantity:1}),b.start('/trades',{account_id:'a',quantity:1})])
+  assert.equal(sent.length,1)
+  assert.equal(results[0].status,'fulfilled');assert.equal(results[1].status,'rejected')
+})
+
+test('two pre-opened forms share a durable intent; delayed response and reopening cannot reuse it',async()=>{
+  const env=durable(), locks=sharedLocks(), sent:Fact[]=[]
+  let release!:()=>void, entered!:()=>void
+  const ready=new Promise<void>(r=>{entered=r}), delayed=new Promise<void>(r=>{release=r})
+  const send:typeof api=async(_p,_m,b)=>{sent.push(b!);if(sent.length===1){entered();await delayed}return {id:'trade-'+sent.length}}
+  const a=new WriteAttempt(send,()=> 'first',env.store,locks), b=new WriteAttempt(send,()=> 'second',env.store,locks)
+  const intentA=a.beginIntent(),intentB=b.beginIntent()
+  assert.equal(intentA,intentB)
+  const body={account_id:'a',quantity:100,price:'3.4567'}
+  const first=a.start('/trades',body,'POST',intentA)
+  await ready
+  const queued=b.start('/trades',body,'POST',intentB)
+  release()
+  await first
+  await assert.rejects(queued,(e:unknown)=>e instanceof ApiError&&e.code==='intent_stale')
+  assert.equal(sent.length,1)
+  const reopened=new WriteAttempt(send,()=> 'third',env.store,locks)
+  await assert.rejects(reopened.start('/trades',body,'POST',intentB),(e:unknown)=>e instanceof ApiError&&e.code==='intent_stale')
+  assert.equal(sent.length,1)
+  const next=reopened.beginIntent();assert.notEqual(next,intentA)
+  await reopened.start('/trades',body,'POST',next)
+  assert.equal(sent.length,2)
+  assert.notEqual(sent[0].request_id,sent[1].request_id)
+  assert.deepEqual({...sent[0],request_id:null},{...sent[1],request_id:null})
+})
+
+test('lost response across close/reopen keeps old ID, stale form is refused after retry',async()=>{
+  const env=durable(),locks=sharedLocks(),sent:string[]=[]
+  const send:typeof api=async(_p,_m,b)=>{sent.push(String(b?.request_id));if(sent.length===1)throw timeout();return {id:'same-trade'}}
+  const a=new WriteAttempt(send,()=> 'uncertain',env.store,locks), intent=a.beginIntent()
+  await assert.rejects(a.start('/trades',{account_id:'a',quantity:1},'POST',intent))
+  const b=new WriteAttempt(send,()=> 'never',env.store,locks)
+  assert.equal(b.requestId,'uncertain')
+  await b.retry('uncertain')
+  await assert.rejects(b.start('/trades',{account_id:'a',quantity:1},'POST',intent),(e:unknown)=>e instanceof ApiError&&e.code==='intent_stale')
+  assert.deepEqual(sent,['uncertain','uncertain'])
+})
+
+test('rejection closes only the old slot and an explicitly reopened form may correct it',async()=>{
+  const env=durable(),locks=sharedLocks(),sent:Fact[]=[]
+  const send:typeof api=async(_p,_m,b)=>{sent.push(b!);if(sent.length===1)throw new ApiError('invalid',false,422);return {ok:true}}
+  const a=new WriteAttempt(send,()=> 'rejected',env.store,locks), b=new WriteAttempt(send,()=> 'new',env.store,locks)
+  const old=a.beginIntent()
+  await assert.rejects(a.start('/trades',{account_id:'a',quantity:0},'POST',old))
+  assert.equal(a.pending,null)
+  await assert.rejects(b.start('/trades',{account_id:'a',quantity:0},'POST',old),(e:unknown)=>e instanceof ApiError&&e.code==='intent_stale')
+  await b.start('/trades',{account_id:'b',quantity:1},'POST',b.beginIntent())
+  assert.deepEqual(sent.map(x=>[x.account_id,x.request_id]),[['a','rejected'],['b','new']])
+})
+
+test('old recovery action cannot delete or retry a newer pending request',async()=>{
+  const env=durable(),locks=sharedLocks()
+  const a=new WriteAttempt(async()=>{throw timeout()},()=> 'old',env.store,locks)
+  await assert.rejects(a.start('/trades',{quantity:1}))
+  await a.discard('old')
+  const b=new WriteAttempt(async()=>{throw timeout()},()=> 'new',env.store,locks)
+  await assert.rejects(b.start('/trades',{quantity:2}))
+  assert.equal(await b.discard('old'),false)
+  await assert.rejects(b.retry('old'))
+  assert.equal(b.requestId,'new')
 })

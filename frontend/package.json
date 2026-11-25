@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "vue-tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/health.test.ts tests/client.test.ts tests/pending.test.ts",
+    "test": "node --experimental-strip-types --test tests/health.test.ts tests/client.test.ts tests/pending.test.ts tests/accountScope.test.ts tests/workspaceAccount.test.ts",
     "build": "npm run typecheck && vite build",
     "test:live": "node --experimental-strip-types tests/health.live.ts"
   },
