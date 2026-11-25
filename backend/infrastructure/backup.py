@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 import shutil
 import sqlite3
 import tempfile
@@ -20,6 +19,7 @@ from backend.infrastructure.database import (
     validate_binding,
     validate_identity,
 )
+from backend.infrastructure.durability import fsync_file
 
 SNAPSHOT_NAME = 'database.sqlite'
 MANIFEST_NAME = 'manifest.json'
@@ -97,7 +97,7 @@ def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previo
             raise DatabaseError('backup destination already exists')
         from backend.infrastructure.takeover import _sync_dir
         for file in (snapshot,staging / MANIFEST_NAME):
-            with file.open("rb") as stream: os.fsync(stream.fileno())
+            fsync_file(file)
         _sync_dir(staging)
         staging.rename(target)
         _sync_dir(target.parent)

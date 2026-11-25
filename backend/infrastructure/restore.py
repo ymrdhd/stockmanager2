@@ -24,6 +24,7 @@ from backend.infrastructure.database import (
     validate_identity,
     writer_lock,
 )
+from backend.infrastructure.durability import fsync_file
 
 # Business tables a usable ledger must expose; a missing table proves the copy is not
 # this application's database, whatever the manifest claims.
@@ -420,8 +421,7 @@ def restore(settings: DatabaseSettings, backup_path: Path, *, confirm: bool,
                     report['new_generation'] = identity.generation
                     # Prepare binding before publishing the database.
                     publish_binding(temporary, Binding(official, uuid, new_generation))
-                    with staged.open('rb') as stream:
-                        os.fsync(stream.fileno())
+                    fsync_file(staged)
                     _write_json(marker, {'path': str(official), 'uuid': uuid,
                         'old_generation': current.generation, 'new_generation': new_generation,
                         'backup': str(destination), 'staged': str(staged), 'operation': 'restore'})

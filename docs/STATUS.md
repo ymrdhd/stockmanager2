@@ -1,7 +1,9 @@
 # 当前状态（每轮覆盖，不累计日志）
 
-- 09J-web-handoff：网页端最终交接候选，**CHANGES_REQUIRED（产品确认、独立关闭及生产/现场验收未完成）**。增量BASE为09I `d2348fbc5b78cff641902ca95f5cfd9c6d07b3c4`；保留09J边界测试提交 `f48cb2e714c18f00311ec33e64d6df3bf89dbcbe`；最终HEAD见交付README。09I 167/167逐字节一致、SHA256 5/5。
-- 保留09G–09I全部业务成果；09J新增12项止损证据边界测试，并修复次查询网络失败仍允许写入，分页列表上报、旧请求代次保护。既有交易意图与pending不变。未改数据库schema、核心策略、产品阈值及依赖锁。
-- 实际：Python全量338 PASS（前端修复前），修复后18项受影响专项PASS；最终63项Node自动化及限定TS PASS；日历指纹、compileall、diff检查PASS。重叠不相加；并非独立审查关闭。正式vue-tsc及build前置FAIL（127，缺依赖），Vite/真实浏览器NOT RUN，历史npm DNS阻断未重复安装。
-- 已知业务候选仍待确认：退款原支出期、基础日收益率分母/精度、流动性分类、2%展示预警。未知分类不可用；真实旧库退款/名称映射须来源样本。未重新取得原策略参考ZIP，本轮未核验原文件哈希。
-- 接手先读 `09J_REPORT.md` 第7节、`09J_HANDOFF.md` 末节、`ISSUES.md`、`09I_FUNCTION_MATRIX.md`；不另开常规功能轮次，发现具体源码缺陷再定向修复。实际依赖安装/构建、真实浏览器、Windows、真实行情、旧库、2027可信日历、Tailscale及正式部署仍待验；未取得正式接管/发布授权。
+- 10-local-acceptance：以 `09J-web-handoff` HEAD `00c2d143f96b0d51e2dca7b5848f477c08071e73` 为 BASE，分支 `10-local-acceptance`；本地 V1.0 构建、真实浏览器、Windows 运维与实网行情已实际执行。**尚未正式接管、部署或发布。**
+- 本轮修复 3 个实际缺陷：Windows 只读句柄 `fsync` 失败导致备份/恢复/接管/迁移 42 项测试全红（S1）；收盘后刷新不写证券名称导致名称缺失（S2）；验收脚本 `exact=True` 标签定位在 Chromium 141 失效（工具）。
+- 实际通过：`npm ci` 52 包；`vue-tsc --noEmit` exit 0；`vite build` exit 0（dist/index.html 416B、CSS 2.31kB、JS 191.47kB）；`npm test` 63 PASS；`pytest -q` **339 PASS**（含新增名称测试）；真实 Chromium 演示 10 项 + 安全 4 组 + 期初/分红 2 项 PASS。
+- Windows：合成演示（中文含空格路径）启动/停止/端口 9092 正常，FastAPI 托管新 dist；合成正式库备份→写者锁→停机恢复 generation 1→2→旧世代拒绝→重启登录 PASS；正式模式网页一键备份 PASS。
+- 实网：腾讯源 510300/159915/600519 当日与前一交易日未复权收盘、来源/时点 PASS；真实名称已写入（沪深300ETF华泰柏瑞/创业板ETF易方达/贵州茅台）。日历 XSHG 4.13.1 指纹 PASS，可信上限仍 2026-12-31。
+- 阻断/未跑：2027 官方日历（上交所仅有 2026 安排）BLOCKED；Tailscale 双机（本机未安装、无第二设备）BLOCKED；真实旧库试迁移（无授权安全副本）BLOCKED；四项产品候选未确认；独立审查关闭未完成。npm 10.9.7 与脚本锁定 10.9.2 有补丁差异，手工路径绕开 `windows.ps1 -Action Build`。
+- 下一步：用户确认四项口径与真实旧库/部署授权 → 2027 官方日历取得后更新锁文件 → 独立审查 → 正式接管与发布。详见 `10_LOCAL_ACCEPTANCE_REPORT.md`、`10_HANDOFF.md`。

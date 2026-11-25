@@ -520,7 +520,7 @@ function ndxText(aux:Fact):string{
 const basisLabels:Record<string,string>={index_level:'指数点位',etf_unadjusted:'ETF 未复权',etf_adjusted:'ETF 复权价'}
 const basisText=(v:unknown)=>basisLabels[str(v)]??(str(v)||'未标注')
 /** Flatten the pool item into display values; no numbers are recomputed in the browser. */
-const strategyRows=computed(()=>pool.value?facts(pool.value.items).map(item=>{
+const strategyRows=computed<Fact[]>(()=>pool.value?facts(pool.value.items).map(item=>{
   const gap=nested(item.gap), factor=nested(item.factor), combo=nested(item.combo), series=nested(item.series), base=nested(item.regime)
   return {...item,
     id:`${str(item.index_id)}`,

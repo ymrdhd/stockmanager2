@@ -103,6 +103,7 @@ class TencentProvider:
         self._last_call: float | None = None
         self._cooldown_until = 0.0
         self._now = now
+        self._names: dict[str, str] = {}
 
     def close(self) -> None:
         if self._client is not None:
@@ -355,6 +356,25 @@ class TencentQuoteProvider(TencentProvider):
             return False
         return True
 
+    def _security_name(self, code: str) -> str:
+        """Return the provider's current name for a quote code, cached per process.
+
+        Daily bars carry no name, so a close-only refresh (after hours or an idle
+        machine) would otherwise leave the instrument nameless. A refusal here
+        must never fail the price evidence.
+        """
+        cached = self._names.get(code)
+        if cached is not None:
+            return cached
+        try:
+            name = _quote_fields(self._request_text(f"{QUOTE_URL}{code}"), code[2:])[1].strip()
+        except TencentError:
+            return ''
+        if 0 < len(name) <= 120 and '\ufffd' not in name:
+            self._names[code] = name
+            return name
+        return ''
+
     def closes(self, instrument: dict, days: set[date], now: datetime) -> list[dict]:
         if not days:
             return []
@@ -390,7 +410,13 @@ class TencentQuoteProvider(TencentProvider):
                            "observed_at": closed, "trading_day": session, "kind": "close",
                            "quality": "valid", "source": "tencent:unadjusted_daily",
                            "price_basis": "unadjusted_security"})
-        return sorted(result, key=lambda item: item["trading_day"])
+        result.sort(key=lambda item: item["trading_day"])
+        if result:
+            name = self._security_name(code)
+            if name:
+                # Attach to the newest bar only; older evidence keeps its own timestamp.
+                result[-1]["instrument_name"] = name
+        return result
 
 
 __all__ = ["CLOSE_DELAY", "KLINE_URL", "RAW_KLINE_URL", "SECURITY_PREFIXES", "TencentError",

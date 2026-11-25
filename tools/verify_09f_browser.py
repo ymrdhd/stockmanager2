@@ -1,4 +1,4 @@
-"""Unrun here. Real Playwright browser smoke/duplicate-intent check on a NEW synthetic demo only."""
+"""Real Playwright browser smoke/duplicate-intent check on a NEW synthetic demo only."""
 import argparse
 from getpass import getpass
 from urllib.parse import urlparse
@@ -27,12 +27,12 @@ def main():
             page.get_by_role('button',name='交易',exact=True).click()
             page.get_by_role('button',name='录入买入 / 卖出',exact=True).click()
             form=page.locator('section[aria-label="业务表单"]');expect(form).to_be_visible()
-            form.get_by_label('证券账户',exact=True).select_option(securities['id']);form.get_by_label('证券标的',exact=True).select_option(instrument['id'])
-            form.get_by_label('方向',exact=True).select_option('buy');form.get_by_label('成交数量（股）',exact=True).fill('10');form.get_by_label('实际成交价格（元，最多四位小数）',exact=True).fill('4.2');form.get_by_label('成交费用（元；未知留空）',exact=True).fill('0');form.get_by_label('真实成交时间（北京时间）',exact=True).fill('2026-01-08T10:00');page.on('dialog',lambda d:d.accept())
-        a.locator('section[aria-label="业务表单"]').get_by_role('button',name='确认提交').click()
+            form.get_by_label('证券账户').select_option(securities['id']);form.get_by_label('证券标的').select_option(instrument['id'])
+            form.get_by_label('方向').select_option('buy');form.get_by_label('成交数量（股）').fill('10');form.get_by_label('实际成交价格（元，最多四位小数）').fill('4.2');form.get_by_label('成交费用（元；未知留空）').fill('0');form.get_by_label('真实成交时间（北京时间）').fill('2026-01-08T10:00');page.on('dialog',lambda d:d.accept())
+        a.locator('section[aria-label="业务表单"]').get_by_role('button',name='确认提交',exact=True).click()
         # B's existing form is the same outstanding intent even if A has finished.
         expect(a.get_by_text('提交已确认。',exact=False)).to_be_visible(timeout=15000)
-        b.locator('section[aria-label="业务表单"]').get_by_role('button',name='确认提交').click(timeout=10000)
+        b.locator('section[aria-label="业务表单"]').get_by_role('button',name='确认提交',exact=True).click(timeout=10000)
         expect(b.get_by_role('alert').filter(has_text='意图')).to_be_visible(timeout=15000)
         after=read('/trades?limit=500');assert after['total']==before['total']+1
         added=[x for x in after['items'] if x['id'] not in {t['id'] for t in before['items']}];assert len(added)==1 and added[0]['status']=='effective'

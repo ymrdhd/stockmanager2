@@ -13,6 +13,7 @@ from backend.infrastructure.backup import create_backup
 from backend.infrastructure.binding import Binding, load_binding, publish_binding
 from backend.infrastructure.database import (DatabaseError, DatabaseSettings, _single_file,
     read_identity, validate_binding, validate_identity, writer_lock)
+from backend.infrastructure.durability import fsync_file
 from backend.infrastructure.restore import check_backup
 
 
@@ -121,8 +122,7 @@ def _publish_db(source, destination):
     temp = destination.with_name('.takeover-'+uuid4().hex+'.sqlite')
     try:
         shutil.copyfile(source, temp)
-        with temp.open('rb') as f:
-            os.fsync(f.fileno())
+        fsync_file(temp)
         os.replace(temp, destination)
         _sync_dir(destination.parent)
     finally:

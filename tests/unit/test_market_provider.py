@@ -163,6 +163,20 @@ def test_closes_returns_only_requested_completed_sessions_on_raw_endpoint():
     assert 'param=sh510300,day' in calls[0]
 
 
+def test_closes_attaches_provider_name_so_an_after_close_refresh_has_names():
+    """Daily bars carry no name; a close-only refresh must still record the real name."""
+    calls: list[str] = []
+    payload = daily_payload('sh510300', [
+        ['2026-11-24', '4.065', '4.033', '4.084', '4.031', '13717503.000'],
+    ])
+    text = quote_line('sh', '510300', '4.033', '4.065', '20261124161458', '沪深300ETF')
+    quotes = provider_for(calls, text=text, daily=payload).closes(
+        instrument('510300', 'SH', 'etf', name=''), {date(2026, 11, 24)}, local(24, 21))
+    assert [q['trading_day'] for q in quotes] == [date(2026, 11, 24)]
+    assert quotes[-1]['instrument_name'] == '沪深300ETF'
+    assert any('q=sh510300' in call for call in calls)
+
+
 @pytest.mark.parametrize('code,market,kind,rows,day,price', [
     ('159915', 'SZ', 'etf',
      [['2026-11-23', '2.203', '2.295', '2.314', '2.202', '1.000']], date(2026, 11, 23), '2.295'),

@@ -17,3 +17,12 @@
 - 不修改策略、账本或产品阈值；2% 仍待产品确认。完整 Vue 构建/浏览器及本地验收未完成。
 - 详见 `09J_REPORT.md`、`09J_HANDOFF.md`。
 - 最终交接补充：复现并修复次查询网络故障仍可写入，统一禁写与分页上报、旧连接代次保护；新增3项前端测试。338 Python全量（修复前）/18受影响专项（修复后）、63前端自动化及限定TS通过。正式Vue仍缺依赖，未发布。
+
+# 10-local-acceptance
+- BASE `00c2d143f96b0d51e2dca7b5848f477c08071e73`（09J-web-handoff）；分支 `10-local-acceptance`。
+- 修复 Windows 只读句柄 `fsync` 失败（新增 `durability.fsync_file`），恢复备份/恢复/接管/迁移在 Windows 的可用性；42 项原失败转 PASS。
+- 修复收盘后证券名称不写入：腾讯日线刷新附加真实名称，新增 1 项测试；实网核对 510300/159915/600519。
+- 修复 `WorkspacePage.vue` 策略行推断类型导致的 `vue-tsc` TS2339；首次完成正式 Vue typecheck 与 Vite 生产构建。
+- 修复浏览器验收脚本标签定位（Chromium 141 可访问名含选项文本）。
+- 实际执行 Windows 合成演示、真实浏览器 16 项、合成正式库启停/单写者/备份/恢复/旧世代拒绝、实网行情与日历指纹；文档更新见 `10_LOCAL_ACCEPTANCE_REPORT.md`、`10_HANDOFF.md`。
+- 未改数据库 schema、核心策略公式、ATR/冷却规则、产品阈值与依赖锁；未接管或覆盖真实库，未部署发布。

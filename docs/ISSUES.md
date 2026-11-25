@@ -186,3 +186,19 @@
 | 09D-001～017 | 09I功能矩阵与候选口径保留；全量338 PASS，前端修改后18项安全/审计专项及63项Node测试PASS，重叠不相加。不是逐项关闭裁决。 |
 | 09D-018 | 本轮正式 typecheck/build 前置 FAIL（vue-tsc not found，127），Vite/真实浏览器 NOT RUN。限定普通TS及自动化PASS不替代生产编译。 |
 | 09D-019 | 现有日历指纹PASS，2027官方资料未导入；可信截止不变。 |
+
+## 10 本地验收处置（开发者实测，非独立关闭裁决）
+
+| 编号 | 现象与证据 | 影响 | 处置/状态 |
+|---|---|---|---|
+| 10-001 | Windows 上对只读句柄调用 `os.fsync` 抛 `OSError: [Errno 9] Bad file descriptor`（`backup.py`/`restore.py`/`takeover.py`），首次全量回归 42 FAIL（备份、恢复、接管、升级迁移、每日保留） | S1：Windows 目标平台的备份/恢复/接管全部不可用 | FIXED：新增 `backend/infrastructure/durability.py::fsync_file`（`r+b` 句柄，Windows `FlushFileBuffers` 需写权限），三处替换。定向下 38+96 项 PASS，最终全量 339 PASS。待独立审查 |
+| 10-002 | 收盘后刷新只取日线，日线不含名称；`instrument_name` 仅盘中 `spot` 返回，导致名称长期为 null、名称搜索失效（实测合成库 3 个标的 name 全空） | S2：V1.0「真实证券名称」不可用 | FIXED：`TencentProvider` 增加进程内名称缓存并在 `closes` 最新 bar 附加 `instrument_name`；失败不影响价格证据。新增 `test_closes_attaches_provider_name_...`；实网写入「沪深300ETF华泰柏瑞」「创业板ETF易方达」「贵州茅台」。待独立审查 |
+| 10-003 | `tools/verify_09f_browser.py` 用 `get_by_label(..., exact=True)`；Chromium 141 的可访问名包含 `<select>` 选项文本，定位超时 | 工具：真实浏览器防重用例无法执行 | FIXED：仅改为非精确标签定位，按钮仍 `exact=True`；真实双页面用例 PASS。不改业务断言 |
+| 09D-018 | 生产构建与真实浏览器 | 发布阻断 | **本轮 PASS**：`npm ci` 52 包、`vue-tsc --noEmit` exit 0（修复 `WorkspacePage.vue` strategyRows 推断类型 TS2339）、`vite build` exit 0、`npm test` 63 PASS；Chromium 141 真实浏览器扩展 16 项 PASS（另 09F 双标签 1 项）。待独立审查 |
+| ISS-022 | 真实行情 | 发布阻断 | **本轮实测通过**：腾讯源 510300/159915/600519 六项 spot/daily 均 valid、未复权、时点正确；名称已写入。历史 OPEN 由独立审查关闭 |
+| ISS-019 / 09D-019 | 2027 可信日历 | 发布阻断 | **BLOCKED**：2026-11-25 抓取上交所「休市安排」官方页仅有 2026 年公告与安排，无 2027 资料；不猜测、不更新锁文件，到期安全闸门保留 |
+| 新增 | Tailscale 私有 HTTPS 与双电脑 | 发布阻断 | **BLOCKED**：本机未安装 Tailscale，无第二台设备与公司许可；未做 Serve/Funnel 配置 |
+| 新增 | 真实旧库只读试迁移与逐项对账 | 发布阻断 | **BLOCKED**：本轮无用户授权的真实库一致性副本；仅合成夹具与自动化覆盖，未宣称真实迁移通过 |
+| 观察-1 | 超量卖出且费用留空时，待核对原因为 `unknown_fees`（先于 `insufficient_lots` 判定）；记录为 pending，不生效、不扣批次 | 提示原因不够直观，但拒绝生效路径安全 | 仅记录，待产品/审查决定是否调整原因优先级；不改校验 |
+| 观察-2 | 沙盒模式点「一键备份」返回 403 后，页面进入「禁止写入」直至显式重新读取 | 安全侧 fail-closed；交互略重 | 仅记录；正式服务模式一键备份实测 PASS |
+| 环境 | npm 10.9.7（脚本 `Assert-Node` 锁定 10.9.2） | `windows.ps1 -Action Install/Build` 会拒绝 | 仅记录；本轮按任务书手工 `npm ci`/`build`，未改环境守卫、未降级断言 |
