@@ -109,7 +109,7 @@ test('trade form keeps exact price and explicit specified batch, account creatio
 test('data-quality reason codes are readable without hiding unknown codes',()=>{
   assert.equal(reasonText('pending_trade'),'存在待核对成交')
   assert.equal(reasonText('account-1:unverified_balance_or_equity'),'account-1：账户余额或证券权益尚未核实')
-  assert.equal(reasonText('liquidity_classification_unknown:account-2'),'账户 account-2：其他资产/负债的流动性分类未核实')
+  assert.equal(reasonText('liquidity_classification_unknown:account-2'),'账户 account-2：流动性分类待确认（受限/不受限），暂不计入流动资产')
   assert.equal(reasonText('510300:current_quote_stale'),'510300：当前报价已过期')
   assert.equal(reasonText('future_reason_code'),'future_reason_code')
   assert.equal(display(['pending_trade','equity_reconciliation_difference'],'reasons'),'存在待核对成交；证券权益与真实资金/持仓事实存在差额')

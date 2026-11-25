@@ -29,7 +29,7 @@ def create(root: Path):
     now=datetime.now(UTC)
     with open_database(settings) as db:
         t=TradeService(db); f=FinanceService(db); p=PortfolioService(db)
-        accounts={kind:t.create_account(AccountInput(request_id='demo-account-'+kind,name='演示-'+label,kind=kind,effective_at='2025-12-01T08:00:00+08:00'))['id'] for kind,label in [('securities','证券'),('bank','储蓄'),('cash','钱包')]}
+        accounts={kind:t.create_account(AccountInput(request_id='demo-account-'+kind,name='演示-'+label,kind=kind,effective_at='2025-12-01T08:00:00+08:00',liquidity_status='liquid'))['id'] for kind,label in [('securities','证券'),('bank','储蓄'),('cash','钱包')]}
         a=accounts['securities']
         t.cash(CashInput(request_id='demo-capital',account_id=a,kind='opening',amount_fen=100_000_000,occurred_at='2025-12-01T09:00:00+08:00',note='合成示例，不是真实资金'))
         instruments={}

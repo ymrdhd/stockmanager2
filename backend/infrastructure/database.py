@@ -19,8 +19,8 @@ from sqlalchemy.engine import URL, Engine
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE = ROOT / 'data' / 'stock_manager.sqlite'
 DEFAULT_BINDING = ROOT / "data" / "official.json"
-SCHEMA_VERSION = 11
-REVISION = '0011'
+SCHEMA_VERSION = 12
+REVISION = '0012'
 BUSY_TIMEOUT_MS = 5000
 Role = Literal['formal', 'sandbox', 'backup']
 InitialRole = Literal['formal', 'sandbox']
@@ -160,7 +160,7 @@ def read_identity(conn: sqlite3.Connection, *, allow_previous: bool = False) -> 
         versions = conn.execute('SELECT version_num FROM alembic_version').fetchall()
         if len(rows) != 1:
             raise DatabaseError('invalid metadata row count')
-        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006', 7: '0007', 8: '0008', 9: '0009', 10: '0010'} if allow_previous else {})}
+        expected = {SCHEMA_VERSION: REVISION, **({1: '0001', 2: '0002', 3: '0003', 4: '0004', 5: '0005', 6: '0006', 7: '0007', 8: '0008', 9: '0009', 10: '0010', 11: '0011'} if allow_previous else {})}
         if rows[0][3] not in expected or versions != [(expected[rows[0][3]],)]:
             raise DatabaseError('incompatible database metadata or Alembic revision')
         identity = Identity(*rows[0])

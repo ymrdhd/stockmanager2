@@ -16,7 +16,7 @@
 | 表 | 最重要字段 | 不变量 |
 |---|---|---|
 | `system_metadata` | `database_uuid`, `instance_role`, `generation`, `schema_version`, `created_at` | 正式启动身份/角色校验 |
-| `accounts` | `id`, `kind`, `currency`, `balance_mode`, `status` | `balance_mode∈{manual_snapshot,ledger}`；历史沿用手工余额模式 |
+| `accounts` | `id`, `kind`, `currency`, `balance_mode`, `status`, `liquidity_status` | `balance_mode∈{manual_snapshot,ledger}`；历史沿用手工余额模式；`liquidity_status∈{liquid,restricted,unknown}`（默认 `unknown`，迁移不伪造分类） |
 | `instruments` | `id`, `code`, `market`, `currency`, `price_scale` | `(market, code)` 唯一；不能用指数点位冒充 ETF 价格 |
 | `trade_executions` | `id`, `request_id`, `account_id`, `instrument_id`, `side`, `quantity`, `price`, `fees_fen`, `executed_at`, `external_id`, `status`, `correction_of` | 每笔真实成交独立行；请求去重；审计更正 |
 | `trade_lots` | `id`, `open_execution_id`, `strategy_id`, `lot_role`, `signal_date`, `frozen_atr`, `opened_qty` | 主仓/子仓独立；信号日 ATR 不漂移 |
@@ -28,6 +28,7 @@
 | `quotes` 或行情缓存 | `instrument_id`, `effective_at`, `value_decimal`, `source`, `quality`, `is_proxy` | 不写交易事实；过期禁止误报实时 |
 | `valuation_snapshots` | `as_of`, `ledger_revision`, `quote_revision`, `equity_fen`, `quality` | 可重算，必须匹配源版本 |
 | `audit_events` | `id`, `entity`, `entity_id`, `event`, `request_id`, `at`, `actor`, `details` | 更正可追溯，禁止悄悄删改 |
+| `account_liquidity_events` | `id`, `account_id`, `previous_status`, `liquidity_status`, `effective_at`, `reason`, `kind` | 受限/不受限分类的分时点证据；历史查询只用当时已记录的分类，不用当前分类倒推 |
 | `alembic_version` | `version_num` | 单向有序迁移，版本不允许分叉 |
 
 **必要索引/约束**：`trade_executions.request_id UNIQUE`；如果存在稳定券商 ID，则 `(account_id, external_id) UNIQUE WHERE external_id IS NOT NULL`；`quantity > 0`, `price > 0`, `fees_fen >= 0`, 外键启用 `PRAGMA foreign_keys=ON`；账户/证券/批次状态有 `CHECK`；各视图使用有效记录而非全部历史更正行。

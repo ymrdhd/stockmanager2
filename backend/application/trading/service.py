@@ -42,6 +42,10 @@ class AccountInput(Input):
     kind: Literal['securities','bank','cash','payment','other_asset','credit_card','other_liability'] = 'securities'
     included: bool = Field(default=True, strict=True)
     effective_at: datetime | None = None
+    # Restricted/liquid classification is explicit evidence, never inferred from kind.
+    # Liabilities keep 'unknown' because the approved liquidity basis classifies them
+    # separately from the asset restriction marker.
+    liquidity_status: Literal['liquid','restricted','unknown'] = 'unknown'
 
     @field_validator('effective_at', mode='before')
     @classmethod
@@ -56,6 +60,9 @@ class AccountInput(Input):
             raise ValueError('manual account requires effective timestamp')
         if self.effective_at is not None and (self.effective_at.utcoffset() is None or not 1900 <= self.effective_at.year <= 9998):
             raise ValueError('account timestamp must have timezone and supported year')
+        if self.kind in ('credit_card','other_liability') and self.liquidity_status != 'unknown':
+            raise ValueError('liability accounts follow the approved current-liability basis; '
+                             'the asset restriction marker does not apply')
         return self
 
 
@@ -396,10 +403,17 @@ class TradeService:
             if data.effective_at is None:
                 raise TradeError('new account requires confirmed effective time')
             id_ = uid()
-            conn.execute("INSERT INTO accounts VALUES (?,?,?,'CNY',?,'active',?,?,?)", (id_, data.name, data.kind,
-                         'ledger' if data.kind=='securities' else 'manual_snapshot',
-                         'liability' if data.kind in ('credit_card','other_liability') else 'asset',
-                         int(data.included), utc(data.effective_at) if data.effective_at else None))
+            conn.execute("INSERT INTO accounts (id,name,kind,currency,balance_mode,status,asset_class,"
+                         "included,effective_at,liquidity_status) VALUES (?,?,?,'CNY',?,'active',?,?,?,?)",
+                         (id_, data.name, data.kind,
+                          'ledger' if data.kind=='securities' else 'manual_snapshot',
+                          'liability' if data.kind in ('credit_card','other_liability') else 'asset',
+                          int(data.included), utc(data.effective_at), data.liquidity_status))
+            # Record the explicit creation-time classification (even 'unknown') so
+            # historical queries never apply a later confirmation to an earlier date.
+            conn.execute('INSERT INTO account_liquidity_events VALUES (?,?,?,?,?,?,?)',
+                         (uid(), id_, 'unknown', data.liquidity_status, utc(data.effective_at),
+                          '账户创建时的流动性分类', 'initial'))
             audit(conn,'account',id_,'created',data.request_id,value)
             result = one(conn, 'SELECT * FROM accounts WHERE id=?', (id_,))
             conn.execute('UPDATE ledger_state SET ledger_revision=ledger_revision+1 WHERE id=1')

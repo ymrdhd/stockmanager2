@@ -55,9 +55,9 @@ UUID 和 generation 只能识别版本，**不能远程阻止失联旧机器写�
 
 ## 6. 07-remote 实际启动与远程访问步骤
 
-以下命令已在本机实现并实测（Windows 11、Python 3.11、Node 24）；Tailscale 双机接入与公司 IT 授权尚未执行，标记 NOT RUN。
+以下命令已在本机实现并实测（Windows 11、Python 3.11.9/3.14.4、Node 22.22.2 与 24.19.0）；Tailscale 双机接入与公司 IT 授权尚未执行，标记 NOT RUN。
 
-安装（仅公司电脑，一次）：`uv sync --locked` → `cd frontend && npm ci && npm run build && cd ..`。
+安装（仅公司电脑，一次）：`uv sync --locked` → `cd frontend && npm ci && npm run build && cd ..`。版本范围：Python ≥3.11（uv 按 `pyproject` 与 `uv.lock` 选择，已验证 3.11.9/3.14.4）；Node.js 22.13+（22.x，已验证 22.22.2）；npm 10.9.x（Node 22.13+ 自带，已验证 10.9.2/10.9.7）。`tools/windows.ps1 -Action Install` 按上述范围检查并执行同样步骤；不要用 npm 11/Node 24 的全局环境替代验证过的 22.x 工具链。
 
 初始化正式库并设置凭据（一次，凭据按需轮换）：`python start.py init-database --database <绝对路径>\data\official.sqlite --confirm`，再 `python start.py set-password --host 127.0.0.1:9091 --host <机器名>.<tailnet>.ts.net`（密码经 getpass 交互输入，只存 scrypt 哈希到 `data/auth.json`，文件权限 0600，不入包不入库）。**Host 必须写成浏览器实际发出的值**：经 Tailscale Serve 的 HTTPS 走 443，浏览器 Host 头不带端口，因此登记 `<机器名>.<tailnet>.ts.net`，不要写 `<主机名>:9091` 或 `<主机名>:443`；只有确实以非默认端口访问时才登记 `主机名:端口`。不使用通配符放行。
 

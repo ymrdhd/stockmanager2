@@ -37,5 +37,6 @@
 - ADR-018 | 已采纳（同上） | **当日投资收益率**：当日投资盈亏 ÷ 上一有效交易日收盘证券权益，**显示两位小数**；分母缺失或非正数时不计算（返回 `null` 并给出原因码）。非 TWR/MWR。影响 `PortfolioService._valuation` 与 `FinanceService._overview` 的 `daily_return_pct`/`investment_daily_return_pct`；本次由 `.6f` 收敛为 `.2f`。回退：改回 `.6f` 并还原 `test_09f_features` 断言。
 - ADR-019 | 已采纳（同上） | **流动净资产**：流动资产 − 流动负债；纳入现金、银行卡、支付账户和可变现证券（证券按权益计入一次），排除受限资产；`other_asset`/`other_liability` 等未知分类时明确提示待确认并停止计算完整指标，不以已知部分冒充全额。影响 `_overview` 的 `liquid_assets_fen`/`liquid_net_worth_fen`/`liquidity_reasons` 与 `amount_evidence`。回退：同上，仅文档回退。
 - ADR-020 | 已采纳（同上） | **接近止损预警**：距有效保护价 2%（`near_stop_bps=200`）以内提示，仅用于风险预警，**不改变 V9/G2 原始策略规则**（不改 ATR、主/子仓、信号时点、质量闸门、保护动作）；NDX T5 继续使用独立规则。影响 `StrategyService._near_stop`、`stop_distance` 与 `start.py --near-stop-bps`。回退：调整 `--near-stop-bps` 或清空显示字段，策略计算不变。
+- ADR-021 | 已采纳（2026-11-25 用户批准 10C 方案 B，补充 ADR-019 实现字段） | **受限资产明确标记**：新增 `accounts.liquidity_status`（`liquid` 已确认不受限 / `restricted` 已确认受限 / `unknown` 尚未确认，默认 `unknown`）与 `account_liquidity_events`（分类生效时点、前后状态、原因）；分类修改同时写 `audit_events`。受限资产仍计入总资产与总净资产，但不计入流动资产与流动净资产；`unknown` 不计算完整流动指标并逐账户提示，旧库迁移及无证据账户一律保留 `unknown`，不得自动认定为不受限。负债流动性继续按 ADR-019 的现行流动负债口径，不使用资产受限标记。同一账户只有部分资金受限时，V1 采用拆分账户记录。历史查询只使用该时点之前已记录的分类证据，不用当前分类倒推。回退：保留字段与事件审计，计算层可临时恢复仅按 `kind` 的旧口径（会重新引入高估风险，不推荐）。
 
 批准的是产品口径，不是部署授权：真实数据库操作、正式接管与发布仍须用户单独明确授权。

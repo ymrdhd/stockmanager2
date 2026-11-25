@@ -218,7 +218,20 @@
 
 | ID | 现象 | 影响 | 建议 |
 |---|---|---|---|
-| 10A-001 | accounts schema（`migrations/versions/0006_finance.py`）无「受限资产」标记字段，排除受限资产的唯一路径是账户 `kind` 落在 `other_asset`/`other_liability`，触发 `liquidity_classification_unknown:<id>` 并停止计算 `liquid_net_worth_fen` | 真实受限资金（如冻结、保证金）当前无法既「明确排除」又「保持其他流动资产可计算」，只能整体降级为待确认 | 仅在产品明确要求时新增受限资产标记迁移；本轮不动 schema |
+| 10A-001 | accounts schema（`migrations/versions/0006_finance.py`）无「受限资产」标记字段，排除受限资产的唯一路径是账户 `kind` 落在 `other_asset`/`other_liability`，触发 `liquidity_classification_unknown:<id>` 并停止计算 `liquid_net_worth_fen` | 真实受限资金（如冻结、保证金）当前无法既「明确排除」又「保持其他流动资产可计算」，只能整体降级为待确认 | **已由 10C 修复**（ADR-021，Alembic `0012`）：新增账户级三态分类与分时点证据，见下节 |
 | 10A-002 | 前端 `WorkspacePage.vue:638`、`:665` 直接拼接 `investment_daily_return_pct`/`daily_return_pct` 字符串加 `%`；后端改为两位小数后展示为 `6.67%` | 展示层无需改动即符合口径 | 若后续需要千分位或正负号样式，另立任务 |
-| 10A-003 | `liquidity_basis` 文案仍为 `legacy_current_liabilities; unclassified other assets/liabilities withheld`（`finance.py:714`），未显式写「排除受限资产」 | 接口语义完整，措辞与批准文本不完全对齐 | 文案级差异，未改代码；如需与批准文本逐字一致可单独修 |
+| 10A-003 | `liquidity_basis` 文案仍为 `legacy_current_liabilities; unclassified other assets/liabilities withheld`（`finance.py:714`），未显式写「排除受限资产」 | 接口语义完整，措辞与批准文本不完全对齐 | **已由 10C 修复**：文案改为显式说明受限资产排除、待确认分类不计算、负债按现行流动负债口径；前端同步显示口径与拆分记录操作说明 |
+
+## 10C 最终最小补丁处置（开发者实测，非独立关闭裁决）
+
+依据 10B 独立审查（10B-001 S2、10B-002 S2、10B-003 S3），本轮采用受限资产明确标记方案 B，不扩大 V1.0 功能范围。
+
+| 编号 | 本轮实际处理 | 状态 |
+|---|---|---|
+| 10B-001 / 10A-001 | **受限资产识别**：Alembic `0012` 新增 `accounts.liquidity_status`（`liquid`/`restricted`/`unknown`，默认 `unknown`）与 `account_liquidity_events`（`previous_status`、`liquidity_status`、`effective_at`、`reason`、`kind`）；`POST /api/v1/accounts/{id}/liquidity` 记录分类并以 `expected_ledger_revision` 做 CAS；每次变更写 `audit_events(event='liquidity_changed')`。`_overview` 只把 `liquid` 资产账户计入流动资产，`restricted` 计入 `restricted_assets_fen` 且仍在总资产/净资产，`unknown` 使 `liquid_assets_fen`/`liquid_net_worth_fen` 为 null 并逐账户提示；负债沿用现行流动负债口径且拒绝设置该标记。历史查询按 `effective_at` 取当时证据，无证据即待确认。旧库升级不写任何分类事件，全部保持 `unknown`。账户页新增「流动性分类」表单、列与说明，含部分受限资金的拆分账户操作说明。 | FIXED，待定向复审；证据 `tests/unit/test_10c_restricted_assets.py`（7 项）与真实 Chromium 9/9 |
+| 10B-002 | **安装脚本版本守卫**：`tools/windows.ps1` 把 npm 精确 `10.9.2` 改为 `10.9.x`（主版本 10 且次版本 ≥9），Node 保持 `>=22.13.0 <23`；新增 `.venv` Python ≥3.11 检查（uv 按 `requires-python >=3.11` 与 `uv.lock` 选择）。未删除检查、未改依赖锁。实测 Node 22.22.2 / npm 10.9.7 下 `-Action Install` 完整通过；npm 11.17.0、Node 24 仍被明确拒绝。 | FIXED，待定向复审；证据 `10C_TEST_REPORT.md` |
+| 10B-003 | **冷却 regime 文档措辞**：`docs/reference/strategy_rule_map.md` 改为按当次评估日 G2 regime 计算；未改 `cooldown_required_days`、3/10 日阈值、`cooldown_until_date` 或任何策略公式。`test_cooldown_days_depend_on_regime_and_exit_action` 保持通过。 | FIXED（文档），待定向复审 |
+| 10B-004 | 近止损只读单一报价价：**按审查建议不改**。ADR-020 措辞为「持仓报价距有效保护价」，真实退出仍用 `bar.low`/`bar.open`，模型 `STOP` 会在 `action` 中显示。 | 保持现状，记录不升级 |
+| 观察（成本） | `other_asset` 不再被无条件视为「未知分类」——其流动性现在取决于账户 `liquidity_status`。旧库中的 `other_asset` 账户升级后为 `unknown`，仍提示待确认；不会因此高估流动净资产。 | 行为变更已记录于 ADR-021 |
+
 

@@ -25,8 +25,10 @@ from test_pnl import at, cash, quote, legacy_trading
 from test_database_upgrade import cfg_for
 
 
-def manual(svc,name,kind='bank',day=5,included=True):
-    return svc.create_account(AccountInput(request_id='account-'+name,name=name,kind=kind,effective_at=at(day,7),included=included))['id']
+def manual(svc,name,kind='bank',day=5,included=True,liquidity=None):
+    # Explicit classification in fixtures: migrated/unknown accounts are fail-closed.
+    status=liquidity or ('unknown' if kind in ('credit_card','other_liability') else 'liquid')
+    return svc.create_account(AccountInput(request_id='account-'+name,name=name,kind=kind,effective_at=at(day,7),included=included,liquidity_status=status))['id']
 
 
 def balance(f,a,amount,req='balance',day=5,hour=8,expected=None):

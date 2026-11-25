@@ -98,7 +98,7 @@ export function reasonText(value: unknown): string {
   const raw = value.trim()
   if (!raw) return '未提供原因'
   if (raw.startsWith('liquidity_classification_unknown:')) {
-    return `账户 ${raw.slice('liquidity_classification_unknown:'.length)}：其他资产/负债的流动性分类未核实`
+    return `账户 ${raw.slice('liquidity_classification_unknown:'.length)}：流动性分类待确认（受限/不受限），暂不计入流动资产`
   }
   const separator = raw.indexOf(':')
   if (separator > 0) {

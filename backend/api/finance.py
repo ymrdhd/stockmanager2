@@ -6,6 +6,7 @@ from backend.api.trading import invoke, service
 from backend.application.finance import (
     FinanceService, AccountUpdate, BalanceInput, BillInput, CategoryInput,
     TransferInput, CashCorrection, VoidInput, month_start, TransferReconciliation, AccountScope, AccountEffective,
+    LiquidityInput,
 )
 from backend.application.portfolio import day_of
 
@@ -123,6 +124,11 @@ router.add_api_route('/company-events',reader('company-events'),methods=['GET'],
 @router.post('/accounts/{id}/scope')
 def account_scope(id: str, data: AccountScope, svc: Service):
     return invoke(svc.set_account_scope,id,data)
+
+
+@router.post('/accounts/{id}/liquidity')
+def account_liquidity(id: str, data: LiquidityInput, svc: Service):
+    return invoke(svc.set_account_liquidity,id,data)
 
 
 @router.post('/accounts/{id}/effective-date')

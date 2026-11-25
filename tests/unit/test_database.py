@@ -54,7 +54,7 @@ def test_db01_init(formal: tuple[Path, Identity]) -> None:
         assert conn.execute('PRAGMA foreign_keys').fetchone() == (1,)
         assert conn.execute('PRAGMA busy_timeout').fetchone() == (5000,)
         assert conn.execute('SELECT version_num FROM alembic_version').fetchone() == (REVISION,)
-        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'system_metadata', 'alembic_version', 'accounts', 'instruments', 'trade_executions', 'trade_lots', 'lot_allocations', 'cash_movements', 'audit_events', 'ledger_state', 'ledger_requests', 'opening_positions', 'company_events', 'quotes', 'quote_state', 'quote_resolutions', 'finance_categories', 'finance_transactions', 'finance_transfers', 'balance_adjustments', 'account_scope_events', 'transfer_reconciliation_gaps', 'strategy_bars', 'strategy_signals', 'strategy_plans', 'strategy_positions', 'strategy_cooldowns', 'strategy_ndx_aux'}
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'system_metadata', 'alembic_version', 'accounts', 'instruments', 'trade_executions', 'trade_lots', 'lot_allocations', 'cash_movements', 'audit_events', 'ledger_state', 'ledger_requests', 'opening_positions', 'company_events', 'quotes', 'quote_state', 'quote_resolutions', 'finance_categories', 'finance_transactions', 'finance_transfers', 'balance_adjustments', 'account_scope_events', 'transfer_reconciliation_gaps', 'account_liquidity_events', 'strategy_bars', 'strategy_signals', 'strategy_plans', 'strategy_positions', 'strategy_cooldowns', 'strategy_ndx_aux'}
 
 
 def test_db02_no_overwrite(formal: tuple[Path, Identity], tmp_path: Path) -> None:

@@ -59,6 +59,12 @@ class AccountUpdate(RequestInput):
     expected_ledger_revision: int = Field(strict=True, ge=0)
 
 
+class LiquidityInput(FactInput):
+    # Explicit three-state marker: never infer 'liquid' from the absence of evidence.
+    status: Literal['liquid', 'restricted', 'unknown']
+    expected_ledger_revision: int = Field(strict=True, ge=0)
+
+
 class TransferInput(FactInput):
     from_account_id: str
     to_account_id: str
@@ -161,6 +167,26 @@ def scope_at(conn: sqlite3.Connection, account: dict, cutoff: str) -> bool:
     return bool(event[0] if event else account['included'])
 
 
+LIQUIDITY_DISPLAY = {
+    'liquid': '有效流动性（可计入流动资产）',
+    'restricted': '受限资产（计入总资产，不计入流动资产）',
+    'unknown': '待确认（不计入流动资产）',
+}
+
+
+def liquidity_status_at(conn: sqlite3.Connection, account: dict, cutoff: str) -> tuple[str, str | None]:
+    """Classification evidence effective at the cutoff, never a retroactive guess.
+
+    A migrated account without any recorded classification stays 'unknown' for every
+    date; the absence of evidence must not be reported as an unrestricted asset.
+    """
+    event = conn.execute(
+        'SELECT liquidity_status,effective_at FROM account_liquidity_events '
+        'WHERE account_id=? AND effective_at<=? ORDER BY effective_at DESC,rowid DESC LIMIT 1',
+        (account['id'], cutoff)).fetchone()
+    return (event[0], event[1]) if event else ('unknown', None)
+
+
 def set_balance(conn: sqlite3.Connection, account: str, amount: int, at: str, reason: str,
                 expected: str | None, request: str, transfer: str | None = None) -> dict:
     require_account(conn, account, securities=False, active=True, at=at)
@@ -259,6 +285,41 @@ class FinanceService:
             audit(conn,'account',account,'effective_confirmed',data.request_id,{'before':old,'after':result,'reason':data.note})
             return result,v['occurred_at']
         return self._write('account_effective',data,work,target=account)
+
+    def set_account_liquidity(self, account: str, data: LiquidityInput) -> dict:
+        """Confirm, restrict or reset an asset account's liquidity classification.
+
+        Restricted assets remain in total assets and net worth. Liabilities keep the
+        approved current-liability basis and cannot carry this marker. The change is
+        append-only evidence: a confirmation can never be dated before an already
+        recorded classification, and history before the first record stays unknown.
+        """
+        data = LiquidityInput.model_validate(data)
+        def work(conn,v):
+            old=require_account(conn,account,at=v['occurred_at'])
+            if old['asset_class']!='asset':
+                raise TradeError('liquidity classification applies to asset accounts only; '
+                                 'liabilities follow the approved current-liability basis')
+            if one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision'] != data.expected_ledger_revision:
+                raise Conflict('ledger changed; reload account')
+            if old['effective_at'] is not None and v['occurred_at'] < old['effective_at']:
+                raise Conflict('liquidity classification cannot precede the account effective date')
+            latest=conn.execute('SELECT max(effective_at) FROM account_liquidity_events WHERE account_id=?',
+                                (account,)).fetchone()[0]
+            if latest is not None and v['occurred_at'] < latest:
+                raise Conflict('liquidity classification history is append-only; '
+                               'record later changes on or after the latest effective time')
+            previous,_=liquidity_status_at(conn,old,v['occurred_at'])
+            event_id=uid()
+            conn.execute('INSERT INTO account_liquidity_events VALUES (?,?,?,?,?,?,?)',
+                         (event_id,account,previous,data.status,v['occurred_at'],data.note,'changed'))
+            conn.execute('UPDATE accounts SET liquidity_status=? WHERE id=?',(data.status,account))
+            result=one(conn,'SELECT * FROM accounts WHERE id=?',(account,))
+            audit(conn,'account',account,'liquidity_changed',data.request_id,
+                  {'before':old,'after':result,'event_id':event_id,'effective_at':v['occurred_at'],'reason':data.note})
+            return {**result,'event_id':event_id,'effective_at':v['occurred_at'],
+                    'previous_status':previous},v['occurred_at']
+        return self._write('account_liquidity',data,work,target=account)
 
     def balance(self, data: BalanceInput) -> dict:
         data = BalanceInput.model_validate(data)
@@ -613,9 +674,9 @@ class FinanceService:
                 try: window=market_window(point)
                 except CalendarUnavailable: window=None
                 value=self._overview(conn,portfolio,point,utc(point),window,ledger,revision)
-                row={k:value[k] for k in ('as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','liquid_assets_fen','liquid_net_worth_fen','liquidity_reasons','securities_equity_fen','quality','reasons')}
+                row={k:value[k] for k in ('as_of','total_assets_fen','total_liabilities_fen','net_worth_fen','liquid_assets_fen','liquid_net_worth_fen','restricted_assets_fen','liquidity_reasons','liquidity_basis','securities_equity_fen','quality','reasons')}
                 if not any(a['included'] for a in value['accounts']):
-                    row.update(total_assets_fen=None,total_liabilities_fen=None,net_worth_fen=None,liquid_assets_fen=None,liquid_net_worth_fen=None,securities_equity_fen=None,quality='unavailable',reasons=['no_included_account_evidence'])
+                    row.update(total_assets_fen=None,total_liabilities_fen=None,net_worth_fen=None,liquid_assets_fen=None,liquid_net_worth_fen=None,restricted_assets_fen=None,securities_equity_fen=None,quality='unavailable',reasons=['no_included_account_evidence'])
                 items.append(row)
             return {'as_of':cutoff,'ledger_revision':ledger,'quote_revision':revision,'source':'current_ledger_projection_not_knowledge_replay','items':items}
 
@@ -663,7 +724,13 @@ class FinanceService:
                 amount=None
                 details['reasons']=[*details['reasons'],'transfer_reconciliation_historical_gap']
             included_now=scope_at(conn,account,cutoff)
-            items.append({**account,**details,'included':included_now,'balance_fen':amount,'quality':'valid' if amount is not None else 'unavailable'})
+            status,status_at=liquidity_status_at(conn,account,cutoff)
+            display=(LIQUIDITY_DISPLAY[status] if account['asset_class']=='asset'
+                     else '负债：按现行流动负债口径（不使用资产受限标记）')
+            items.append({**account,**details,'included':included_now,'balance_fen':amount,
+                          'liquidity_status':status,'liquidity_status_effective_at':status_at,
+                          'liquidity_status_display':display,
+                          'quality':'valid' if amount is not None else 'unavailable'})
             if not included_now: continue
             if account['asset_class']=='asset':
                 if amount is None: assets_ok=False
@@ -699,19 +766,32 @@ class FinanceService:
         return_pct=None
         if securities and all(r['daily_return_pct'] is not None for r in securities) and denominator and denominator>0 and numerator is not None:
             return_pct=format(Decimal(numerator)*100/Decimal(denominator),'.2f')
-        # Old Finance classifies liabilities by maturity and restricted/other assets by type.
-        # 2.0 loses that distinction for other_* kinds. Do not silently classify them.
-        liquidity_unknown=[r['id'] for r in included if r['kind'] in ('other_asset','other_liability')]
-        liquid_assets=[r for r in included if r['asset_class']=='asset' and r['kind'] in ('bank','cash','payment','securities')]
-        liquid_asset_total=sum(r['balance_fen'] for r in liquid_assets) if all(r['balance_fen'] is not None for r in liquid_assets) and not any(r['kind']=='other_asset' for r in included) and assets_ok else None
-        liquid_net=liquid_asset_total-liabilities if liquid_asset_total is not None and liabilities_ok and not liquidity_unknown else None
-        liquidity_reasons=(['liquidity_classification_unknown:'+i for i in liquidity_unknown] + ([] if assets_ok and liabilities_ok else ['balance_or_valuation_unavailable']))
+        # Account-level liquidity classification is explicit evidence; absence of
+        # evidence is 'unknown', never silently unrestricted. Restricted assets stay
+        # in total assets and net worth but never enter liquid assets. Liabilities
+        # keep the approved current-liability basis and are not mixed with this mark.
+        asset_accounts=[r for r in included if r['asset_class']=='asset']
+        liquid_accounts=[r for r in asset_accounts if r['liquidity_status']=='liquid']
+        restricted_accounts=[r for r in asset_accounts if r['liquidity_status']=='restricted']
+        liquidity_unknown=[r['id'] for r in asset_accounts if r['liquidity_status']=='unknown']
+        restricted_total=(sum(r['balance_fen'] for r in restricted_accounts)
+                          if all(r['balance_fen'] is not None for r in restricted_accounts) else None)
+        liquid_asset_total=(sum(r['balance_fen'] for r in liquid_accounts)
+                            if all(r['balance_fen'] is not None for r in liquid_accounts)
+                            and not liquidity_unknown and assets_ok else None)
+        liquid_net=(liquid_asset_total-liabilities
+                    if liquid_asset_total is not None and liabilities_ok else None)
+        liquidity_reasons=(['liquidity_classification_unknown:'+i for i in liquidity_unknown]
+                           + ([] if assets_ok and liabilities_ok else ['balance_or_valuation_unavailable']))
         result={'ledger_revision':ledger,'quote_revision':revision,'as_of':cutoff,'quality':'valid' if assets_ok and liabilities_ok else 'derived_unverified','asset_categories':categories,
                 'securities_cash_fen':total('cash_fen') if all(r['cash_quality']=='valid' for r in securities) else None,
                 'securities_market_value_fen':total('market_value_fen'),'securities_equity_fen':total('equity_fen'),
                 'investment_daily_pnl_fen':numerator,'investment_daily_return_pct':return_pct,'investment_daily_return_reason':None if return_pct is not None else 'account_return_or_denominator_unavailable','investment_previous_close_equity_fen':denominator,
-                'liquid_assets_fen':liquid_asset_total,'liquid_net_worth_fen':liquid_net,'liquidity_reasons':liquidity_reasons,
-                'liquidity_basis':'legacy_current_liabilities; unclassified other assets/liabilities withheld',
+                'liquid_assets_fen':liquid_asset_total,'liquid_net_worth_fen':liquid_net,'restricted_assets_fen':restricted_total,
+                'liquidity_reasons':liquidity_reasons,
+                'liquidity_basis':('explicit_account_liquidity_status; restricted assets stay in total assets and net worth '
+                                   'but are excluded from liquid assets; unconfirmed classification withheld; '
+                                   'liabilities use the approved current-liability basis'),
                 'reasons':reasons,'accounts':items,'known_assets_fen':assets,'known_liabilities_fen':liabilities,
                 'total_assets_fen':assets if assets_ok else None,'total_liabilities_fen':liabilities if liabilities_ok else None,
                 'net_worth_fen':assets-liabilities if assets_ok and liabilities_ok else None,
@@ -723,8 +803,9 @@ class FinanceService:
             ('net_worth_fen','净资产','included_account_projection','纳入统计的总资产 − 总负债',included,reasons),
             ('total_assets_fen','总资产','included_account_projection','纳入统计的资产账户余额或证券权益之和',[r for r in included if r['asset_class']=='asset'],reasons),
             ('total_liabilities_fen','总负债','included_account_projection','纳入统计的负债账户余额之和',[r for r in included if r['asset_class']=='liability'],reasons),
-            ('liquid_assets_fen','流动资产','known_liquidity_classification','按现有可核实分类汇总；未知分类不猜测',included,liquidity_reasons),
-            ('liquid_net_worth_fen','流动净资产','known_liquidity_classification','流动资产减流动负债；未分类不计算',included,liquidity_reasons),
+            ('liquid_assets_fen','流动资产','confirmed_liquidity_classification','已确认不受限的资产账户余额或证券权益之和；受限资产与待确认分类不计入',liquid_accounts,liquidity_reasons),
+            ('liquid_net_worth_fen','流动净资产','confirmed_liquidity_classification','流动资产减纳入统计的流动负债；存在待确认分类时不计算',liquid_accounts,liquidity_reasons),
+            ('restricted_assets_fen','受限资产','account_liquidity_status','已确认受限的资产账户余额或证券权益；仍计入总资产及净资产，不计入流动资产',restricted_accounts,[]),
             ('securities_cash_fen','证券现金','effective_cash_ledger','有效证券现金期初及流水；不使用普通账单改余额',securities,security_reasons),
             ('securities_market_value_fen','证券市值','sqlite_ledger_and_explicit_quotes','剩余批次数量乘有效证券报价；缺失报价不填零',securities,security_reasons),
             ('securities_equity_fen','证券权益','sqlite_ledger_and_explicit_quotes','证券现金加证券市值，仅计入个人资产一次',securities,security_reasons),

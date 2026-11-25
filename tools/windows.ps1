@@ -17,10 +17,22 @@ function Run-Native([string]$Exe,[string[]]$Arguments) {
   & $Exe @Arguments
   if ($LASTEXITCODE -ne 0) { throw "$Exe returned exit code $LASTEXITCODE" }
 }
-function Require-Python { if (!(Test-Path -LiteralPath $Py -PathType Leaf)) {throw 'Run Install first'} }
+function Require-Python {
+  if (!(Test-Path -LiteralPath $Py -PathType Leaf)) {throw 'Run Install first'}
+  Assert-Python
+}
+function Assert-Python {
+  # uv resolves the interpreter from pyproject requires-python (>=3.11) and uv.lock.
+  $version=(& $Py -c "import sys; print('%d.%d' % sys.version_info[:2])")
+  if ($LASTEXITCODE -ne 0 -or $version -notmatch '^(\d+)\.(\d+)$' -or [int]$Matches[1] -lt 3 -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -lt 11)) {throw "Use Python >=3.11 in .venv (verified 3.11 and 3.14); found $version"}
+}
 function Assert-Node {
-  $version=(& node --version); if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v22\.(\d+)\.\d+$' -or [int]$Matches[1] -lt 13) {throw 'Use Node.js >=22.13.0 <23 (reference 22.16.0)'}
-  $npmVersion=(& npm.cmd --version); if ($LASTEXITCODE -ne 0 -or $npmVersion -ne '10.9.2') {throw 'Use npm 10.9.2, the reference locked-install environment'}
+  $version=(& node --version); if ($LASTEXITCODE -ne 0 -or $version -notmatch '^v22\.(\d+)\.(\d+)$' -or [int]$Matches[1] -lt 13) {throw 'Use Node.js >=22.13.0 <23 (verified 22.22.2)'}
+  # Node 22.13+ ships npm 10.9.x. The former exact 10.9.2 guard was a reference
+  # environment, not a dependency requirement: package-lock v3 + `npm ci` are the
+  # reproducibility guarantee. npm 10.9.7 passed the production build.
+  $npmVersion=(& npm.cmd --version)
+  if ($LASTEXITCODE -ne 0 -or $npmVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$' -or [int]$Matches[1] -ne 10 -or [int]$Matches[2] -lt 9) {throw "Use npm 10.9.x shipped with Node.js 22.13+ (verified 10.9.7); found $npmVersion"}
 }
 function Build-Web {
   Assert-Node
@@ -42,7 +54,7 @@ function Get-ManagedProcess {
   return $proc
 }
 switch ($Action) {
- 'Install' { Assert-Node; Run-Native 'uv' @('sync','--locked'); Build-Web }
+ 'Install' { Assert-Node; Run-Native 'uv' @('sync','--locked'); Assert-Python; Build-Web }
  'Build' { Build-Web }
  'Check' { Require-Python; Run-Native $Py @($Start,'check-database') }
  'Start' {

@@ -46,3 +46,5 @@
 10 本地验收：`10_LOCAL_ACCEPTANCE_REPORT.md`（实际环境、构建、回归、浏览器与 Windows 运维结果，PASS/FAIL/BLOCKED/NOT RUN 分列）、`10_HANDOFF.md`（剩余授权、阻断与下一步）。当前状态以 `STATUS.md` 为准。
 
 10A 口径批准与最终交付：`10A_FINAL_REVIEW.md`（四项口径定向核对结论、逐条证据、剩余阻断）、`10A_HANDOFF.md`（最终交付包构成、复原顺序、未授权事项）。四项口径的权威文本在 `DECISIONS.md` ADR-017～ADR-020，接口表现见 `INTERFACE_CONTRACT.md` 末节。当前状态以 `STATUS.md` 为准。
+
+10C 最终最小补丁：`10C_HANDOFF.md`（受限资产标记方案 B、安装脚本版本范围、复原顺序）、`10C_TEST_REPORT.md`（实际命令、日志、PASS/FAIL/BLOCKED 分列）。受限资产口径见 `DECISIONS.md` ADR-021，接口表现见 `INTERFACE_CONTRACT.md` 流动净资产一节。当前状态以 `STATUS.md` 为准。

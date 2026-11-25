@@ -29,7 +29,7 @@ def cfg(tmp_path):
 def ledger(cfg):
     with open_database(cfg) as db:
         svc = TradeService(db)
-        account = svc.create_account(AccountInput(request_id='account-test-account',name='test account',effective_at='2000-01-01T00:00:00+08:00'))['id']
+        account = svc.create_account(AccountInput(request_id='account-test-account',name='test account',effective_at='2000-01-01T00:00:00+08:00',liquidity_status='liquid'))['id']
         instrument = svc.create_instrument(InstrumentInput(request_id='instrument-510300',code='510300', market='SH', kind='etf'))['id']
         yield svc, account, instrument
 

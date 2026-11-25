@@ -4,8 +4,8 @@
 
 ## 环境及依赖安装
 
-- Python 3.11+（SQLite ≥ 3.37）、uv（测试环境 uv 0.10.0）。
-- Node.js 22.13+（22.x）、npm 10+、Git。
+- Python 3.11+（`pyproject` 的 `requires-python >=3.11` 与 `uv.lock` 为准；已验证 3.11.9 与 3.14.4，uv 0.11.7）、SQLite ≥ 3.37。
+- Node.js 22.13+（22.x，已验证 22.22.2）、npm 10.9.x（Node 22.13+ 自带；已验证 10.9.2/10.9.7，安装脚本按此范围检查，`npm ci` 才是锁文件可复现保证）、Git。
 - 除特别说明外，以下命令从仓库根目录执行，优先兼容 Windows PowerShell。
 
 **当前锁文件尚未生成**：需要在可访问 PyPI 和 npm registry 的开发环境先完成解析。这两步未通过前不要将工程视为可复现安装，也不要手工拼装锁文件。
@@ -44,7 +44,7 @@ python start.py server --port 8000
 
 收益 API：`GET /api/v1/portfolio/{account_id}?as_of=<带时区ISO时间>&previous_trading_day=<实际前一交易日>` 返回该时点持仓/批次、证券权益、日收益、已实现/未实现/累计收益和质量；历史日收益通过对应日 as_of 查询。`POST /api/v1/quotes`、`GET /api/v1/quotes/{instrument_id}?as_of=...`、`POST /api/v1/opening-positions`、`POST /api/v1/company-events` 为明确输入及查询入口，详见本机 `/docs`。仅确认现金分红入账；未支持的数量公司行为录入缺口，不产生虚构买卖或收益。实际前一交易日由后端日历确定；`previous_trading_day` 是可选兼容输入，不匹配时拒绝。休市自然日收益与最近完成交易日收益分开。`quote_revision` 可固定报价版本（账本仍使用当前有效事实）；报价查询的 `available_at` 可额外限制历史时点可获得的数据，旧报价获取时间未知时不纳入严格回放。`POST /api/v1/quotes/resolutions` 对已审阅的收盘冲突显式确认正确报价（selected_quote_id、expected_quote_revision、request_id、reason）；旧证据保留，历史严格可获得性不提前使用更正。
 
-财务 API（`/api/v1`）：复用 `POST/GET /accounts`，新账户（含证券）传 `kind`、经核实的 `effective_at`、`included`，`PATCH /accounts/{id}` 使用 `expected_ledger_revision` 更名或调整状态；关闭账户仍计入已有余额。`POST/GET /finance/balances` 使用 `after_fen`、`expected_balance_id`（首次显式 null）、实际时间与原因。`/finance/bills`、`/finance/categories`、`/finance/transfers` 提供创建、查询，账单和转账各有 `/{id}/corrections`、`/{id}/void`。转账手工端必须提交 `from_included`/`to_included` 及对应 `*_balance_id`，证券端留空；已包含不调整，未包含原子更新，普通更正拒绝复杂历史；人工核对 `POST /finance/transfers/{id}/reconciliation` 可提交最新手工余额 ID、实际余额与核实时间、核实原因及 `confirmed=true`，作废或替换正确金额（相同两端与原日期）。`POST /accounts/{id}/scope` 与 `/effective-date` 分别记录统计范围和可信开户时间。独立 `/cash` 不接受新内部 `transfer_id`。`GET /finance/overview?as_of=...` 返回净资产、证券权益及财务月；`GET /finance/month?period=YYYY-MM-23` 与 `/finance/year/{year}` 查询分期明细，支持 as_of。`POST /cash/{id}/corrections`、`/cash/{id}/void`、`POST /company-events/{id}/corrections`、`/company-events/{id}/void` 为非成交现金及分红更正入口；`GET /company-events` 查询历史。金额整数分，负债用非负金额且从净资产扣减。所有写操作使用唯一 request_id，具体字段见 `/docs`。
+财务 API（`/api/v1`）：复用 `POST/GET /accounts`，新账户（含证券）传 `kind`、经核实的 `effective_at`、`included`，`PATCH /accounts/{id}` 使用 `expected_ledger_revision` 更名或调整状态；关闭账户仍计入已有余额。`POST/GET /finance/balances` 使用 `after_fen`、`expected_balance_id`（首次显式 null）、实际时间与原因。`/finance/bills`、`/finance/categories`、`/finance/transfers` 提供创建、查询，账单和转账各有 `/{id}/corrections`、`/{id}/void`。转账手工端必须提交 `from_included`/`to_included` 及对应 `*_balance_id`，证券端留空；已包含不调整，未包含原子更新，普通更正拒绝复杂历史；人工核对 `POST /finance/transfers/{id}/reconciliation` 可提交最新手工余额 ID、实际余额与核实时间、核实原因及 `confirmed=true`，作废或替换正确金额（相同两端与原日期）。`POST /accounts/{id}/scope` 与 `/effective-date` 分别记录统计范围和可信开户时间；`POST /accounts/{id}/liquidity` 以 `status=liquid|restricted|unknown`、`occurred_at`、`note`、`expected_ledger_revision` 明确记录受限/不受限分类（`unknown` 不会被当作不受限）。独立 `/cash` 不接受新内部 `transfer_id`。`GET /finance/overview?as_of=...` 返回净资产、受限资产、证券权益及财务月；`GET /finance/month?period=YYYY-MM-23` 与 `/finance/year/{year}` 查询分期明细，支持 as_of。`POST /cash/{id}/corrections`、`/cash/{id}/void`、`POST /company-events/{id}/corrections`、`/company-events/{id}/void` 为非成交现金及分红更正入口；`GET /company-events` 查询历史。金额整数分，负债用非负金额且从净资产扣减。所有写操作使用唯一 request_id，具体字段见 `/docs`。
 
 行情 API：`GET /api/v1/market/status`、`GET /api/v1/market/prices/{instrument_id}`、`POST /api/v1/market/refresh?instrument_id=<可选ID>`。正式服务默认 20 秒盘中检查；`--market-refresh-seconds 10-300` 可配置，`--no-market-refresh` 可关闭后台网络刷新。休市不做持续网络轮询，收盘后补取已完成日线；只读本地模式禁止刷新写入。当前适配器仅支持可识别代码范围内沪深股票/ETF 的实际未复权价格，来源为东方财富公开接口（真实接口在开发环境尚未验证）；其他市场/代理/指数数据不得写入证券估值表。日历使用 exchange-calendars 4.13.1 的 XSHG 预计算日历（沪深共用内地交易日，覆盖至 2026-12-31）；`/market/status` 提供日历覆盖及60天到期提示，正式发布前核对交易所公告并更新可信日历。超出覆盖或缺失必要行情返回不可用。`GET /api/v1/strategy/evidence/{account_id}` 仅展示实际批次及冻结证据，明确策略引擎不可用，不返回正式建议。
 

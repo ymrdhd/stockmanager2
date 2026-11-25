@@ -58,8 +58,9 @@ def test_liquidity_no_duplicate_and_unknown(ledger):
     bank=manual(svc,'liquid-bank'); credit=manual(svc,'liquid-credit','credit_card')
     balance(f,bank,100000,'bank-balance');balance(f,credit,20000,'credit-balance');cash(svc,a,'opening','opening',50000,5)
     v=f.overview(at(6));assert v['liquid_assets_fen']==150000 and v['liquid_net_worth_fen']==130000
-    unknown=manual(svc,'uncertain','other_liability');balance(f,unknown,10000,'unknown-balance')
-    v=f.overview(at(6));assert v['liquid_net_worth_fen'] is None and v['liquidity_reasons']
+    # An asset without confirmed classification is withheld, never treated as liquid.
+    unknown=manual(svc,'uncertain','other_asset',liquidity='unknown');balance(f,unknown,10000,'unknown-balance')
+    v=f.overview(at(6));assert v['liquid_assets_fen'] is None and v['liquid_net_worth_fen'] is None and v['liquidity_reasons']
 
 
 def test_opening_pages_and_stale_version(ledger):
