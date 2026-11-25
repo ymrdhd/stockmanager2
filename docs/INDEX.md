@@ -29,3 +29,5 @@
 
 
 09F 本轮入口：`09F_REPORT.md`、`09F_FUNCTION_MATRIX.md`、`09F_PRODUCT_CANDIDATES.md`、`09F_LOCAL_ACCEPTANCE.md`。
+
+09G 本轮交接：`09G_REPORT.md` 记录内部账本只读对账预览、测试证据、未完成边界与回退方式；`09G_FUNCTION_MATRIX.md` 记录当前 V1.0 网页功能差距。

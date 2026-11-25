@@ -952,6 +952,215 @@ class PortfolioService:
                               latest_trading_day_quality=historical['daily_pnl_quality'])
             return {**result,'database_uuid':identity.database_uuid,'generation':identity.generation}
 
+    def reconciliation(self, account: str, as_of: datetime, ledger_revision: int | None = None,
+                       quote_revision: int | None = None, database_uuid: str | None = None,
+                       generation: int | None = None) -> dict:
+        """Read-only internal ledger reconciliation on one SQLite snapshot.
+
+        This report checks facts already recorded by Stock Manager. It is not an
+        external broker statement comparison and deliberately has no repair action.
+        """
+        cutoff = self._cutoff(as_of)
+        expected = (ledger_revision, quote_revision, database_uuid, generation)
+        if any(value is not None for value in expected) and not all(value is not None for value in expected):
+            raise TradeError('snapshot guard requires ledger, quote, database UUID and generation')
+        try:
+            window = market_window(as_of)
+        except CalendarUnavailable:
+            window = None
+
+        with self.db.read() as conn:
+            require_account(conn, account, securities=True, at=cutoff)
+            current_ledger = one(conn, 'SELECT ledger_revision FROM ledger_state')['ledger_revision']
+            current_quote = self._revision(conn, None)
+            identity = self.db.identity
+            if ledger_revision is not None and (
+                current_ledger != ledger_revision or current_quote != quote_revision
+                or identity.database_uuid != database_uuid or identity.generation != generation
+            ):
+                raise Conflict('reconciliation snapshot changed; reload the account valuation')
+
+            valuation = self._valuation(conn, account, as_of, window, current_quote)
+            trade_counts = one(conn, """SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN status='effective' THEN 1 ELSE 0 END) AS effective_count,
+                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN status='effective' AND side='buy' THEN 1 ELSE 0 END) AS buy_count,
+                SUM(CASE WHEN status='effective' AND side='sell' THEN 1 ELSE 0 END) AS sell_count
+                FROM trade_executions WHERE account_id=? AND executed_at<=?""", (account, cutoff))
+            sales = rows(conn, """SELECT t.id,t.instrument_id,t.quantity,t.executed_at,
+                    COALESCE(SUM(a.quantity),0) AS allocated_quantity
+                FROM trade_executions t
+                LEFT JOIN lot_allocations a ON a.sell_execution_id=t.id
+                WHERE t.account_id=? AND t.side='sell' AND t.status='effective' AND t.executed_at<=?
+                GROUP BY t.id ORDER BY t.executed_at,t.rowid""", (account, cutoff))
+            allocation_count = one(conn, """SELECT COUNT(*) AS total FROM lot_allocations a
+                JOIN trade_executions t ON t.id=a.sell_execution_id
+                WHERE t.account_id=? AND t.status='effective' AND t.executed_at<=?""",
+                (account, cutoff))['total']
+            allocation_details = rows(conn, """SELECT a.id,a.sell_execution_id,a.lot_id,a.quantity,
+                    a.cost_fen,a.buy_fees_fen,a.method,t.instrument_id,t.executed_at
+                FROM lot_allocations a JOIN trade_executions t ON t.id=a.sell_execution_id
+                WHERE t.account_id=? AND t.status='effective' AND t.executed_at<=?
+                ORDER BY t.executed_at,t.rowid,a.rowid LIMIT 101""", (account, cutoff))
+            allocation_details_truncated = len(allocation_details) > 100
+            allocation_details = allocation_details[:100]
+            allocation_mismatches = [
+                {'kind':'sale_allocation_quantity','record_id':sale['id'],
+                 'instrument_id':sale['instrument_id'],'occurred_at':sale['executed_at'],
+                 'expected':sale['quantity'],'actual':sale['allocated_quantity'],
+                 'message':'卖出成交数量与批次分配数量不一致'}
+                for sale in sales if sale['quantity'] != sale['allocated_quantity']
+            ]
+
+            lots = [lot for lot in self._lots(conn, account, cutoff) if lot['quantity'] > 0]
+            lot_quantities: dict[str, int] = {}
+            for lot in lots:
+                lot_quantities[lot['instrument_id']] = (
+                    lot_quantities.get(lot['instrument_id'], 0) + lot['quantity']
+                )
+            projected_quantities = {
+                item['instrument_id']: item['quantity']
+                for item in valuation['instrument_results']
+            }
+            position_mismatches = []
+            for instrument in sorted(set(lot_quantities) | set(projected_quantities)):
+                lot_quantity = lot_quantities.get(instrument, 0)
+                projected_quantity = projected_quantities.get(instrument, 0)
+                if lot_quantity != projected_quantity:
+                    position_mismatches.append({
+                        'kind':'position_lot_quantity','record_id':instrument,
+                        'expected':lot_quantity,'actual':projected_quantity,
+                        'message':'剩余批次数量与持仓投影不一致',
+                    })
+
+            pending = rows(conn, """SELECT id,instrument_id,side,quantity,executed_at,pending_reason
+                FROM trade_executions WHERE account_id=? AND status='pending' AND executed_at<=?
+                ORDER BY executed_at,rowid""", (account, cutoff))
+            unresolved = rows(conn, """SELECT id,instrument_id,kind,occurred_at,note
+                FROM company_events WHERE account_id=? AND kind!='dividend'
+                AND applied_at IS NULL AND voided_at IS NULL AND occurred_at<=?
+                ORDER BY occurred_at,rowid""", (account, cutoff))
+
+            checks = []
+            def add_check(code: str, status: str, message: str, **details) -> None:
+                checks.append({'code':code,'status':status,'message':message,**details})
+
+            add_check(
+                'sale_allocations',
+                'attention' if allocation_mismatches else 'pass',
+                '存在卖出数量与批次分配不一致' if allocation_mismatches else '所有有效卖出均有对应批次分配',
+                mismatch_count=len(allocation_mismatches), checked_count=len(sales),
+            )
+            add_check(
+                'position_lots',
+                'attention' if position_mismatches else 'pass',
+                '批次数量与持仓投影存在差异' if position_mismatches else '剩余批次数量与持仓投影一致',
+                mismatch_count=len(position_mismatches), checked_count=len(set(lot_quantities) | set(projected_quantities)),
+            )
+            cash_quality = valuation['cash_quality']
+            add_check(
+                'cash_projection', 'pass' if cash_quality == 'valid' else 'unavailable',
+                '证券现金账本可核实' if cash_quality == 'valid' else '证券现金存在缺失或冲突，不能确认余额',
+                quality=cash_quality,
+            )
+            market_quality = 'pass' if valuation['market_value_fen'] is not None else 'unavailable'
+            add_check(
+                'market_valuation', market_quality,
+                '持仓市值有可信行情依据' if market_quality == 'pass' else '持仓市值缺少可信行情，不能确认权益',
+                market_value_fen=valuation['market_value_fen'],
+            )
+            difference = valuation['reconciliation_difference_fen']
+            if difference is None:
+                pnl_status = 'unavailable'
+                pnl_message = '当日收益或权益勾稽缺少可信数据，不能判断'
+            elif difference == 0:
+                pnl_status = 'pass'
+                pnl_message = '自然日收益与权益变动勾稽一致'
+            else:
+                pnl_status = 'attention'
+                pnl_message = '自然日收益与权益变动存在差额'
+            add_check('daily_equity_pnl', pnl_status, pnl_message, difference_fen=difference)
+            add_check(
+                'pending_trades', 'attention' if pending else 'pass',
+                '存在待核对成交，相关持仓/收益可能不可用' if pending else '没有待核对成交',
+                count=len(pending),
+            )
+            add_check(
+                'unresolved_company_actions', 'attention' if unresolved else 'pass',
+                '存在尚未应用或作废的公司行为' if unresolved else '没有未解决公司行为',
+                count=len(unresolved),
+            )
+
+            exceptions = [*allocation_mismatches, *position_mismatches]
+            exceptions.extend({
+                'kind':'pending_trade','record_id':item['id'],
+                'instrument_id':item['instrument_id'],'occurred_at':item['executed_at'],
+                'reason':item['pending_reason'],'message':'成交待核对',
+            } for item in pending)
+            exceptions.extend({
+                'kind':'unresolved_company_action','record_id':item['id'],
+                'instrument_id':item['instrument_id'],'occurred_at':item['occurred_at'],
+                'reason':item['kind'],'message':'公司行为尚未解决',
+            } for item in unresolved)
+            if cash_quality != 'valid':
+                exceptions.append({
+                    'kind':'cash_projection_unavailable','record_id':account,
+                    'reason':valuation['cash_quality'],'message':'证券现金余额不可核实',
+                })
+            if valuation['market_value_fen'] is None:
+                exceptions.append({
+                    'kind':'market_valuation_unavailable','record_id':account,
+                    'reason':'current_quote_unavailable','message':'持仓市值缺少可信行情',
+                })
+            if difference is None:
+                exceptions.append({
+                    'kind':'daily_equity_pnl_unavailable','record_id':account,
+                    'reason':'equity_reconciliation_unavailable','message':pnl_message,
+                })
+            elif difference != 0:
+                exceptions.append({
+                    'kind':'daily_equity_pnl_difference','record_id':account,
+                    'expected':0,'actual':difference,'message':pnl_message,
+                })
+
+            exception_total = len(exceptions)
+            has_attention = any(item['status'] == 'attention' for item in checks)
+            has_unavailable = any(item['status'] == 'unavailable' for item in checks)
+            quality = 'valid' if not has_attention and not has_unavailable else 'derived_unverified'
+            summary = {
+                'total_trade_count':trade_counts['total_count'] or 0,
+                'effective_trade_count':trade_counts['effective_count'] or 0,
+                'buy_count':trade_counts['buy_count'] or 0,
+                'sell_count':trade_counts['sell_count'] or 0,
+                'pending_trade_count':trade_counts['pending_count'] or 0,
+                'sale_allocation_mismatch_count':len(allocation_mismatches),
+                'allocation_count':allocation_count,
+                'open_lot_count':len(lots),
+                'open_quantity':sum(lot['quantity'] for lot in lots),
+                'open_cost_fen':sum(lot['cost_fen'] + lot['fees_fen'] for lot in lots),
+                'cash_fen':valuation['cash_fen'],
+                'cash_quality':cash_quality,
+                'market_value_fen':valuation['market_value_fen'],
+                'equity_fen':valuation['equity_fen'],
+                'daily_pnl_fen':valuation['daily_pnl_fen'],
+                'equity_pnl_fen':valuation['equity_pnl_fen'],
+                'reconciliation_difference_fen':difference,
+                'quality':quality,
+            }
+            return {
+                'account_id':account,'as_of':cutoff,'ledger_revision':current_ledger,
+                'quote_revision':current_quote,'database_uuid':identity.database_uuid,
+                'generation':identity.generation,'source':'sqlite_ledger_read_snapshot',
+                'quality':quality,'summary':summary,'checks':checks,
+                'allocation_details':allocation_details,
+                'allocation_details_truncated':allocation_details_truncated,
+                'exceptions':exceptions[:100],'exception_count':exception_total,
+                'exceptions_truncated':exception_total > 100,
+                'reasons':valuation['reasons'],
+                'note':'只核对 Stock Manager 内部账本事实，不代表已与券商对账单或旧数据库完成外部对账；此报告只读，不会自动修正任何记录。',
+            }
+
     def monthly_pnl(self, account: str, month: date) -> dict:
         """One current-ledger/quote revision, daily rows only; not a historical knowledge replay."""
         if month.day!=1 or not 1900<=month.year<=9997:

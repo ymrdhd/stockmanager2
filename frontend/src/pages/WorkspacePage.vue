@@ -15,11 +15,12 @@ const tab=ref<typeof tabs[number]>('总览')
 const health=ref<HealthState>({kind:'checking'}), system=ref<Fact|null>(null), overview=ref<Fact|null>(null), market=ref<Fact|null>(null)
 const accounts=ref<Fact[]>([]), instruments=ref<Fact[]>([]), categories=ref<Fact[]>([]), lots=ref<Fact[]>([])
 const valuation=ref<Fact|null>(null), strategy=ref<Fact|null>(null), month=ref<Fact|null>(null), historical=ref<Fact|null>(null)
+const reconciliationReport=ref<Fact|null>(null), reconciliationError=ref(''), reconciliationLoading=ref(false)
 const pool=ref<Fact|null>(null), positionsView=ref<Fact|null>(null), strategyError=ref(''), strategyLoading=ref(false)
 const signalWriting=ref(false), signalFeedback=ref('')
 const accountScope=new AccountScope(), tradeScope=new AccountScope()
 const investmentLoading=ref(false), investmentError=ref(''), tradeEpoch=ref(0)
-let pnlSequence=0, tradeSequence=0
+let pnlSequence=0, tradeSequence=0, reconciliationSequence=0
 const selectedAccount=ref(''), asOf=ref(''), period=ref(''), historyTime=ref(''),holdingSearch=ref('')
 const netMonths=ref(12),netTrend=ref<Fact|null>(null),netTrendError=ref('')
 async function loadNetTrend(){
@@ -142,6 +143,8 @@ const positions=computed(()=>valuation.value?facts(valuation.value.positions):[]
 const filteredPositions=computed(()=>{const q=holdingSearch.value.trim().toLowerCase();return positions.value.filter(p=>{const i=instruments.value.find(i=>i.id===p.instrument_id);return !q||[p.code,p.name,i?.name,i?.code].some(v=>str(v).toLowerCase().includes(q))})})
 const currentLots=computed(()=>filteredPositions.value.flatMap(p=>facts(p.lots).map(l=>({...l,code:p.code,market:p.market}))))
 const currentRevision=computed(()=>Number(overview.value?.ledger_revision ?? 0))
+const reconciliationCheckRows=computed(()=>facts(reconciliationReport.value?.checks).map(r=>({...r,status_text:reconciliationStatus(r.status)})))
+
 const cols=(fields:Record<string,string>)=>Object.entries(fields).map(([key,label])=>({key,label}))
 const accountColumns=cols({name:'账户',kind:'类型',asset_class:'资产/负债',balance_fen:'余额/权益（元）',balance_at:'余额时点',effective_at:'生效日期',effective_date_quality:'生效日期质量',included:'纳入统计',status:'当前状态',quality:'质量',reasons:'异常原因'})
 const cashColumns=cols({id:'流水ID',account_id:'证券账户ID',kind:'类型',amount_fen:'金额',occurred_at:'时间',transfer_id:'内部转账ID',reversal_of:'冲正来源',note:'备注'})
@@ -166,7 +169,7 @@ async function loadMaster(path:string):Promise<Fact[]> {
 async function reload() {
   const oldIdentity=safeKey(system.value);spec.value=null;backupState.value=null;migrationState.value=null;quoteEvidence.value=null;quoteSequence++
   const token=++sequence;loading.value=true;readError.value='';freshness.value='stale';clearAccountViews();month.value=null;historical.value=null
-  clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[]
+  clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;reconciliationReport.value=null;reconciliationError.value='';reconciliationSequence++;system.value=null;overview.value=null;market.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[]
   session.forgetIdentity()
   try {
     const h=await getHealth();if(!active||token!==sequence)return;health.value=h
@@ -194,7 +197,7 @@ function handleRead(e:unknown) {
   readError.value=String(e);markStale('读取失败，禁止写入')
   if(e instanceof ApiError&&e.status===401){markStale('会话已失效，禁止写入');signIn.value=true;sessionName.value='';readError.value='会话已过期或被撤销，请重新登录。';forget()}
 }
-function forget() {sequence++;backupState.value=null;migrationState.value=null;quoteEvidence.value=null;maintenanceError.value='';clearAccountViews();quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
+function forget() {sequence++;backupState.value=null;migrationState.value=null;quoteEvidence.value=null;maintenanceError.value='';clearAccountViews();quoteSequence++;clearStrategyView();todo.value=null;netTrend.value=null;tradeDetail.value=null;yearResult.value=null;pnlHistory.value=null;reconciliationReport.value=null;reconciliationError.value='';reconciliationSequence++;system.value=null;overview.value=null;market.value=null;valuation.value=null;strategy.value=null;month.value=null;historical.value=null;accounts.value=[];instruments.value=[];categories.value=[];lots.value=[];spec.value=null;session.forgetIdentity()}
 async function signInSubmit() {
   if(busy.value)return
   error.value='';authState.value='正在登录…';busy.value=true
@@ -213,6 +216,7 @@ async function signOut() {
 async function loadInvestment(){await refreshInvestment(false)}
 async function refreshInvestment(quiet:boolean){
   const token=++valuationSequence,ticket=accountScope.capture()
+  reconciliationSequence++;reconciliationReport.value=null;reconciliationError.value='';reconciliationLoading.value=false
   if(!quiet){valuation.value=null;strategy.value=null}
   investmentError.value='';investmentLoading.value=!!ticket.account
   if(!ticket.account)return
@@ -223,6 +227,31 @@ async function refreshInvestment(quiet:boolean){
     if(active&&token===valuationSequence&&accountScope.accepts(ticket,v,s)){if(v.ledger_revision!==s.ledger_revision||v.quote_revision!==s.quote_revision||v.database_uuid!==s.database_uuid||v.generation!==s.generation||v.as_of!==s.as_of)throw new Error('持仓与证据版本不一致，请重新读取');valuation.value=v;strategy.value=s}
   }catch(e){if(active&&token===valuationSequence&&accountScope.current(ticket)){valuation.value=null;strategy.value=null;investmentError.value=String(e)}}
   finally{if(active&&token===valuationSequence&&accountScope.current(ticket))investmentLoading.value=false}
+}
+async function loadReconciliation(){
+  reconciliationReport.value=null;reconciliationError.value=''
+  const snapshot=valuation.value,ticket=accountScope.capture(),token=++reconciliationSequence
+  if(!snapshot||!ticket.account||str(snapshot.account_id)!==ticket.account){
+    reconciliationError.value='请先读取当前证券账户持仓，再进行对账预览。';return
+  }
+  reconciliationLoading.value=true
+  try{
+    const params=new URLSearchParams({
+      as_of:str(snapshot.as_of),ledger_revision:String(snapshot.ledger_revision),
+      quote_revision:String(snapshot.quote_revision),database_uuid:str(snapshot.database_uuid),
+      generation:String(snapshot.generation),
+    })
+    const result=await api(`/portfolio/${encodeURIComponent(ticket.account)}/reconciliation?${params.toString()}`)
+    if(active&&token===reconciliationSequence&&accountScope.accepts(ticket,result)){
+      if(result.account_id!==ticket.account||result.as_of!==snapshot.as_of
+        ||result.ledger_revision!==snapshot.ledger_revision||result.quote_revision!==snapshot.quote_revision
+        ||result.database_uuid!==snapshot.database_uuid||result.generation!==snapshot.generation){
+        throw new Error('对账报告与当前持仓不是同一数据库/账本/行情快照，请重新读取')
+      }
+      reconciliationReport.value=result
+    }
+  }catch(e){if(active&&token===reconciliationSequence&&accountScope.current(ticket))reconciliationError.value=String(e)}
+  finally{if(active&&token===reconciliationSequence&&accountScope.current(ticket))reconciliationLoading.value=false}
 }
 async function loadQuotes() {
   quoteError.value='';quoteEvidence.value=null
@@ -364,9 +393,9 @@ async function poll(){
     system.value=status;session.declare(status)
     if(status.mode==='development'){freshness.value='unavailable';freshnessNote.value='开发健康模式，无业务数据库';return}
     const [o,m]=await Promise.all([api('/finance/overview'),api('/market/status')]);if(!active||token!==sequence)return
-    if(overview.value&&Number(o.ledger_revision)!==Number(overview.value.ledger_revision)){refresh.value++;clearStrategyView();todo.value=null;netTrend.value=null}
+    if(overview.value&&Number(o.ledger_revision)!==Number(overview.value.ledger_revision)){refresh.value++;clearStrategyView();todo.value=null;netTrend.value=null;reconciliationSequence++;reconciliationReport.value=null;reconciliationError.value='';reconciliationLoading.value=false}
     const quoteMoved=!market.value||Number(m.quote_revision)!==Number(market.value.quote_revision)
-    if(quoteMoved){clearStrategyView();netTrend.value=null}
+    if(quoteMoved){clearStrategyView();netTrend.value=null;reconciliationSequence++;reconciliationReport.value=null;reconciliationError.value='';reconciliationLoading.value=false}
     overview.value=o;market.value=m
     freshness.value='live';freshnessNote.value='';lastPollAt.value=new Date().toISOString()
     if(tab.value==='投资'&&selectedAccount.value&&!asOf.value&&(quoteMoved||refresh.value))await refreshInvestment(true)
@@ -401,7 +430,8 @@ function clearStrategyView():void{
 }
 function clearAccountViews():void{
   accountScope.reset(selectedAccount.value,()=>{
-    valuationSequence++;pnlSequence++;valuation.value=null;strategy.value=null;pnlHistory.value=null;pnlError.value='';investmentError.value='';investmentLoading.value=!!selectedAccount.value
+    valuationSequence++;pnlSequence++;reconciliationSequence++;reconciliationReport.value=null;reconciliationError.value='';reconciliationLoading.value=false
+    valuation.value=null;strategy.value=null;pnlHistory.value=null;pnlError.value='';investmentError.value='';investmentLoading.value=!!selectedAccount.value
     clearStrategyView()
   })
   filterTrades()
@@ -424,6 +454,7 @@ const factorLabels:Record<string,string>={PASS:'通过',FAIL:'不通过',UNVERIF
 const num=(v:unknown,d=4)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d):display(v)
 const nested=(v:unknown)=>v&&typeof v==='object'&&!Array.isArray(v)?v as Fact:{}
 const statusText=(v:unknown)=>statusLabels[str(v)]??display(v)
+const reconciliationStatus=(v:unknown)=>({pass:'通过',attention:'需要核对',unavailable:'不可计算'} as Record<string,string>)[str(v)]??display(v)
 function ndxText(aux:Fact):string{
   if(!aux.status)return '—'
   return `${str(aux.status)}：${str(aux.detail)}；目标 ${aux.target_ratio==null?'—':num(Number(aux.target_ratio)*100,1)+'%'} / ${aux.target_amount==null?'—':num(aux.target_amount,2)+' 元'}；实际 ${aux.actual_quantity??'—'} 股；当前比例 ${aux.current_ratio==null?'—':num(Number(aux.current_ratio)*100,1)+'%'}；实际现金 ${money(aux.actual_cash_fen)}；现金缓冲 25 万元；不预留资金${aux.next_etf_session?'；适用 '+str(aux.next_etf_session):''}`
@@ -562,9 +593,23 @@ function openTradeFromSignal(row:Fact){
         <template v-if="valuation"><p>数据时点 {{display(valuation.as_of,'as_of')}}；账本 {{valuation.ledger_revision}} / 行情 {{valuation.quote_revision}}；质量 {{display(valuation.quality)}}；{{display(valuation.reasons)}}</p>
           <dl class="metrics"><div v-for="item in cols({cash_fen:'证券现金',market_value_fen:'市值',equity_fen:'账户权益',daily_pnl_fen:'自然日收益',latest_trading_day_pnl_fen:'最近交易日收益',realized_fen:'已实现收益',unrealized_fen:'未实现收益',cumulative_pnl_fen:'累计收益'})" :key="item.key"><dt>{{item.label}}</dt><dd>{{money(valuation[item.key])}}</dd></div></dl>
           <p>基础当日收益率：{{valuation.daily_return_pct==null?'不可计算':String(valuation.daily_return_pct)+'%'}}；上一交易日收盘权益 {{money(valuation.previous_close_equity_fen)}}（{{display(valuation.previous_close_as_of,'as_of')}}）；{{display(valuation.daily_return_reason)}}</p>
-          <p>权益对账差额（不是可自动调整金额）：{{money(valuation.reconciliation_difference_fen)}}；{{display(valuation.reasons)}}。</p><button v-if="accountById(selectedAccount)" :disabled="!writable||!!asOf" @click="openForm(()=>forms.equityAdjustmentForm(accountById(selectedAccount)!,valuation!))">核对证券现金差额并校正</button><p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
+          <p>权益对账差额（不是可自动调整金额）：{{money(valuation.reconciliation_difference_fen)}}；{{display(valuation.reasons)}}。</p><button v-if="accountById(selectedAccount)" :disabled="!writable||!!asOf" @click="openForm(()=>forms.equityAdjustmentForm(accountById(selectedAccount)!,valuation!))">核对证券现金差额并校正</button><button :disabled="reconciliationLoading||!selectedAccount||!valuation" @click="loadReconciliation">{{reconciliationLoading?'正在对账…':'生成内部账本对账预览'}}</button><p>累计起算：{{display(valuation.cumulative_from)}}；最近完成交易日：{{display(valuation.latest_completed_trading_day)}}</p>
+          <p v-if="reconciliationError" class="error" role="alert">{{reconciliationError}}</p>
+          <template v-if="reconciliationReport">
+            <h3>内部账本对账预览</h3>
+            <p class="notice">只核对本系统已记录的成交、批次、持仓、现金和收益；不是券商对账单或旧库外部对账。此报告只读，不会自动修改任何账本记录。</p>
+            <p>报告质量：{{display(reconciliationReport.quality)}}；账本 {{reconciliationReport.ledger_revision}} / 行情 {{reconciliationReport.quote_revision}}；{{display(reconciliationReport.as_of,'as_of')}}</p>
+            <RecordTable :rows="facts([reconciliationReport.summary])" :columns="cols({total_trade_count:'成交总数',effective_trade_count:'有效成交',buy_count:'买入笔数',sell_count:'卖出笔数',pending_trade_count:'待核对成交',sale_allocation_mismatch_count:'卖出分配差异',open_lot_count:'未清批次数',open_quantity:'剩余股数',open_cost_fen:'剩余成本及费用',cash_fen:'证券现金',cash_quality:'现金质量',market_value_fen:'证券市值',equity_fen:'证券权益',daily_pnl_fen:'当日收益',equity_pnl_fen:'权益变动收益',reconciliation_difference_fen:'收益勾稽差额',quality:'整体质量'})"/>
+            <RecordTable :rows="reconciliationCheckRows" :columns="cols({code:'检查项目',status_text:'结果',message:'说明',checked_count:'检查数量',mismatch_count:'差异数量',count:'待处理数量',difference_fen:'勾稽差额',quality:'质量'})"/>
+            <h4>卖出成交批次分配明细</h4>
+            <RecordTable :rows="facts(reconciliationReport.allocation_details)" :columns="cols({sell_execution_id:'卖出成交ID',lot_id:'被扣减批次ID',instrument_id:'证券标的',quantity:'扣减股数',cost_fen:'分配本金',buy_fees_fen:'分配买入费用',method:'分配方式',executed_at:'卖出时间'})"/>
+            <p v-if="reconciliationReport.allocation_details_truncated" class="notice">批次分配明细超过 100 条，仅显示前 100 条；可按成交历史分页复核。</p>
+            <RecordTable v-if="Number(reconciliationReport.exception_count)>0" :rows="facts(reconciliationReport.exceptions)" :columns="cols({kind:'异常类型',record_id:'记录ID',instrument_id:'证券标的',occurred_at:'发生时间',expected:'预期数量',actual:'实际数量',reason:'原因',message:'说明'})"/>
+            <p v-if="reconciliationReport.exceptions_truncated" class="notice">异常超过展示上限，仅显示前 100 条；请按成交及批次记录分页复核。</p>
+            <p v-else-if="Number(reconciliationReport.exception_count)===0" class="notice">当前快照未发现内部账本数量或收益勾稽差异；这不代表已经与券商或旧库完成外部核对。</p>
+          </template>
           <label>搜索持仓代码或名称 <input v-model="holdingSearch"/></label><RecordTable :rows="filteredPositions" :columns="cols({code:'代码',name:'名称',name_quality:'名称质量',market:'市场',quantity:'持仓股数',remaining_cost_fen:'剩余本金',remaining_fees_fen:'剩余费用',holding_cost_fen:'持仓成本',price:'现价（元）',market_value_fen:'市值',daily_pnl_fen:'当日收益',realized_fen:'已实现',unrealized_fen:'未实现',quality:'质量',quote:'报价时点及来源'})"/>
-          <h3>当前/历史有效批次</h3><RecordTable :rows="currentLots" :columns="cols({lot_id:'批次ID',code:'证券代码',lot_role:'角色',quantity:'数量',cost_fen:'剩余本金',fees_fen:'剩余费用',frozen_atr:'冻结ATR',signal_date:'信号日',opened_at:'开启时间'})"/>
+          <h3>当前/历史有效批次</h3><RecordTable :rows="currentLots" :columns="cols({lot_id:'批次ID',open_execution_id:'来源成交ID',opening_id:'期初记录ID',code:'证券代码',lot_role:'角色',strategy_id:'策略',quantity:'数量',cost_fen:'剩余本金',fees_fen:'剩余费用',frozen_atr:'冻结ATR',signal_date:'信号日',opened_at:'开启时间'})"/>
         </template>
         <template v-else><p>请选择证券账户或重新读取。</p></template>
         <h3>月度投资盈亏（日级明细）</h3><p class="notice">基于当前账本与行情版本重算，不表示当时已知的历史证据；未核实金额不显示为零。</p><div class="toolbar"><label>月份 <input type="month" v-model="pnlMonth"/></label><button @click="loadPnlMonth">查询</button></div><p v-if="pnlError" class="error" role="alert">{{pnlError}}</p><template v-if="pnlHistory"><p>账本 {{pnlHistory.ledger_revision}} / 行情 {{pnlHistory.quote_revision}}；查询时间 {{display(pnlHistory.as_of)}}</p><RecordTable :rows="facts(pnlHistory.items)" :columns="cols({day:'日期',is_session:'交易日',daily_pnl_fen:'自然日投资收益',daily_return_pct:'基础收益率（%）',daily_return_reason:'收益率原因',equity_fen:'证券权益',quality:'质量',reasons:'原因',reason:'不可用原因'})"><template #actions="{row}"><button @click="pnlDay(row)">查看该日持仓</button></template></RecordTable></template><h3>V9/G2 策略观察池</h3>

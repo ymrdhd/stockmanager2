@@ -75,6 +75,14 @@ def quotes(instrument_id: str,as_of: datetime,svc: Service,quote_revision: int|N
     return invoke(svc.quotes,instrument_id,as_of,quote_revision,available_at)
 
 
+@router.get('/portfolio/{account_id}/reconciliation')
+def reconciliation(account_id: str, as_of: datetime, svc: Service,
+                   ledger_revision: int | None=None, quote_revision: int | None=None,
+                   database_uuid: str | None=None, generation: int | None=None):
+    return invoke(svc.reconciliation, account_id, as_of, ledger_revision, quote_revision,
+                  database_uuid, generation)
+
+
 @router.get('/portfolio/{account_id}')
 def valuation(account_id: str,as_of: datetime,svc: Service,previous_trading_day: date|None=None,quote_revision: int|None=None, ledger_revision: int|None=None, database_uuid: str|None=None,generation: int|None=None):
     return invoke(svc.valuation,account_id,as_of,previous_trading_day,quote_revision,ledger_revision,database_uuid,generation)

@@ -14,7 +14,7 @@ function ref<T>(initial:T):Ref<T>{let v=initial;const listeners=new Set<()=>void
 function watch<T>(source:Ref<T>,callback:()=>void){source.listeners.add(callback)}
 function deferred<T>(){let resolve!:(value:T)=>void,reject!:(reason:unknown)=>void;const promise=new Promise<T>((r,j)=>{resolve=r;reject=j});return {promise,resolve,reject}}
 const tick=()=>new Promise<void>(r=>setImmediate(r))
-type Setup={pnlDay(row:Fact):Promise<void>;wentOffline():void;freshness:Ref<string>;writable:Ref<boolean>;system:Ref<Fact|null>;overview:Ref<Fact|null>;health:Ref<Fact>;selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
+type Setup={pnlDay(row:Fact):Promise<void>;loadReconciliation():Promise<void>;reconciliationReport:Ref<Fact|null>;reconciliationError:Ref<string>;reconciliationLoading:Ref<boolean>;wentOffline():void;freshness:Ref<string>;writable:Ref<boolean>;system:Ref<Fact|null>;overview:Ref<Fact|null>;health:Ref<Fact>;selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
 function setup(request:(path:string)=>Promise<Fact>):Setup{
   const raw=readFileSync(process.env.SM2_WORKSPACE_SOURCE || new URL('../src/pages/WorkspacePage.vue',import.meta.url),'utf-8')
   const source=raw.split('<script setup lang="ts">')[1].split('</script>')[0].replace(/^import .*$/gm,'')
@@ -22,7 +22,7 @@ function setup(request:(path:string)=>Promise<Fact>):Setup{
   const context={ref,watch,computed:(get:()=>unknown)=>({get value(){return get()}}),onMounted:()=>{},onBeforeUnmount:()=>{},
     api:request,ApiError,fact,facts,page,str,WriteAttempt,AccountScope,display,localTime,money,shanghaiTime,URLSearchParams,Date,
     harness:null as Setup|null}
-  runInNewContext(js+`\nglobalThis.harness={selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,
+  runInNewContext(js+`\nglobalThis.harness={selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,reconciliationReport,reconciliationError,reconciliationLoading,loadReconciliation,
   investmentError:typeof investmentError==='undefined'?{value:''}:investmentError,
   investmentLoading:typeof investmentLoading==='undefined'?{value:false}:investmentLoading,
   navigate,refreshInvestment,refreshStrategy,loadPnlMonth,readTrade,pnlDay,wentOffline,freshness,writable,system,overview,health};`,context)
@@ -91,4 +91,31 @@ test('Workspace refuses different version of month detail',async()=>{
   const w=setup(async path=>path.includes('/month?')?snap:{...snap,ledger_revision:6,as_of:row.as_of})
   w.selectedAccount.value='A';w.pnlMonth.value='2026-01';await w.loadPnlMonth();await w.pnlDay(row)
   assert.equal(w.valuation.value,null);assert.equal(w.pnlHistory.value,null);assert.match(w.investmentError.value,/版本/)
+})
+
+
+test('Workspace reconciliation preview is bound to the displayed account and exact valuation snapshot',async()=>{
+  const snapshot={account_id:'A',as_of:'2026-01-06T08:00:00+00:00',ledger_revision:7,quote_revision:4,database_uuid:'db-a',generation:2}
+  let called=''
+  const w=setup(async path=>{
+    called=path
+    return {...snapshot,source:'sqlite_ledger_read_snapshot',quality:'valid',summary:{effective_trade_count:1},checks:[],exceptions:[]}
+  })
+  w.selectedAccount.value='A';w.valuation.value=snapshot
+  await w.loadReconciliation()
+  assert.match(called,/\/portfolio\/A\/reconciliation\?/)
+  for(const value of ['as_of=2026-01-06T08%3A00%3A00%2B00%3A00','ledger_revision=7','quote_revision=4','database_uuid=db-a','generation=2'])assert.ok(called.includes(value),value)
+  assert.equal(w.reconciliationReport.value?.account_id,'A')
+  assert.equal(w.reconciliationLoading.value,false)
+  w.selectedAccount.value='B'
+  assert.equal(w.reconciliationReport.value,null,'account change must clear the prior account reconciliation immediately')
+})
+
+test('Workspace rejects reconciliation returned for another snapshot',async()=>{
+  const snapshot={account_id:'A',as_of:'2026-01-06T08:00:00+00:00',ledger_revision:7,quote_revision:4,database_uuid:'db-a',generation:2}
+  const w=setup(async()=>({...snapshot,ledger_revision:8,source:'sqlite_ledger_read_snapshot'}))
+  w.selectedAccount.value='A';w.valuation.value=snapshot
+  await w.loadReconciliation()
+  assert.equal(w.reconciliationReport.value,null)
+  assert.match(w.reconciliationError.value,/同一数据库/)
 })
