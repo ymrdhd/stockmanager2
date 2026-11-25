@@ -158,3 +158,56 @@ def list_backups(directory: Path) -> dict:
     else:
         note = None
     return {'items': items, 'directory': str(path), 'note': note}
+
+
+def daily_backup(settings: DatabaseSettings, directory: Path, *, now=None) -> dict:
+    """One verified automatic snapshot per UTC day; retain 7 daily + 4 weekly.
+
+    Manual, restore and takeover backups, other identities and corrupt snapshots
+    are never removed by this policy. A failed new backup never triggers pruning.
+    """
+    from datetime import date, timedelta
+    from backend.infrastructure.database import writer_lock
+    from backend.infrastructure.restore import check_backup
+    import re
+    if settings.mode != 'server':
+        raise DatabaseError('automatic backup requires bound formal ledger')
+    day = (now or datetime.now(UTC)).astimezone(UTC).date()
+    root = absolute_path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    prefix = f'auto-{settings.expected_uuid}-g{settings.generation}-'
+    target = root / (prefix+day.isoformat())
+    with writer_lock(settings.binding_path), writer_lock(root/'auto-retention'):
+        validate_binding(settings)
+        if not target.exists():
+            create_backup(settings,target)
+        if not check_backup(settings,target)['ok']:
+            raise DatabaseError('daily snapshot invalid; retention refused')
+        verified = []
+        for path in root.iterdir():
+            if not path.name.startswith(prefix) or path.is_symlink() or not path.is_dir():
+                continue
+            suffix = path.name[len(prefix):]
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',suffix):
+                continue
+            try:
+                when = date.fromisoformat(suffix)
+            except ValueError:
+                continue
+            if when > day or {p.name for p in path.iterdir()} != {SNAPSHOT_NAME,MANIFEST_NAME}:
+                continue
+            if any(p.is_symlink() for p in path.iterdir()) or not check_backup(settings,path)['ok']:
+                continue
+            verified.append((when,path))
+        keep = {p for d,p in verified if d >= day-timedelta(days=6)}
+        weeks = set()
+        for d,p in sorted(verified,reverse=True):
+            week = d-timedelta(days=d.weekday())
+            if p not in keep and week not in weeks and len(weeks)<4:
+                keep.add(p); weeks.add(week)
+        removed = []
+        for _,p in verified:
+            if p not in keep:
+                shutil.rmtree(p)
+                removed.append(p.name)
+        return {'ok':True,'snapshot':str(target),'removed':removed,'kept':len(keep)}

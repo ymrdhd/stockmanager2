@@ -1,9 +1,9 @@
 # 当前状态（每轮覆盖，不累计日志）
 
-- 当前迭代：`09-release-candidate`，**部分实现，CHANGES_REQUIRED / 发布阻断，未发布**。已获用户批准采用恢复后的 08 Git BASE `7271eac6801b22a980d06de9e2a7778615b4c226`（原 08 BASE `6446ee09b821b8bf818a528186148e255e9aa2d4` 对象缺失，不伪造 SHA）。工作区开工干净，08 包 44/44 文件精确字节及 manifest 校验通过；原策略 ZIP SHA256 `1edc58feabbe2e32cda9bfb2bd34f205f4cd3c4b0b3e008e5910002b6af6cc06`。
-- 策略：显式 current/historical、行情完成日与账本截止分离，当前周末/盘前使用实时账本；历史只读且获取时间截止，未实现完整双时态更正/配置版本，明确不可核实，不输出可执行建议。冻结 ATR 及 ETF 未复权/G2 指数分离不变。未核实、重复引用、过期信号仍允许记录真实成交，不给有效保护指令。观察池新计划先汇总现金/核心槽位，竞争时保守阻断，不擅定优先级；未完成跨请求原子容量保证。NDX 旧辅助缓存不能证明现仓，暂禁执行建议。原策略 ZIP `subroutine/index_strategy/service.py` 915–950、1250–1289 与 `mixins/trading_ops.py` 91–139：再次买入信号日 RANGE 动态决定 3/10 日，不冻结实际卖出日状态；不改该规则。
-- 迁移：无任意账户日期，已知事实最早日期保留来源、推断标记需确认，未知拒绝；运行前持久化 running，拒绝中断/孤立记录/旧协议/未知源版本/变动来源；重复运行保留历史阻断。1000 vs 600 股未解释差异阻断。正式财务服务同一截止投影、版本、月度和有效成交费用统计写入报告，来源同一时点估值仍未核实，因此仍禁止接管。未实现完整逐项源目标勾稽及 ISS-041 新迁移接管命令，现有备份恢复不能代替接管。
-- 实测（独立组有重叠，不能相加为全量）：`python -m pytest -q tests/unit/test_rc_decision_time.py tests/unit/test_strategy_service.py tests/unit/test_trading.py tests/unit/test_corrections.py` 最终 72 PASS；`python -m pytest -q tests/unit/test_migration.py` 11 PASS，随后新增三例 `-k test_rc_` 3 PASS；最终证据/报告四例定向复核 PASS。`python -m pytest -q tests/unit/test_backup_restore.py tests/unit/test_security.py tests/unit/test_market.py tests/unit/test_market_provider.py` 67 PASS；`tests/unit/test_market_resolution.py -k iss019` 1 PASS。`npm test` 34 PASS；`uv lock --check --offline` PASS；`compileall`/`git diff --check` PASS。未运行全量历史回归。初轮扩展 64 PASS/2 FAIL（时钟及未核实模型夹具），后续 27 PASS/1 FAIL（未核实保护价断言），容量扩展 29 PASS/2 FAIL（同池多机会期望）；修正后以最终专项为准，保留技术信号与公式断言，另加不可执行断言。
-- 构建：Node 22.16.0/npm 10.9.2；`npm ci --offline --no-audit --no-fund` FAIL（ENOTCACHED vue-tsc 3.3.14），`npm run build` FAIL（vue-tsc not found；Vite NOT RUN）。无本轮生产 dist，不交付 RC 运行包；浏览器、两标签真实丢响应、Windows 中文空格路径、双机 Tailscale、完整锁定 Python 环境安装均 NOT RUN。未用历史 dist 或开发服务器替代。
-- 实网：2026-11-25 北京时间 09:50，`timeout 25s python -u tools/verify_market_live.py` 退出 1，三标的 spot/daily 六项失败（首次 transport unavailable，其余 cooldown），未重试。ISS-022 保持 OPEN。核对 SSE https://www.sse.com.cn/disclosure/dealinstruc/closed/ 与 SZSE https://www.szse.cn/disclosure/notice/general/，未找到 2027 可信正式休市安排；保留 2026-12-31 安全上限，ISS-019 OPEN。
-- 未处理正式库、未部署、未自动下单；真实旧库未提供，只用生成夹具。全量历史配置/历史账本、三类真实样本、完整对账、接管、保留期/加密异地备份、Windows 脚本与真实浏览器验收仍阻断；下一步独立审查与补齐。交付 A 增量、B 完整当前恢复源码、D 原恢复 BASE bundle，C 不交付。原参考 ZIP 单独保存。勿以源码包启动正式服务。
+- 当前迭代：`09B-release-blocker-closure`；**CHANGES_REQUIRED，未批准 RC1、未正式发布**。09 完整源码及 12/12 增量校验一致，实际开工 BASE `0fc2309a875c28cb0bb4b46b3d324029f0cdd084`，前序 08 BASE `7271eac6801b22a980d06de9e2a7778615b4c226`。
+- 接管 CLI 与中断维护标记、备份、绑定/generation、显式回滚已实现；合成成功及中断拒绝/恢复通过。必须实际停所有写端，Windows 与真实库验收未执行。
+- 迁移协议 09B、独立同截止声明、普通转账、逐项对账与未知/差异阻断；纯财务合成样本对账接管通过，证券/混合夹具验证重建及阻断，干净证券/混合接管与真实库未验收。旧协议 sandbox 不混用。
+- 策略计划事务内容量复核、信号/计划原子、真实交易幂等；NDX 原辅助规则接入仓位证据与现金缓冲，仍不提供可执行辅助建议，完整周期待审。原动态3/10日冷却不改；完整历史配置与研究回放授权延期，历史证据不足仍禁执行。
+- 基础每日 SQLite 一致性备份与保留策略，Windows 操作/演示脚本，日历覆盖 UI；合成演示生成 PASS，生产浏览器/Windows/双机 NOT RUN。保持 XSHG 2026-12-31 上限。
+- 集中专项69 PASS；最终事务/身份/日历扩展63 PASS（有重叠）；另接管6及迁移/接管20 PASS。实际命令及风险见 `09B_REPORT.md`；本地操作见 `09B_LOCAL_ACCEPTANCE.md`。09 的 npm ENOTCACHED 与行情六项 FAIL 历史记录保留，09B 按授权不在受限环境重试，生产构建/实网 NOT RUN。无 dist、无 RC1 运行包。
+- 停止开发，提交 A/B/C/E/F；原始策略 ZIP 单独保留。未操作用户正式库、未部署、未自动下单。独立回归与本地验收决定发布资格，不开启10阶段。

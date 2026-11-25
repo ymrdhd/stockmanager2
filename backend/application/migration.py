@@ -29,7 +29,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from backend.application.finance import BalanceInput, BillInput, FinanceService, month_start
+from backend.application.finance import BalanceInput, BillInput, FinanceService, TransferInput, month_start
 from backend.application.portfolio import OpeningInput, PortfolioService
 from backend.application.trading.service import (
     AccountInput,
@@ -101,7 +101,7 @@ CATEGORY_BY_NATURE = {"INCOME": "other_income", "EXPENSE": "other_expense", "FEE
 
 STRATEGY_KEY = "index_strategy:v1:position:"
 STRATEGY_VERSION = "index-strategy-atr-v9.2"
-MIGRATION_PROTOCOL = "09-rc1"
+MIGRATION_PROTOCOL = "09B-rc1"
 UNADJUSTED_BASIS = "unadjusted_etf_price"
 
 #: Migration writes are stamped against a clock that always postdates the facts.
@@ -369,7 +369,7 @@ def load_legacy_accounts(conn_finance: sqlite3.Connection | None) -> list[dict[s
 # --------------------------------------------------------------------------- #
 def probe(stock_db: Path, finance_db: Path | None = None) -> dict[str, Any]:
     """Describe both legacy sources without modifying either file."""
-    stock_db = Path(stock_db)
+    stock_db = Path(stock_db).resolve()
     before = (stock_db.stat().st_mtime, stock_db.stat().st_size)
     stock_sha = sha256_of(stock_db)
     with open_source(stock_db) as conn:
@@ -672,6 +672,10 @@ def migrate_accounts(db, run: _Run, svc: TradeService,
         legacy_type = str(account["account_type"])
         name = account["name"]
         source_id = f"account:{account['id']}"
+        if account["currency"] != "CNY" or not account["is_own_account"] or not account["is_active"]:
+            run.difference("account_scope_or_currency_unresolved", f"{name}: currency/ownership/inactive state needs review", True)
+            run.skip(db,"account","account_scope_or_currency_unresolved",source_id)
+            continue
         existing = already_migrated(db, "account", run.stock_sha, source_id)
         if existing is not None:
             run.accounts[name] = {"target_id": existing["target_id"],
@@ -735,6 +739,8 @@ def migrate_accounts(db, run: _Run, svc: TradeService,
         if kind == "securities" and not seen_securities:
             primary, seen_securities = name, True
     if primary is None:
+        if not run.stock_dates and not any(a['account_type']=='SECURITIES_CASH' for a in legacy_accounts):
+            return None
         if not run.stock_dates or any(a['account_type']=='SECURITIES_CASH' for a in legacy_accounts):
             run.difference('securities_account_date_unresolved', 'No confirmed securities account mapping/effective date; manual review required', True)
             return None
@@ -761,7 +767,7 @@ def migrate_accounts(db, run: _Run, svc: TradeService,
             "multiple_securities_accounts",
             f"{len(securities)} securities accounts were created; the legacy kv_store "
             f"trade history carries no account column, so every migrated execution is "
-            f"booked on {primary} and the others hold no trading facts")
+            f"booked on {primary} and the others hold no trading facts", True)
     return primary
 
 
@@ -814,6 +820,7 @@ def migrate_openings(db, run: _Run, portfolio_svc: PortfolioService,
         lots = [lot for lot in entry.get("lots") or [] if isinstance(lot, dict)]
         quantity = sum(whole_quantity(lot.get("qty")) or 0 for lot in lots)
         if quantity <= 0:
+            run.difference("unverifiable_opening_quantity", code, True)
             run.skip(db, "position", "unverifiable_opening_quantity", source_id,
                      {"code": code})
             continue
@@ -824,7 +831,7 @@ def migrate_openings(db, run: _Run, portfolio_svc: PortfolioService,
             run.difference(
                 "unverified_opening_position",
                 f"{code}: cached {quantity} shares vs {confirmed} confirmed by "
-                f"daily_stock_snapshot; no baseline was migrated")
+                f"daily_stock_snapshot; no baseline was migrated", True)
             continue
         cost_fen = 0
         for lot in lots:
@@ -842,17 +849,19 @@ def migrate_openings(db, run: _Run, portfolio_svc: PortfolioService,
             run.skip(db, "position", "opening_cost_unknown", source_id, {"code": code})
             run.difference("unverified_opening_cost",
                            f"{code}: the cached lot cost is not a usable number; the "
-                           f"baseline carries no remaining cost")
+                           f"baseline carries no remaining cost", True)
             continue
         at = parse_legacy_time(lots[0].get("buy_date")) or parse_legacy_time(
             entry.get("buy_date"))
         if at is None:
             run.skip(db, "position", "opening_date_unknown", source_id, {"code": code})
+            run.difference("opening_date_unknown", code, True)
             continue
         if already_migrated(db, "opening", run.stock_sha, source_id) is not None:
             run.skip(db, "position", "already_migrated", source_id)
             run.baseline_used = True
             continue
+        run.difference("opening_fees_unverified", f"{code}: cached cost does not independently prove remaining fees; confirm statement", True)
         created = portfolio_svc.opening(OpeningInput(
             request_id=request_id(run.stock_sha, "opening", source_id),
             account_id=account_id, instrument_id=run.instruments[code],
@@ -881,6 +890,7 @@ def migrate_cash(db, run: _Run, svc: TradeService, conn_source: sqlite3.Connecti
         amount = yuan_to_fen(snapshot[1])
         source_id = f"cash-opening:{snapshot[0]}"
         if at is None or amount is None or amount < 0:
+            run.difference("unverifiable_opening_cash", str(snapshot[0]), True)
             run.skip(db, "cash", "unverifiable_opening_cash", source_id,
                      {"date": snapshot[0], "cash_balance": snapshot[1]})
         elif already_migrated(db, "cash", run.stock_sha, source_id) is not None:
@@ -905,7 +915,7 @@ def migrate_cash(db, run: _Run, svc: TradeService, conn_source: sqlite3.Connecti
         if at is None or net is None or net == 0:
             run.skip(db, "cash", "unverifiable_cash_flow", source_id, {"entry": entry})
             run.difference("unverifiable_cash_flow",
-                           f"transfer_data entry {entry!r} has no usable date or amount")
+                           f"transfer_data entry {entry!r} has no usable date or amount", True)
             continue
         if already_migrated(db, "cash", run.stock_sha, source_id) is not None:
             run.skip(db, "cash", "already_migrated", source_id)
@@ -957,6 +967,8 @@ def trade_source_id(index: int, trade: dict[str, Any]) -> str:
 def migrate_trades(db, run: _Run, svc: TradeService, trades: list[dict[str, Any]],
                    account_id: str | None) -> None:
     """Rebuild executions through ``TradeService.submit`` only."""
+    if not trades:
+        return
     if account_id is None:
         run.difference("no_securities_account",
                        "no ledger account could be resolved for the legacy trades", True)
@@ -1127,22 +1139,42 @@ def migrate_bills(db, run: _Run, svc: FinanceService,
             run.skip(db, "bill", "legacy_transaction_not_posted", source_id,
                      {"status": status})
             continue
+        if nature == 'INTERNAL_TRANSFER':
+            endpoints = [id_to_account.get(i) for i in (source_account, target_account)]
+            targets = [run.accounts.get(a['name']) if a else None for a in endpoints]
+            at = parse_legacy_time(occurred_at)
+            if all(t and t['kind'] != 'securities' for t in targets) and at is not None and type(amount) is int and amount > 0:
+                ids = [t['target_id'] for t in targets]
+                with db.read() as conn:
+                    balances = [conn.execute("SELECT id,occurred_at FROM balance_adjustments WHERE account_id=? AND status='effective' ORDER BY occurred_at DESC,rowid DESC LIMIT 1", (i,)).fetchone() for i in ids]
+                if all(b and datetime.fromisoformat(b[1]) >= at for b in balances):
+                    if already_migrated(db, 'transfer', run.stock_sha, source_id):
+                        run.skip(db, 'transfer', 'already_migrated', source_id)
+                        continue
+                    created = svc.transfer(TransferInput(request_id=request_id(run.stock_sha,'transfer',source_id),
+                        from_account_id=ids[0],to_account_id=ids[1],amount_fen=amount,occurred_at=at,
+                        from_included=True,to_included=True,from_balance_id=balances[0][0],to_balance_id=balances[1][0],
+                        note=(description or 'legacy transfer, included in observed balance')[:2000]))
+                    record(db,run,'transfer',source_id,'finance_transfers',created['id'],{'amount_fen':amount})
+                    continue
         if nature in NATURES_WITHOUT_BILL_EQUIVALENT:
             run.skip(db, "bill", f"nature_without_bill_equivalent:{nature}", source_id,
                      {"description": description})
             run.difference(
                 "bill_nature_without_equivalent",
                 f"legacy transaction #{transaction_id} ({nature}) has no safe 2.0 bill "
-                f"equivalent; it is reported, not posted")
+                f"equivalent; it is reported, not posted", True)
             continue
         kind = NATURE_KIND.get(str(nature))
         if kind is None:
+            run.difference("unknown_bill_nature", f"{transaction_id}: {nature}", True)
             run.skip(db, "bill", f"unknown_bill_nature:{nature}", source_id,
                      {"description": description})
             continue
         account = id_to_account.get(source_account or target_account or 0)
         target = run.accounts.get(account["name"]) if account else None
         if target is None or target.get("target_id") is None:
+            run.difference("bill_account_not_migrated", f"{transaction_id}", True)
             run.skip(db, "bill", "bill_account_not_migrated", source_id,
                      {"account_id": source_account})
             continue
@@ -1152,7 +1184,7 @@ def migrate_bills(db, run: _Run, svc: FinanceService,
             run.difference(
                 "bill_on_securities_account",
                 f"legacy transaction #{transaction_id} is booked on a securities account; "
-                f"2.0 keeps securities cash inside the ledger, so the bill was not posted")
+                f"2.0 keeps securities cash inside the ledger, so the bill was not posted", True)
             continue
         if already_migrated(db, "bill", run.stock_sha, source_id) is not None:
             run.skip(db, "bill", "already_migrated", source_id)
@@ -1523,8 +1555,8 @@ def source_summary(stock_path: Path, finance_path: Path | None,
             "finance": (detect_finance_schema(conn_finance, finance_tables)["detected"]
                         if conn_finance is not None else None),
         },
-        "stock_path": str(stock_path),
-        "finance_path": str(finance_path) if finance_path else None,
+        "stock_path": str(stock_path.resolve()),
+        "finance_path": str(finance_path.resolve()) if finance_path else None,
         "stock_size": Path(stock_path).stat().st_size,
         "finance_size": Path(finance_path).stat().st_size if finance_path else None,
     }
@@ -1638,6 +1670,8 @@ def _finish(db, run: _Run, source: dict[str, Any], *, previous_run: bool,
     if sha256_of(run.stock_path) != run.stock_sha or (run.finance_path and sha256_of(run.finance_path) != run.finance_sha):
         run.difference('source_changed_during_run', 'source checksum changed during migration; discard this sandbox from takeover', True)
         report['blocks_formal_takeover'] = True
+    report["target_identity"] = {"uuid": db.identity.database_uuid, "generation": db.identity.generation,
+                                 "schema_version": db.identity.schema_version}
     report["run_id"] = run.run_id
     report["target"] = str(Path(target).resolve())
     report["dry_run"] = dry_run
@@ -1662,8 +1696,8 @@ def _open_sources(stock_db: Path, finance_db: Path | None):
 def run_migration(stock_db: Path, finance_db: Path | None, target: Path, *,
                   confirm: bool, target_role: str = "sandbox") -> dict[str, Any]:
     """Migrate into an isolated sandbox target and return the reconciliation report."""
-    stock_db = Path(stock_db)
-    finance_db = Path(finance_db) if finance_db else None
+    stock_db = Path(stock_db).resolve()
+    finance_db = Path(finance_db).resolve() if finance_db else None
     if not confirm:
         raise Refused("migration writes are refused without --confirm")
     target = target_guard(target, target_role)
@@ -1734,8 +1768,8 @@ def run_migration(stock_db: Path, finance_db: Path | None, target: Path, *,
 
 def rehearsal(stock_db: Path, finance_db: Path | None, target: Path) -> dict[str, Any]:
     """Run the whole migration against a throwaway sandbox; ``--target`` is untouched."""
-    stock_db = Path(stock_db)
-    finance_db = Path(finance_db) if finance_db else None
+    stock_db = Path(stock_db).resolve()
+    finance_db = Path(finance_db).resolve() if finance_db else None
     target_guard(target, "sandbox")
     started = datetime.now(UTC)
     conn_source, conn_finance, contexts = _open_sources(stock_db, finance_db)

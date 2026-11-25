@@ -25,9 +25,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime, time
 import json
 import logging
+import math
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -38,11 +40,11 @@ from backend.application.strategy.series import (
     ETF_UNADJUSTED, INDEX_BASIS, SeriesError, StrategyData, basis_unit,
     config_fingerprint, series_summary,
 )
-from backend.application.strategy.store import StrategyStore
+from backend.application.strategy.store import CapacityRefused, StrategyStore
 from backend.application.trading.service import SCALE, rows, utc, verified_trade_signal
 from backend.domain.strategy.calendars import CalendarCoverageError, market_clock
 from backend.domain.strategy.config import (
-    INDEX_STRATEGY_VERSION, PORTFOLIO_MAX_POSITIONS, G2_ENABLED, get_config, NDX_AUX_INITIAL_RATIO,
+    INDEX_STRATEGY_VERSION, PORTFOLIO_MAX_POSITIONS, G2_ENABLED, get_config, NDX_AUX_INITIAL_RATIO, NDX_AUX_CASH_BUFFER,
 )
 from backend.domain.strategy.entry import (
     STATUS_DATA_UNAVAILABLE, STATUS_SIGNAL, FILL_CANCELLED, FILL_FILLED,
@@ -61,7 +63,7 @@ from backend.domain.strategy.symbols import (
     configured_index_ids, etf_code_of, normalize_index_id, peers_of,
 )
 from backend.domain.strategy.v9_rules import (
-    base_position_amount, evaluate_pyramid, ma_snapshot,
+    base_position_amount, evaluate_pyramid, ma_snapshot, evaluate_ndx_aux,
 )
 from backend.infrastructure.database import Database
 
@@ -169,7 +171,14 @@ class StrategyService:
                 if persist and item['index_id'] not in deferred:
                     self.store.clear_plan(account_id, item['index_id'], reason='组合容量不足，旧计划不可执行')
             elif item['index_id'] in deferred:
-                signal = deferred[item['index_id']]()
+                try:
+                    signal = deferred[item['index_id']]()
+                except CapacityRefused as exc:
+                    item['status'] = 'PORTFOLIO_CAPACITY_BLOCKED'
+                    item['tradable'] = False
+                    item['tradable_block_reason'] = str(exc)
+                    item['reason_codes'].append('transaction_capacity_refused')
+                    continue
                 if signal is None:
                     item['status'] = 'SIGNAL_CONSUMED'
                     item['reason_codes'].append('signal_already_consumed')
@@ -177,6 +186,7 @@ class StrategyService:
                     item['signal_id'] = signal['signal_id']
                     item['input_version'] = signal['input_version']
                     item['tradable'] = item['price_basis'] == ETF_UNADJUSTED and bool(item['etf_code'])
+                    item['capacity_kind'] = 'plan_capacity_checked_not_cash_escrow'
         return {
             'as_of': day, **self._time_payload(day),
             'strategy_version': INDEX_STRATEGY_VERSION,
@@ -210,6 +220,8 @@ class StrategyService:
         except (CalendarUnavailable, CalendarCoverageError, StrategyCalendarUnavailable) as exc:
             return self._unavailable(canonical, cfg, '交易日历不可用', SeriesError(str(exc)), ETF_UNADJUSTED if cfg.uses_etf_underlying else INDEX_BASIS)
         historical = self._historical(as_of)
+        with self.db.read() as conn:
+            evidence_revision = conn.execute("SELECT ledger_revision FROM ledger_state").fetchone()[0]
         persist = persist and not historical
         allow_network = allow_network and persist
         clock = market_clock(cfg.clock_market)
@@ -364,12 +376,14 @@ class StrategyService:
                         except SeriesError:
                             peer_versions['G2:'+idx] = 'unavailable'
                 def commit_entry():
-                    signal_row = self._record_signal(account_id, canonical, cfg, series, plan,
-                                                    regime, factor, combo, basis, unit,
-                                                    peer_versions, as_of)
-                    if self._plan_used(account_id, signal_row, as_of):
-                        return None
-                    else:
+                    # Signal and capacity claim publish in ONE transaction. Failed
+                    # capacity checks cannot leave an apparently verified orphan.
+                    with self.db.transaction() as conn:
+                        signal_row = self._record_signal(account_id, canonical, cfg, series, plan,
+                                                        regime, factor, combo, basis, unit,
+                                                        peer_versions, as_of, connection=conn)
+                        if conn.execute("SELECT 1 FROM trade_executions WHERE account_id=? AND side='buy' AND status IN ('effective','reversed') AND json_extract(payload,'$.signal_id')=?",(account_id,signal_row['signal_id'])).fetchone():
+                            return None
                         self.store.save_plan(
                             account_id=account_id, index_id=canonical, signal_date=plan.signal_date,
                             strategy_version=INDEX_STRATEGY_VERSION, status=STATUS_SIGNAL,
@@ -378,13 +392,21 @@ class StrategyService:
                             atr14=plan.atr14, buy_max=plan.buy_max,
                             initial_stop_reference=plan.initial_stop_reference,
                             trail_trigger_reference=plan.trail_trigger_reference, detail=plan.detail,
+                            capacity_check=lambda c: self._check_plan_capacity(c, account_id, canonical, as_of, signal_row['signal_id'], evidence_revision=evidence_revision),
+                            connection=conn,
                         )
                     return signal_row
                 if deferred_entries is not None:
                     deferred_entries[canonical] = commit_entry
                 else:
-                    signal_row = commit_entry()
-                    if signal_row is None:
+                    try:
+                        signal_row = commit_entry()
+                    except CapacityRefused as exc:
+                        status = 'PORTFOLIO_CAPACITY_BLOCKED'
+                        reason_codes.append('transaction_capacity_refused')
+                        detail += '；'+str(exc)
+                        signal_row = None
+                    if signal_row is None and status != 'PORTFOLIO_CAPACITY_BLOCKED':
                         status = 'SIGNAL_CONSUMED'
                         reason_codes.append('signal_already_consumed')
             else:
@@ -402,10 +424,14 @@ class StrategyService:
                 regime_state=regime.state, regime_label=regime.label,
             ).to_payload()
             if cfg.is_us_track and not historical:
-                # A legacy auxiliary cache is not current custody. Until allocation
-                # lineage and its market clock are verified, do not emit a T5 action.
-                ndx_aux = {'status': 'DATA_UNAVAILABLE', 'detail': 'NDX 辅助仓比例与补仓日期缺少真实账本核验，不提供执行建议',
-                           'current_ratio': None, 'target_ratio': None, 'target_amount': None}
+                ndx_aux = self._ndx_advice(account_id, as_of, cfg, series, held)
+
+        # Initial NDX T5 advice is independent of the A-share core slots. It is
+        # not a reserved plan and never supplies an executable order.
+        if cfg.is_us_track and not held and safe and not historical:
+            ndx_aux = self._ndx_advice(account_id, as_of, cfg, series, held)
+        if cfg.is_us_track and ndx_aux is None:
+            ndx_aux = {'status':'DATA_UNAVAILABLE','detail':'历史或真实 NDX 策略证据不足，不提供执行建议','tradable':False,'capacity_kind':'advice_only_no_reservation'}
 
         atr = compute_atr14(series.highs, series.lows, series.closes)
         price_now = float(series.closes[-1])
@@ -442,6 +468,7 @@ class StrategyService:
                               and safe and not historical and signal_row is not None)),
             'tradable_block_reason': ('历史回放不可执行' if historical else _tradable_block_reason(basis, cfg, series, live_qty)),
             'series': series_summary(series), 'warnings': warnings,
+            'capacity_kind': 'plan_capacity_checked_not_cash_escrow' if signal_row else 'advice_only_no_reservation',
             'read_only': not persist,
         }
 
@@ -670,6 +697,90 @@ class StrategyService:
             versions[key] = self.data.input_version(peer, completed_on=as_of, basis=basis)
         return peers, versions
 
+    def _check_plan_capacity(self, conn, account_id: str, index_id: str, day: str, signal_id: str, *, evidence_revision=None):
+        """Under BEGIN IMMEDIATE, recalculate actual cash, lots and all active plans.
+
+        Active plans count as dynamic capacity claims, not cash movements. Real
+        executions remain authoritative even when they exceed a prior claim.
+        """
+        if evidence_revision is not None and conn.execute("SELECT ledger_revision FROM ledger_state").fetchone()[0] != evidence_revision:
+            raise CapacityRefused("ledger changed during signal evaluation; refresh")
+        at = self._decision_time(day)
+        cutoff = utc(at)
+        try:
+            window = market_window(at)
+            valuation = self.portfolio._valuation(conn, account_id, at, window,
+                                                   self.portfolio._revision(conn, None))
+        except Exception as exc:
+            raise CapacityRefused('current valuation unavailable') from exc
+        equity, cash = valuation['equity_fen'], valuation['cash_fen']
+        if equity is None or cash is None or valuation['cash_quality'] != 'valid':
+            raise CapacityRefused('current cash or equity unavailable')
+        if conn.execute("SELECT 1 FROM trade_executions WHERE account_id=? AND side='buy' AND status IN ('effective','reversed') AND json_extract(payload,'$.signal_id')=?", (account_id, signal_id)).fetchone():
+            raise CapacityRefused('signal already consumed')
+        held = set()
+        for lot in self.portfolio._lots(conn, account_id, cutoff):
+            if lot['quantity'] <= 0 or lot['lot_role'] != 'main' or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
+                continue
+            code = conn.execute('SELECT code FROM instruments WHERE id=?', (lot['instrument_id'],)).fetchone()[0]
+            idx = self._lot_index({'code':code})
+            if idx is None:
+                raise CapacityRefused('unmapped actual strategy holding')
+            held.add(idx)
+        if index_id in held:
+            raise CapacityRefused('actual holding already exists')
+        active = {row[0] for row in conn.execute("SELECT index_id FROM strategy_plans WHERE account_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')", (account_id,))}
+        claims = (active - held) | {index_id}
+        try:
+            slots = sum(get_config(idx).counts_against_core_slots for idx in held | claims)
+            budget = sum(math.ceil(entry_amount(equity,get_config(idx))) for idx in claims)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CapacityRefused('unverified capacity claim') from exc
+        buffer = math.ceil(NDX_AUX_CASH_BUFFER*100) if any(get_config(idx).is_us_track for idx in claims) else 0
+        if slots > PORTFOLIO_MAX_POSITIONS or budget + buffer > cash:
+            raise CapacityRefused('account cash or core slots exhausted by active plans')
+
+    def _ndx_advice(self, account_id, as_of, cfg, series, held):
+        unavailable = {'status':'DATA_UNAVAILABLE','detail':'NDX 实际持仓/现金/行情证据不足',
+                       'current_ratio':None,'target_ratio':None,'target_amount':None,
+                       'tradable':False,'capacity_kind':'advice_only_no_reservation'}
+        try:
+            value = self.portfolio.valuation(account_id,self._decision_time(as_of))
+            equity,cash = value['equity_fen'],value['cash_fen']
+            if equity is None or equity<=0 or cash is None or value['cash_quality']!='valid':
+                return unavailable
+            positions = [p for p in value['positions'] if p['code']==cfg.etf_code]
+            if len(positions)>1 or any(p['market_value_fen'] is None for p in positions):
+                return unavailable
+            qty = sum(p['quantity'] for p in positions)
+            if qty != sum(l['remaining'] for l in held) or any(not l['signal_verified'] or l['scale_invalid'] for l in held):
+                return unavailable  # ordinary/mixed holdings and ambiguous scale
+            mv = sum(p['market_value_fen'] for p in positions)
+            us = market_clock('US')
+            completed = us.last_completed_session(now=self._decision_time(as_of))
+            if not completed:
+                return unavailable
+            # The original T5 function uses the configured series, but measures
+            # add intervals in completed US sessions, not future or calendar days.
+            sub = [l for l in held if l['lot_role']=='sub']
+            last = max((datetime.fromisoformat(l['opened_at']).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat() for l in sub),default=None)
+            elapsed = None
+            if last and us.covered(last) and last<=completed:
+                elapsed = sum(d<=completed for d in us.trading_days_after(last,10))
+            plan = asdict(evaluate_ndx_aux(series.closes,equity=equity/100,current_ratio=mv/equity,
+                                    days_since_add=elapsed,last_date=completed))
+            plan.update({'tradable':False,'capacity_kind':'advice_only_no_reservation','actual_cash_fen':cash,'actual_market_value_fen':mv})
+            if plan['status']=='ALLOW' and plan.get('target_amount') is not None:
+                with self.db.read() as conn:
+                    active = {r[0] for r in conn.execute("SELECT index_id FROM strategy_plans WHERE account_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')",(account_id,))}
+                claims = sum(math.ceil(entry_amount(equity,get_config(idx))) for idx in active)
+                need = max(0,math.ceil(plan['target_amount']*100)-mv)
+                if need+claims+math.ceil(NDX_AUX_CASH_BUFFER*100)>cash:
+                    plan.update({'status':'CASH_BLOCKED','detail':'实际现金扣除已有容量计划后不足以保留 25 万元缓冲'})
+            return plan
+        except (ValueError,KeyError,TypeError,CalendarCoverageError,CalendarUnavailable):
+            return unavailable
+
     def _custody(self, account_id: str, as_of: str) -> list[dict]:
         """真实账本中带策略标记的批次（主仓/子仓），用于和策略建议对照。
 
@@ -683,7 +794,7 @@ class StrategyService:
         result = []
         with self.db.read() as conn:
             for lot in self.portfolio._lots(conn, account_id, cutoff):
-                if lot['lot_role'] not in ('main','sub') or lot['quantity'] <= 0:
+                if lot['lot_role'] not in ('main','sub') or lot['quantity'] <= 0 or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
                     continue
                 instrument = rows(conn, 'SELECT code,market,kind FROM instruments WHERE id=?', (lot['instrument_id'],))[0]
                 trade = rows(conn, 'SELECT * FROM trade_executions WHERE id=?', (lot['open_execution_id'],)) if lot['open_execution_id'] else []
@@ -871,7 +982,7 @@ class StrategyService:
         with self.db.read() as conn:
             closed = []
             for lot in self.portfolio._lots(conn, account_id, cutoff):
-                if lot['lot_role'] != 'main' or lot['quantity'] != 0:
+                if lot['lot_role'] != 'main' or lot['quantity'] != 0 or lot['strategy_id'] != 'INDEX_STRATEGY_ATR':
                     continue
                 instrument = rows(conn,'SELECT code FROM instruments WHERE id=?',(lot['instrument_id'],))[0]
                 if self._lot_index(instrument) != index_id:
@@ -919,22 +1030,27 @@ class StrategyService:
         plan = _plan_from_row(plan_row, cfg)
         fill = evaluate_fill(plan, bar)
         if fill.status == FILL_FILLED and persist:
-            self.store.save_plan(
-                account_id=account_id, index_id=index_id, signal_date=signal_date,
-                strategy_version=INDEX_STRATEGY_VERSION, status='AWAITING_CONFIRMATION', signal_id=plan_row['signal_id'],
-                signal_close=plan_row['signal_close'], threshold_high=plan_row['threshold_high'],
-                atr14=plan_row['atr14'], buy_max=plan_row['buy_max'],
-                initial_stop_reference=plan_row['initial_stop_reference'],
-                trail_trigger_reference=plan_row['trail_trigger_reference'],
-                detail=(f'{next_day} 开盘 {fill.entry_price:.4f} 通过价格条件；'
-                        '须核对实际成交、数量与账户现金后经持仓录入确认，不自动建仓'))
-            warnings.append(f'{index_id} 计划已通过开盘价格条件，等待人工确认成交')
+            try:
+                self.store.save_plan(
+                    account_id=account_id, index_id=index_id, signal_date=signal_date,
+                    strategy_version=INDEX_STRATEGY_VERSION, status='AWAITING_CONFIRMATION', signal_id=plan_row['signal_id'],
+                    signal_close=plan_row['signal_close'], threshold_high=plan_row['threshold_high'],
+                    atr14=plan_row['atr14'], buy_max=plan_row['buy_max'],
+                    initial_stop_reference=plan_row['initial_stop_reference'],
+                    trail_trigger_reference=plan_row['trail_trigger_reference'],
+                    detail=(f'{next_day} 开盘 {fill.entry_price:.4f} 通过价格条件；'
+                            '须核对实际成交、数量与账户现金后经持仓录入确认，不自动建仓'),
+                    capacity_check=lambda conn: self._check_plan_capacity(conn,account_id,index_id,series.last_date,plan_row['signal_id']))
+                warnings.append(f'{index_id} 计划已通过开盘价格条件，等待人工确认成交')
+            except CapacityRefused as exc:
+                self.store.clear_plan(account_id,index_id,reason=str(exc))
+                return replace(fill,status=FILL_CANCELLED,entry_price=None,executed=False,reason='实际容量不足：'+str(exc))
         elif fill.status == FILL_FILLED:
             warnings.append(f'{index_id} 计划已通过开盘价格条件（只读查询，未写入计划状态）')
         return fill
 
     def _record_signal(self, account_id: str, index_id: str, cfg, series, plan, regime,
-                       factor, combo, basis: str, unit: str, peer_versions: dict, as_of: str) -> dict:
+                       factor, combo, basis: str, unit: str, peer_versions: dict, as_of: str, connection=None) -> dict:
         input_version = self.data.evaluation_version(
             index_id, completed_on=as_of, basis=basis, peer_versions=peer_versions)
         return self.store.save_signal(
@@ -953,7 +1069,7 @@ class StrategyService:
             combo_status=combo.status, combo_detail=combo.detail,
             regime_state=regime.state, regime_er60=regime.er60,
             data_source=series.source, is_proxy=series.is_proxy,
-            source_verified=series.source_verified,
+            source_verified=series.source_verified, connection=connection,
         )
 
     def _position_payload(self, position: Optional[PositionState], decision, cfg,

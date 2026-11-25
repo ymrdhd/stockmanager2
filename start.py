@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from backend.config import WEB_DIST, AppConfig, AuthConfig
 from backend.infrastructure.authfile import DEFAULT_AUTH_FILE, AuthFileError, load_auth, save_auth
-from backend.infrastructure.backup import create_backup, list_backups
+from backend.infrastructure.backup import create_backup, list_backups, daily_backup
 from backend.infrastructure.binding import load_binding
 from backend.infrastructure.database import (
     DEFAULT_BINDING,
@@ -149,6 +149,9 @@ def main() -> int:
     backup = commands.add_parser('backup', help='create a new consistent formal database backup directory')
     _identity_args(backup)
     backup.add_argument('--destination', required=True, type=Path)
+    daily = commands.add_parser('backup-daily', help='verified daily snapshot and conservative retention')
+    _identity_args(daily)
+    daily.add_argument('--destination', type=Path, default=None)
     adopt = commands.add_parser('adopt-database', help='explicitly bind an existing formal database')
     _identity_args(adopt)
     adopt.add_argument('--confirm', action='store_true')
@@ -169,6 +172,14 @@ def main() -> int:
     restore_command.add_argument('--report', type=Path, default=None,
                                  help='also write the JSON report to this file')
     restore_command.add_argument('--confirm', action='store_true')
+    take = commands.add_parser('takeover', help='review or publish an accepted sandbox migration offline')
+    take.add_argument('--target', type=Path, required=True)
+    take.add_argument('--report', type=Path, required=True)
+    take.add_argument('--approval')
+    take.add_argument('--isolated', action='store_true')
+    rollback = commands.add_parser('takeover-rollback', help='recover interrupted takeover offline')
+    rollback.add_argument('--confirm', action='store_true')
+    rollback.add_argument('--isolated', action='store_true')
     status = commands.add_parser('backup-status', help='list the backups published in a directory')
     status.add_argument('--destination', type=Path, required=True)
     commands.add_parser('client', help='browser only; no local database or backend')
@@ -202,6 +213,15 @@ def main() -> int:
                                       expected_uuid=args.uuid, generation=args.generation)
             print(json.dumps(asdict(adopt_database(config, confirm=args.confirm))))
             return 0
+        if args.command == 'takeover':
+            from backend.infrastructure.takeover import takeover
+            print(json.dumps(takeover(_restore_settings(argparse.Namespace(database=None)), args.target,
+                                      args.report, approval=args.approval, isolated=args.isolated)))
+            return 0
+        if args.command == 'takeover-rollback':
+            from backend.infrastructure.takeover import rollback_pending
+            print(json.dumps(rollback_pending(DEFAULT_BINDING, confirm=args.confirm, isolated=args.isolated)))
+            return 0
         if args.command == 'backup-status':
             print(json.dumps(list_backups(args.destination), indent=2, ensure_ascii=False))
             return 0
@@ -219,6 +239,9 @@ def main() -> int:
         config = _local_settings(args) if local else _server_settings(args)
         if args.command == 'upgrade-database':
             upgrade_database(config, args.destination, confirm=args.confirm)
+            return 0
+        if args.command == 'backup-daily':
+            print(json.dumps(daily_backup(config,args.destination or config.path.parent/'backups')))
             return 0
         if args.command == 'backup':
             print(create_backup(config, args.destination))
@@ -248,7 +271,7 @@ def main() -> int:
                                                server_header=False))
         server.run()
         return 0 if server.started else 1
-    except (DatabaseError, AuthFileError, OSError, sqlite3.Error) as exc:
+    except (DatabaseError, AuthFileError, OSError, sqlite3.Error, ValueError, KeyError) as exc:
         print(f'Operation refused: {exc}', file=sys.stderr)
         return 1
 

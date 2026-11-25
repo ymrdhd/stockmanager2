@@ -251,6 +251,8 @@ def validate_binding(settings: DatabaseSettings) -> None:
         if bound.path == settings.path or (bound.path.is_file() and os.path.samefile(bound.path, settings.path)):
             raise DatabaseError('local mode must not open the formal database')
         return
+    if os.path.lexists(settings.binding_path.with_name(settings.binding_path.name + '.takeover-pending')):
+        raise DatabaseError('unfinished takeover; offline recovery required')
     bound = load_binding(settings.binding_path)
     if bound.path != settings.official_path or (bound.path, bound.uuid, bound.generation) != (
             settings.path, settings.expected_uuid, settings.generation):
@@ -263,6 +265,7 @@ def open_database(settings: DatabaseSettings) -> Iterator[Database]:
     _single_file(settings.path)  # no lock sidecar or SQLite file on missing path
     guard = writer_lock(settings.path) if settings.writable else nullcontext()
     with guard:
+        validate_binding(settings)
         # Validate without changing journal mode or any database content first.
         with closing(_connect(settings.path, readonly=True)) as conn:
             identity = validate_identity(conn, settings)
@@ -390,6 +393,8 @@ def initialize_database(path: Path, *, role: InitialRole, confirm: bool,
             if official_path is not None and absolute_path(official_path) != official:
                 raise DatabaseError('sandbox conflicts with fixed formal binding')
             return _initialize_database(path, role=role, confirm=True, official_path=official)
+        if os.path.lexists(binding_path.with_name(binding_path.name + '.takeover-pending')):
+            raise DatabaseError('unfinished takeover; offline recovery required')
         if binding_path.exists() or binding_path.is_symlink():
             raise DatabaseError('formal binding already exists; cannot initialize another formal database')
         identity = _initialize_database(path, role=role, confirm=True, official_path=official_path)
@@ -408,6 +413,8 @@ def adopt_database(settings: DatabaseSettings, *, confirm: bool) -> Identity:
         raise DatabaseError('formal binding must not be a symlink')
     file.parent.mkdir(parents=True, exist_ok=True)
     with writer_lock(file):
+        if os.path.lexists(file.with_name(file.name + '.takeover-pending')):
+            raise DatabaseError('unfinished takeover; offline recovery required')
         if file.exists() or file.is_symlink():
             raise DatabaseError('formal binding already exists')
         _single_file(settings.path)

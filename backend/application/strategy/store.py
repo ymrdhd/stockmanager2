@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from contextlib import nullcontext
 from hashlib import sha256
 import json
 from typing import Optional
@@ -43,6 +44,10 @@ def _plan_id(account_id: Optional[str], index_id: str, signal_date: str, version
     return 'plan:' + sha256(raw.encode()).hexdigest()[:32]
 
 
+class CapacityRefused(RuntimeError):
+    """A plan could not acquire capacity in the serialized ledger transaction."""
+
+
 class StrategyStore:
     def __init__(self, db: Database,
                  clock=lambda: datetime.now(UTC)) -> None:
@@ -64,10 +69,10 @@ class StrategyStore:
                     combo_status: Optional[str] = None, combo_detail: str = '',
                     regime_state: Optional[str] = None, regime_er60: Optional[float] = None,
                     data_source: str = '', is_proxy: bool = False,
-                    source_verified: bool = True) -> dict:
+                    source_verified: bool = True, connection=None) -> dict:
         key = _signal_id(account_id, index_id, signal_date, input_version, strategy_version)
         now = utc(self.clock())
-        with self.db.transaction() as conn:
+        with (self.db.transaction() if connection is None else nullcontext(connection)) as conn:
             conn.execute(
                 '''INSERT INTO strategy_signals
                    (signal_id,account_id,index_id,instrument_code,strategy_version,config_version,
@@ -122,12 +127,14 @@ class StrategyStore:
                   atr14: Optional[float] = None, buy_max: Optional[float] = None,
                   initial_stop_reference: Optional[float] = None,
                   trail_trigger_reference: Optional[float] = None,
-                  detail: str = '') -> dict:
+                  detail: str = '', capacity_check=None, connection=None) -> dict:
         if not account_id:
             raise ValueError('执行计划必须具有明确账户归属')
         key = _plan_id(account_id, index_id, signal_date, strategy_version)
         now = utc(self.clock())
-        with self.db.transaction() as conn:
+        with (self.db.transaction() if connection is None else nullcontext(connection)) as conn:
+            if capacity_check is not None:
+                capacity_check(conn)
             conn.execute(
                 '''INSERT INTO strategy_plans
                    (plan_id,account_id,index_id,strategy_version,signal_id,signal_date,status,

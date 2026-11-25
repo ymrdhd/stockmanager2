@@ -87,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_cmd.add_argument("--report-file", type=Path,
                              help="also write the reconciliation report JSON here")
 
+    reconcile_cmd = sub.add_parser("reconcile", help="match independent same-cutoff source statement")
+    reconcile_cmd.add_argument("--target", required=True, type=Path)
+    reconcile_cmd.add_argument("--evidence", required=True, type=Path)
+    reconcile_cmd.add_argument("--report-file", required=True, type=Path)
+    reconcile_cmd.add_argument("--confirm", action="store_true")
     report_cmd = sub.add_parser("report", help="re-read a migrated target or a prior report")
     report_cmd.add_argument("--target", type=Path)
     report_cmd.add_argument("--report-file", type=Path)
@@ -114,6 +119,14 @@ def main(argv: list[str] | None = None) -> int:
                 write_report(report, args.report_file)
             _emit(report)
             return 0 if not report["blocks_formal_takeover"] else 2
+        if args.command == "reconcile":
+            from backend.application.migration_reconcile import reconcile
+            if args.report_file.exists():
+                raise Refused("report destination must be new")
+            report = reconcile(args.target, args.evidence, confirm=args.confirm)
+            write_report(report, args.report_file)
+            _emit(report)
+            return 0
         if args.command == "report":
             if args.target:
                 report = report_from_target(args.target)
