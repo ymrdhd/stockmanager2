@@ -101,9 +101,22 @@ artifacts\tmp\pwvenv\Scripts\python.exe artifacts\tmp\10c\verify_browser_10c.py
 | 8 | 审计事件 `liquidity_changed` 记录并在页面可见 | PASS |
 | 9 | 新账户默认未知 → 提示「待确认」且流动指标被扣留 | PASS |
 
-## 5. Windows 标准安装脚本
+**双击预览入口实测（同轮追加）**：`打开网页.cmd` → `tools/open_preview.py`，合成库自动创建（3 账户、4 笔成交），9091 已被另一实例占用时自动改用 9092，Chromium 登录 + 总览 + 财务页正常，`system/status` 为 `sandbox` 且可写；未触碰 9091 上的既有实例，也未碰正式库。
 
-### 5.1 正向：Node 22.22.2 / npm 10.9.7
+## 5. 启动与预览入口
+
+### 5.1 双击预览（用户追加需求）
+
+- 首次在 `data/preview-app/` 创建独立合成演示库（`tools/create_demo.py`），非交互环境下可经 `STOCK_PREVIEW_PASSWORD` 注入一次性密码；
+- 仅监听 `127.0.0.1`；默认 9091，被占用时依次尝试 9092–9100 并在窗口说明；
+- 启动前校验演示库确实位于 `data\preview-app\` 内、不等于正式库且不等于正式绑定路径；
+- 首次运行交互设置登录密码（只写本机 `auth.json` 哈希）；端口变化时保留哈希、只刷新 Host 白名单；
+- 启动后写 `PREVIEW.json` 记录端口/PID，仅在 PID 存活且健康检查通过时才复用，绝不把别人的服务当成自己的；
+- 出错与退出均停住窗口（`.cmd` 末尾 `pause`），不会一闪而过。
+
+### 5.2 Windows 标准安装脚本
+
+#### 5.2.1 正向：Node 22.22.2 / npm 10.9.7
 
 ```powershell
 $env:PATH = '<repo>\artifacts\tmp\node22;' + $env:PATH
@@ -121,19 +134,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\windows.ps1 -Action In
 
 **即：不再需要手工绕过 npm 守卫。**
 
-### 5.2 负向：npm 11.17.0
+#### 5.2.2 负向：npm 11.17.0
 
 用 PATH 前置的 `npm.cmd` 模拟 npm 11（不改系统安装），`-Action Build`：
 
 结果：**exit 1**，`Use npm 10.9.x shipped with Node.js 22.13+ (verified 10.9.7); found 11.17.0`　日志：`logs/windows-npm11-reject-10c.log`
 
-### 5.3 负向：Node 24.19.0
+#### 5.2.3 负向：Node 24.19.0
 
 系统默认 Node 24，`-Action Build`：
 
 结果：**exit 1**，`Use Node.js >=22.13.0 <23 (verified 22.22.2)`　日志：`logs/windows-node24-reject-10c.log`
 
-### 5.4 Python 守卫
+#### 5.2.4 Python 守卫
 
 `Assert-Python` 读取 `.venv` 解释器版本并要求 ≥3.11；当前 venv 为 3.14.4，`-Action Install` 通过。系统 Python 3.11.9 亦满足 `requires-python >=3.11`。
 

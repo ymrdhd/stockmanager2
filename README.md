@@ -1,6 +1,6 @@
 # Stock Manager 2.0
 
-当前阶段：`06-ui`（部分完成，待独立审查）。已实现后端交易、持仓收益、行情、财务及五页 Vue 业务源码（Alembic 0007）；依赖锁、完整 Vue 类型检查、构建及浏览器验收仍因环境阻塞。V9/G2 正式策略、真实行情、数量公司行为及旧库迁移未完成。
+当前状态以 `docs/STATUS.md` 为准（10C 最终最小补丁，待定向复审）。本仓库已实现后端交易/持仓收益/行情/财务与五页 Vue 业务源码，schema 为 Alembic `0012`；`uv.lock` 与 `frontend/package-lock.json` 均已生成并锁定。V9/G2 正式策略、2027 交易日历、真实旧库试迁移与双机远程访问仍未完成，详见 `docs/ISSUES.md`。
 
 ## 环境及依赖安装
 
@@ -8,26 +8,38 @@
 - Node.js 22.13+（22.x，已验证 22.22.2）、npm 10.9.x（Node 22.13+ 自带；已验证 10.9.2/10.9.7，安装脚本按此范围检查，`npm ci` 才是锁文件可复现保证）、Git。
 - 除特别说明外，以下命令从仓库根目录执行，优先兼容 Windows PowerShell。
 
-**当前锁文件尚未生成**：需要在可访问 PyPI 和 npm registry 的开发环境先完成解析。这两步未通过前不要将工程视为可复现安装，也不要手工拼装锁文件。
+首次安装（或 `tools/windows.ps1 -Action Install` 一次完成同样步骤）：
 
 ```powershell
-uv lock
 uv sync --locked
 cd frontend
-npm install --package-lock-only
 npm ci
 cd ..
 ```
 
-生成并审查 `uv.lock`、`frontend/package-lock.json` 后，正常安装只需 `uv sync --locked` 和在 `frontend/` 中运行 `npm ci`。依赖锁文件仍需在正式发布前补齐。
+依赖已锁定：`uv sync --locked` 与 `npm ci` 只按锁文件安装，不会重新解析版本。若要修改依赖，须先经批准再用 `uv lock` / `npm install --package-lock-only` 更新锁文件。
 
 ## 启动
 
-后端：先用 `python start.py --help` 查看入口。正式路径与 UUID/generation 固定保存在忽略的 `data/official.json`；初始化与显式接入后不得由普通参数重选。相对路径不允许。以下仅为 PowerShell 运维示例，不要对现有库执行初始化：
+### 只想先看网页：双击 `打开网页.cmd`
+
+仓库根目录的 `打开网页.cmd` 是给日常预览用的双击入口，不需要记命令：
+
+- 只在 `data\preview-app\` 下创建**独立合成演示库**（首次自动生成），**绝不打开正式库**；页面全部是虚构示例数据。
+- 仅监听 `127.0.0.1`。默认用 9091；若该端口已被其他实例占用，自动改用下一个空闲端口并在窗口里说明。
+- 首次运行会要求设置登录密码（只写入本机 `data\preview-app\auth.json`，内容是哈希）。之后双击直接打开浏览器。
+- 窗口保持打开即服务运行中，按 `Ctrl+C` 或关闭窗口停止；出错时窗口会停住显示原因，不会一闪而过。
+- 想查看自己的真实账本请用下面的 `start.py server`，不要用这个预览入口。
+
+等效命令（想看得更清楚时用）：`.\.venv\Scripts\python.exe tools\open_preview.py`。
+
+### 正式服务与命令行入口
+
+后端：先用 `python start.py --help` 查看入口。`start.py` 是命令行程序，**双击不会启动**（没有子命令时按设计直接退出并打印用法）。正式路径与 UUID/generation 固定保存在忽略的 `data/official.json`；初始化与显式接入后不得由普通参数重选。相对路径不允许。以下仅为 PowerShell 运维示例，不要对现有库执行初始化：
 
 ```powershell
 $db = Join-Path (Get-Location) 'data/stock_manager.sqlite'
-# 仅首次新库，迁移至 0007 并建立固定绑定
+# 仅首次新库，迁移至 0012 并建立固定绑定
 python start.py init-database --database "$db" --confirm
 # 默认读取绑定；可选 --database/--uuid/--generation 仅用于核对，不可覆盖绑定
 python start.py check-database

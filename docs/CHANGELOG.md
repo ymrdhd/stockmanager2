@@ -33,6 +33,7 @@
 - 修复 10B-002：`tools/windows.ps1` 的 npm 精确 `10.9.2` 改为 `10.9.x`（主版本 10、次版本 ≥9），Node 保持 `>=22.13 <23`，新增 `.venv` Python ≥3.11 检查；未删除检查、未升级依赖锁。Node 22.22.2 / npm 10.9.7 下 `-Action Install` 实测通过，npm 11.17.0 与 Node 24 仍被拒绝。
 - 修复 10B-003：`docs/reference/strategy_rule_map.md` 冷却 regime 来源改为「当次评估日 G2 regime」，与实现一致；未改任何策略公式、3/10 日阈值或近止损规则。
 - 实测：Python 全量 346 PASS（新增 7 项受限资产/迁移/备份恢复专项）；前端 63 PASS、`vue-tsc --noEmit` exit 0、`vite build` exit 0；真实 Chromium 受限资产专项 9/9 PASS。全部使用合成库。
+- 同轮追加用户需求：根目录双击入口 `打开网页.cmd`（调用 `tools/open_preview.py`），只运行 `data/preview-app/` 下的合成演示库、仅本机监听、端口冲突自动顺延、首次交互设密码、出错停住窗口；不触碰正式库。实测演示库 3 账户/4 成交、Chromium 登录与页面通过。
 - 文档：`STATUS.md`、`ISSUES.md`（10A-001/003 标记已修 + 新增 10C 处置表）、`DECISIONS.md`（ADR-021）、`PRODUCT_SPEC.md`、`INTERFACE_CONTRACT.md`、`DATA_CONTRACTS.md`、`OPERATIONS_SECURITY.md`、`README.md`、`INDEX.md`、新增 `10C_HANDOFF.md` 与 `10C_TEST_REPORT.md`。
 - 未操作真实数据库、未正式接管、未部署发布；2027 日历、真实旧库试迁移与 Tailscale 双机仍 BLOCKED/未授权。
 
