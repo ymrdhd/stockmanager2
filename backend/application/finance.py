@@ -485,11 +485,15 @@ class FinanceService:
         totals={kind:sum(r['amount_fen'] for r in items if r['kind']==kind) for kind in ('income','expense','fee')}
         categories={}; refund_received=sum(r['amount_fen'] for r in items if r['kind']=='refund'); recovered=0
         for item in items:
-            if item['kind']=='refund': continue
+            if item['kind']=='refund':
+                original=rows(conn,'SELECT occurred_at FROM finance_transactions WHERE id=?',(item['related_transaction_id'],))
+                item['original_expense_period']=month_start(day_of(datetime.fromisoformat(original[0]['occurred_at']))).isoformat() if original else None
+                continue
             reduction=0
             if item['kind'] in ('expense','fee'):
                 reduction=conn.execute("SELECT COALESCE(SUM(amount_fen),0) FROM finance_transactions WHERE related_transaction_id=? AND status='effective' AND occurred_at<=?",(item['id'],cutoff)).fetchone()[0]
                 totals[item['kind']]-=reduction; recovered+=reduction
+            item['refund_applied_fen']=reduction
             item['net_amount_fen']=item['amount_fen']-reduction
             key=item['category_id'];categories[key]=categories.get(key,0)+item['net_amount_fen']
         gross_expense=sum(r['amount_fen'] for r in items if r['kind'] in ('expense','fee'))
@@ -498,6 +502,7 @@ class FinanceService:
                 'net_fen':totals['income']-totals['expense']-totals['fee'],'categories':categories,'items':items,
                 'refund_received_fen':refund_received,'refund_against_original_fen':recovered,
                 'bill_cash_flow_fen':totals['income']-gross_expense+refund_received,
+                'source':'current_effective_finance_facts_not_knowledge_replay',
                 'refund_basis':'original_expense_period; receipt_cash_flow_at_actual_date'}
 
     def month(self,start: date,as_of: datetime) -> dict:
@@ -510,6 +515,38 @@ class FinanceService:
         cutoff=PortfolioService(self.db,self.clock)._cutoff(as_of)
         with self.db.read() as conn:
             return {**one(conn,'SELECT ledger_revision FROM ledger_state'),'as_of':cutoff,'items':[self._month(conn,date(year,m,23),cutoff) for m in range(1,13)]}
+
+    def record_detail(self, kind: str, id_: str, expected_revision: int | None=None) -> dict:
+        """Read immutable audit facts and explicit direct links in one ledger snapshot."""
+        tables={'bills':('finance_transactions','bill'), 'transfers':('finance_transfers','transfer'),
+                'balances':('balance_adjustments','balance'), 'accounts':('accounts','account')}
+        if kind not in tables: raise TradeError('unsupported finance audit record kind')
+        table,entity=tables[kind]
+        with self.db.read() as conn:
+            revision=one(conn,'SELECT ledger_revision FROM ledger_state')['ledger_revision']
+            if expected_revision is not None and expected_revision!=revision:
+                raise Conflict('ledger changed; reload audit query')
+            record=one(conn,'SELECT * FROM '+table+' WHERE id=?',(id_,))
+            events=rows(conn,'SELECT id,event,request_id,at,actor,details FROM audit_events WHERE entity=? AND entity_id=? ORDER BY at,rowid',(entity,id_))
+            related=[]; original=None; refunded=None; remaining=None
+            if kind=='bills':
+                if record['kind']=='refund' and record['related_transaction_id']:
+                    candidates=rows(conn,'SELECT * FROM finance_transactions WHERE id=?',(record['related_transaction_id'],))
+                    original=candidates[0] if candidates else None
+                elif record['kind'] in ('expense','fee'):
+                    original=record
+                related=rows(conn,"SELECT * FROM finance_transactions WHERE id<>? AND (correction_of=? OR id=? OR related_transaction_id=?) ORDER BY rowid",(id_,id_,record['correction_of'],id_))
+                if original is not None and original['status']=='effective' and original['kind'] in ('expense','fee'):
+                    refunded=conn.execute("SELECT COALESCE(SUM(amount_fen),0) FROM finance_transactions WHERE related_transaction_id=? AND kind='refund' AND status='effective'",(original['id'],)).fetchone()[0]
+                    remaining=original['amount_fen']-refunded
+            elif kind=='transfers':
+                related=rows(conn,'SELECT * FROM finance_transfers WHERE id<>? AND (correction_of=? OR id=?) ORDER BY rowid',(id_,id_,record['correction_of']))
+            elif kind=='balances':
+                related=rows(conn,'SELECT * FROM balance_adjustments WHERE id<>? AND (previous_id=? OR id=?) ORDER BY rowid',(id_,id_,record['previous_id']))
+            return {'kind':kind,'record':record,'audit_events':events,'related_records':related,
+                    'database_uuid':self.db.identity.database_uuid,'generation':self.db.identity.generation,
+                    'original_expense':original,'effective_refunds_fen':refunded,'remaining_expense_fen':remaining,
+                    'ledger_revision':revision,'source':'current_ledger_audit_facts'}
 
     def records(self, kind: str, limit: int=100, offset: int=0,
                 account_id: str | None=None, from_at: datetime | None=None,

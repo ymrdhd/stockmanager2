@@ -122,6 +122,8 @@ export function auditDetails(value: unknown): string {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return String(parsed)
   const labels: Record<string,string> = {
+    related_transaction_id:'关联原支出', category_id:'账单分类', note:'备注', id:'记录编号', before:'更正前', after:'更正后',
+    from_account_id:'转出账户', to_account_id:'转入账户', before_fen:'原余额', after_fen:'核实余额',
     reason:'原因', strategy_deviation:'策略偏离', correction_of:'更正原记录', reversal_id:'冲正记录',
     request_id:'请求编号', signal_id:'正式信号', signal_date:'信号日期', frozen_atr:'冻结 ATR',
     amount_fen:'金额', fees_fen:'费用', occurred_at:'发生时间', executed_at:'成交时间',

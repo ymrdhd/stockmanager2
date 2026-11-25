@@ -14,7 +14,7 @@ function ref<T>(initial:T):Ref<T>{let v=initial;const listeners=new Set<()=>void
 function watch<T>(source:Ref<T>,callback:()=>void){source.listeners.add(callback)}
 function deferred<T>(){let resolve!:(value:T)=>void,reject!:(reason:unknown)=>void;const promise=new Promise<T>((r,j)=>{resolve=r;reject=j});return {promise,resolve,reject}}
 const tick=()=>new Promise<void>(r=>setImmediate(r))
-type Setup={reload():Promise<void>;manualReload?():Promise<void>;poll():Promise<void>;signOut():Promise<void>;loading:Ref<boolean>;signIn:Ref<boolean>;readError:Ref<string>;sessionName:Ref<string>;month:Ref<Fact|null>;pnlDay(row:Fact):Promise<void>;loadReconciliation():Promise<void>;reconciliationReport:Ref<Fact|null>;reconciliationError:Ref<string>;reconciliationLoading:Ref<boolean>;wentOffline():void;freshness:Ref<string>;writable:Ref<boolean>;system:Ref<Fact|null>;overview:Ref<Fact|null>;health:Ref<Fact>;selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
+type Setup={financeAudit:Ref<Fact|null>;financeAuditError:Ref<string>;financeAuditLoading:Ref<boolean>;readFinanceAudit(kind:string,row:Fact):Promise<void>;filterBills():void;period:Ref<string>;loadMonth():Promise<void>;proposedPort:Ref<string>;validPort:Ref<boolean>;portCommand:Ref<string>;reload():Promise<void>;manualReload?():Promise<void>;poll():Promise<void>;signOut():Promise<void>;loading:Ref<boolean>;signIn:Ref<boolean>;readError:Ref<string>;sessionName:Ref<string>;month:Ref<Fact|null>;pnlDay(row:Fact):Promise<void>;loadReconciliation():Promise<void>;reconciliationReport:Ref<Fact|null>;reconciliationError:Ref<string>;reconciliationLoading:Ref<boolean>;wentOffline():void;freshness:Ref<string>;writable:Ref<boolean>;system:Ref<Fact|null>;overview:Ref<Fact|null>;health:Ref<Fact>;selectedAccount:Ref<string>;valuation:Ref<Fact|null>;strategy:Ref<Fact|null>;pool:Ref<Fact|null>;positionsView:Ref<Fact|null>;pnlHistory:Ref<Fact|null>;pnlMonth:Ref<string>;tradeDetail:Ref<Fact|null>;tradeAccount:Ref<string>;tradePath:Ref<string>;investmentError:Ref<string>;investmentLoading:Ref<boolean>;navigate(tab:string):void;refreshInvestment(quiet:boolean):Promise<void>;refreshStrategy():Promise<void>;loadPnlMonth():Promise<void>;readTrade(row:Fact):Promise<void>}
 function setup(request:(path:string)=>Promise<Fact>,logout=async()=>{}):Setup{
   const raw=readFileSync(process.env.SM2_WORKSPACE_SOURCE || new URL('../src/pages/WorkspacePage.vue',import.meta.url),'utf-8')
   const source=raw.split('<script setup lang="ts">')[1].split('</script>')[0].replace(/^import .*$/gm,'')
@@ -22,7 +22,7 @@ function setup(request:(path:string)=>Promise<Fact>,logout=async()=>{}):Setup{
   const context={ref,watch,computed:(get:()=>unknown)=>({get value(){return get()}}),onMounted:()=>{},onBeforeUnmount:()=>{},
     api:request,requestApi:request,getHealth:async()=>({kind:'connected',version:'test'}),session:{forgetIdentity(){},forgetSession(){},declare(){},stored:async()=>({username:'test'}),logout},ApiError,fact,facts,page,str,WriteAttempt,AccountScope,auditDetails,display,localTime,money,shanghaiTime,URLSearchParams,Date,
     harness:null as Setup|null}
-  runInNewContext(js+`\nglobalThis.harness={selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,reconciliationReport,reconciliationError,reconciliationLoading,loadReconciliation,
+  runInNewContext(js+`\nglobalThis.harness={financeAudit,financeAuditError,financeAuditLoading,readFinanceAudit,filterBills,period,loadMonth,proposedPort,validPort,portCommand,selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,reconciliationReport,reconciliationError,reconciliationLoading,loadReconciliation,
   investmentError:typeof investmentError==='undefined'?{value:''}:investmentError,
   investmentLoading:typeof investmentLoading==='undefined'?{value:false}:investmentLoading,
   navigate,refreshInvestment,refreshStrategy,loadPnlMonth,readTrade,pnlDay,wentOffline,freshness,writable,system,overview,health,reload,manualReload:typeof manualReload==='undefined'?undefined:manualReload,poll,signOut,loading,signIn,readError,sessionName,month};`,context)
@@ -199,4 +199,43 @@ test('Workspace sign out clears private projections before the server responds',
   assert.equal(w.writable.value,false);assert.equal(w.signIn.value,true)
   response.reject(new Error('connection lost'));await logout
   assert.match(w.readError.value,/退出结果未知/)
+})
+
+
+test('finance audit ignores late detail, filter invalidation and wrong record',async()=>{
+  const old=deferred<Fact>();let bad=false
+  const w=setup(async path=>path.includes('/old?')?old.promise:{kind:'bills',record:{id:bad?'wrong':'new'},ledger_revision:3,audit_events:[]})
+  w.overview.value={ledger_revision:3}
+  const pending=w.readFinanceAudit('bills',{id:'old'})
+  await w.readFinanceAudit('bills',{id:'new'});assert.equal(fact(w.financeAudit.value?.record).id,'new')
+  old.resolve({kind:'bills',record:{id:'old'},ledger_revision:3});await pending
+  assert.equal(fact(w.financeAudit.value?.record).id,'new');w.filterBills();assert.equal(w.financeAudit.value,null)
+  bad=true;await w.readFinanceAudit('bills',{id:'new'});assert.equal(w.financeAudit.value,null);assert.match(w.financeAuditError.value,/不一致/)
+})
+
+test('finance audit is cleared on disconnect and cannot publish after logout',async()=>{
+  const old=deferred<Fact>();const w=setup(async()=>old.promise)
+  w.overview.value={ledger_revision:3};const pending=w.readFinanceAudit('bills',{id:'old'})
+  w.wentOffline();old.resolve({kind:'bills',record:{id:'old'},ledger_revision:3});await pending
+  assert.equal(w.financeAudit.value,null);assert.equal(w.financeAuditLoading.value,false)
+})
+
+test('finance month delayed response cannot overwrite newer selection',async()=>{
+  const old=deferred<Fact>();const w=setup(async path=>path.includes('2026-01-23')?old.promise:{period:'2026-02-23',ledger_revision:4})
+  w.period.value='2026-01-23';const pending=w.loadMonth();w.period.value='2026-02-23';await w.loadMonth()
+  old.resolve({period:'2026-01-23',ledger_revision:4});await pending
+  assert.equal(w.month.value?.period,'2026-02-23')
+})
+
+test('port preview only accepts an integer safe for literal command argument',()=>{
+  const w=setup(async()=>{throw new Error('preview must not call API')})
+  for(const input of ['','1023','65536','9000;whoami','1e4','9091.1','-1',' 9091']){w.proposedPort.value=input;assert.equal(w.validPort.value,false);assert.equal(w.portCommand.value,'')}
+  for(const input of ['1024','9091','65535']){w.proposedPort.value=input;assert.equal(w.validPort.value,true);assert.equal(w.portCommand.value,`powershell -File tools/windows.ps1 -Action Start -Port ${input}`)}
+})
+
+test('finance audit rejects another database even at the same ledger version',async()=>{
+  const w=setup(async()=>({kind:'bills',record:{id:'new'},ledger_revision:3,database_uuid:'db-b',generation:1,audit_events:[]}))
+  w.system.value=systemStatus('db-a',1);w.overview.value={ledger_revision:3}
+  await w.readFinanceAudit('bills',{id:'new'})
+  assert.equal(w.financeAudit.value,null);assert.match(w.financeAuditError.value,/身份不一致/);assert.equal(w.freshness.value,'stale')
 })

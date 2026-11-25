@@ -3,7 +3,7 @@
 param(
   [Parameter(Mandatory=$true)][ValidateSet('Install','Build','Start','Stop','Check','Backup','DailyBackup','ScheduleBackup','Demo','DemoStart','VerifyMarket','Maintenance')][string]$Action,
   [string]$Destination,
-  [int]$Port=9091,
+  [ValidateRange(1,65535)][int]$Port=9091,
   [string[]]$MaintenanceArgs=@()
 )
 $ErrorActionPreference='Stop'

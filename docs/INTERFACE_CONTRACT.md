@@ -40,3 +40,9 @@ E2E 必测：当前版本适用的 UI01–09 路由及代表性操作；真实�
 ## 09H 增量行为说明
 - `/finance/overview` 增量字段 `amount_evidence` 解释既有权威金额：金额、质量、口径/来源、截止、账本和行情版本以及关联账户；`related_reasons` 是相关上下文，不表示每个原因均影响每个指标。账户详情增量携带余额来源、适用现金期初或手工余额快照、证券报价证据。它们来自同一读取快照；不生成新的账务事实。
 - 会话失效、断线或身份变化时清理私有数据、失效表单；保留未核实写入记录。已接受连接的数据库身份变化需操作者确认重新读取；候选再变化需重新确认，不自动切换。历史异步响应不得恢复旧身份。
+
+## 09I 财务只读审计与设置补充
+- `GET /api/v1/finance/audit/{kind}/{id}?ledger_revision=<可选>`：kind 严格限 `bills/transfers/balances/accounts`，认证沿用统一中间件；返回 `kind,record,audit_events,related_records,original_expense,effective_refunds_fen,remaining_expense_fen,ledger_revision,database_uuid,generation,source`。原记录及直接关联、审计事件为当前事实，不伪造完整历史快照；无原支出/不可判断时退款汇总为 null。账本版本不匹配409、不存在404、不支持kind422。读取不修改账本。
+- 财务月 `items` 新增非退款账单 `refund_applied_fen`、退款账单 `original_expense_period`（未知null）；`source=current_effective_finance_facts_not_knowledge_replay`。不改变原期冲减、到账现金流候选语义及手工余额。
+- 页面财务详情按记录、账本版本及数据库身份核对，切换筛选/断线/账本变更时清除，身份不匹配拒绝并标记不可写；历史和趋势仅展示请求对应快照。
+- UI09 端口入口仅生成下次启动的明确参数，建议1024–65535；CLI与PowerShell接受合法1–65535。正式启动命令只在正式服务模式展示，沙盒/只读保留原启动模式。不得通过网页直接改认证文件、自动重启服务或切换库。实际配置与端口验收在服务端进行。

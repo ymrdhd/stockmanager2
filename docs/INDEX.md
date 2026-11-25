@@ -38,3 +38,5 @@
 - [09H_FUNCTION_MATRIX.md](09H_FUNCTION_MATRIX.md)：剩余工作分类。
 - [09H_HANDOFF.md](09H_HANDOFF.md)：本地与后续网页验收顺序。
 - [CHANGELOG.md](CHANGELOG.md)：本次变更记录。
+
+09I 收尾交接：`09I_REPORT.md`（实际变更及测试）、`09I_FUNCTION_MATRIX.md`（当前剩余分类）、`09I_HANDOFF.md`（最终环境验收顺序与候选口径）。不构成正式发布批准。

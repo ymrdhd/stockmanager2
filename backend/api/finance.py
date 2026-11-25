@@ -133,3 +133,8 @@ def account_effective(id: str, data: AccountEffective, svc: Service):
 @router.post('/finance/transfers/{id}/reconciliation')
 def reconcile_transfer(id: str, data: TransferReconciliation, svc: Service):
     return invoke(svc.reconcile_transfer,id,data)
+
+
+@router.get('/finance/audit/{kind}/{id}')
+def audit_detail(kind: str, id: str, svc: Service, ledger_revision: Annotated[int | None, Query(ge=0)]=None):
+    return invoke(svc.record_detail,kind,id,ledger_revision)

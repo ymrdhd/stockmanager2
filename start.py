@@ -117,6 +117,16 @@ def _restore_settings(args: argparse.Namespace) -> DatabaseSettings:
                             official_path=path, binding_path=binding_path, mode='server')
 
 
+def _port_number(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('port must be an integer') from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError('port must be between 1 and 65535')
+    return port
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Stock Manager database and loopback launcher')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -128,7 +138,7 @@ def main() -> int:
     for mode in ('server', 'local'):
         serve = commands.add_parser(mode, help=f'run {mode} backend on loopback')
         _identity_args(serve, local=mode == 'local')
-        serve.add_argument('--port', type=int, default=9091)
+        serve.add_argument('--port', type=_port_number, default=9091)
         serve.add_argument('--near-stop-bps', type=int, choices=range(0,1001), default=200, metavar='0-1000')
         serve.add_argument('--market-refresh-seconds', type=int, choices=range(10,301), default=20, metavar='10-300')
         serve.add_argument('--no-market-refresh', action='store_true', help='disable automatic network refresh')
@@ -142,7 +152,7 @@ def main() -> int:
     password.add_argument('--username', default='owner')
     password.add_argument('--host', action='append', dest='hosts', metavar='HOST:PORT')
     password.add_argument('--origin', action='append', dest='origins', metavar='SCHEME://HOST:PORT')
-    password.add_argument('--port', type=int, default=9091)
+    password.add_argument('--port', type=_port_number, default=9091)
     password.add_argument('--insecure-cookie', action='store_true',
                           help='only for loopback testing without TLS')
     check = commands.add_parser('check-database', help='validate formal identity and writer access; no migration')
