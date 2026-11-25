@@ -176,7 +176,7 @@ def set_balance(conn: sqlite3.Connection, account: str, amount: int, at: str, re
 
 
 def reverse_cash(conn: sqlite3.Connection, original: dict, note: str, request: str) -> str:
-    if original['kind'] not in ('deposit','withdrawal','adjustment','dividend') or original['execution_id'] is not None:
+    if original['kind'] not in ('opening','deposit','withdrawal','adjustment','dividend') or original['execution_id'] is not None:
         raise Conflict('only non-execution cash facts may be corrected here')
     if not conn.execute('SELECT 1 FROM effective_cash_movements WHERE id=?',(original['id'],)).fetchone():
         raise Conflict('cash fact already reversed')
@@ -424,7 +424,7 @@ class FinanceService:
             reason=data.note if isinstance(data,CashCorrection) else data.reason
             reversal=reverse_cash(conn,old,reason,data.request_id)
             if isinstance(data,CashCorrection):
-                if (old['kind']=='deposit' and data.amount_fen<=0 or old['kind']=='withdrawal' and data.amount_fen>=0 or old['kind']=='adjustment' and data.amount_fen==0):
+                if (old['kind']=='opening' and data.amount_fen<0 or old['kind']=='deposit' and data.amount_fen<=0 or old['kind']=='withdrawal' and data.amount_fen>=0 or old['kind']=='adjustment' and data.amount_fen==0):
                     raise TradeError('correction amount conflicts with cash kind')
                 result=post_cash(conn,account=old['account_id'],kind=old['kind'],amount=data.amount_fen,at=v['occurred_at'],note=data.note,request=data.request_id)
                 audit(conn,'cash',result['id'],'corrected',data.request_id,{'correction_of':id_,'reversal_id':reversal})
@@ -445,7 +445,7 @@ class FinanceService:
                 if data.amount_fen<=0: raise TradeError('dividend must be positive')
                 cash=post_cash(conn,account=old['account_id'],kind='dividend',amount=data.amount_fen,at=v['occurred_at'],note=data.note,request=data.request_id)
                 new=uid()
-                conn.execute('INSERT INTO company_events VALUES (?,?,?,?,?,?,?)',(new,old['account_id'],old['instrument_id'],'dividend',v['occurred_at'],cash['id'],data.note))
+                conn.execute('INSERT INTO company_events (id,account_id,instrument_id,kind,occurred_at,cash_movement_id,note) VALUES (?,?,?,?,?,?,?)',(new,old['account_id'],old['instrument_id'],'dividend',v['occurred_at'],cash['id'],data.note))
                 audit(conn,'company_event',new,'corrected',data.request_id,{'correction_of':id_,'reversal_id':reversal})
                 return one(conn,'SELECT * FROM company_events WHERE id=?',(new,)),min(old['occurred_at'],v['occurred_at'])
             return {'id':id_,'reversal_id':reversal,'status':'reversed'},old['occurred_at']

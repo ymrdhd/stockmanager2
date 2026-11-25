@@ -1,10 +1,16 @@
 """策略证据持久化：信号、计划、持仓推进状态、冷却、NDX 辅助仓。
 
-原则：
-- 同一 ``(index_id, signal_date, input_version, strategy_version)`` 只允许一条信号，
-  重复刷新不会产生新的等价正式信号（``INSERT ... ON CONFLICT DO UPDATE`` 只更新状态）；
+原则（ISS-033 之后）：
+
+- **市场信号可共享，执行计划必须归属**。``strategy_signals`` 允许 ``account_id`` 为空
+  （表示无账户归属的市场级证据），但 ``strategy_plans`` 是执行计划，必须有明确账户，
+  否则账户 A 的计划会让账户 B 误判为 PLAN_PENDING。
+- 幂等键里带上账户维度：``_signal_id`` / ``_plan_id`` 的摘要输入包含 ``account_id``，
+  同一账户、同一等价信号重复刷新仍是同一条记录（不产生第二份证据），
+  不同账户各自独立。
 - 持仓推进状态是 ``PositionState`` 的完整快照（``state_json``），列字段只用于查询；
-- 冷却与 NDX 辅助仓按账户 + 指数唯一；
+  它**只是可重建的衍生证据**，真实持仓始终以 ``trade_executions`` / ``trade_lots`` /
+  ``lot_allocations`` 为准。
 - 这里**不会**写 ``trade_executions`` / ``trade_lots`` / ``cash_movements``。
 """
 from __future__ import annotations
@@ -18,13 +24,23 @@ from backend.application.trading.service import dump, one, rows, utc
 from backend.infrastructure.database import Database
 from backend.domain.strategy.exit import PositionState
 
+#: 无账户归属的市场级证据在幂等摘要里的占位符（不是账户 ID，不入外键）。
+MARKET_SCOPE = '-'
 
-def _signal_id(index_id: str, signal_date: str, input_version: str, version: str) -> str:
-    return 'sig:' + sha256(f'{index_id}|{signal_date}|{input_version}|{version}'.encode()).hexdigest()[:32]
+
+def _scope(account_id: Optional[str]) -> str:
+    return account_id or MARKET_SCOPE
 
 
-def _plan_id(index_id: str, signal_date: str, version: str) -> str:
-    return 'plan:' + sha256(f'{index_id}|{signal_date}|{version}'.encode()).hexdigest()[:32]
+def _signal_id(account_id: Optional[str], index_id: str, signal_date: str,
+               input_version: str, version: str) -> str:
+    raw = f'{_scope(account_id)}|{index_id}|{signal_date}|{input_version}|{version}'
+    return 'sig:' + sha256(raw.encode()).hexdigest()[:32]
+
+
+def _plan_id(account_id: Optional[str], index_id: str, signal_date: str, version: str) -> str:
+    raw = f'{_scope(account_id)}|{index_id}|{signal_date}|{version}'
+    return 'plan:' + sha256(raw.encode()).hexdigest()[:32]
 
 
 class StrategyStore:
@@ -49,7 +65,7 @@ class StrategyStore:
                     regime_state: Optional[str] = None, regime_er60: Optional[float] = None,
                     data_source: str = '', is_proxy: bool = False,
                     source_verified: bool = True) -> dict:
-        key = _signal_id(index_id, signal_date, input_version, strategy_version)
+        key = _signal_id(account_id, index_id, signal_date, input_version, strategy_version)
         now = utc(self.clock())
         with self.db.transaction() as conn:
             conn.execute(
@@ -61,12 +77,7 @@ class StrategyStore:
                     combo_status,combo_detail,regime_state,regime_er60,data_source,is_proxy,
                     source_verified,created_at,updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(signal_id) DO UPDATE SET
-                    status=excluded.status, reason_codes=excluded.reason_codes,
-                    detail=excluded.detail, factor_status=excluded.factor_status,
-                    factor_detail=excluded.factor_detail, combo_status=excluded.combo_status,
-                    combo_detail=excluded.combo_detail, regime_state=excluded.regime_state,
-                    regime_er60=excluded.regime_er60, updated_at=excluded.updated_at''',
+                   ON CONFLICT(signal_id) DO NOTHING''',
                 (key, account_id, index_id, instrument_code, strategy_version, config_version,
                  signal_date, input_version, price_basis, price_unit, status,
                  dump(reason_codes or []), detail, breakout_window, signal_close, threshold_high,
@@ -80,8 +91,10 @@ class StrategyStore:
             sql = 'SELECT * FROM strategy_signals WHERE index_id=?'
             args: tuple = (index_id,)
             if account_id is not None:
-                sql += ' AND (account_id IS NULL OR account_id=?)'
+                sql += ' AND account_id=?'
                 args += (account_id,)
+            else:
+                sql += ' AND account_id IS NULL'
             sql += ' ORDER BY signal_date DESC, updated_at DESC LIMIT 1'
             found = rows(conn, sql, args)
             return found[0] if found else None
@@ -91,20 +104,28 @@ class StrategyStore:
             sql = 'SELECT * FROM strategy_signals WHERE signal_date=?'
             args: tuple = (signal_date,)
             if account_id is not None:
-                sql += ' AND (account_id IS NULL OR account_id=?)'
+                sql += ' AND account_id=?'
                 args += (account_id,)
+            else:
+                sql += ' AND account_id IS NULL'
             return rows(conn, sql + ' ORDER BY index_id', args)
 
+    def signal_by_id(self, signal_id: str) -> Optional[dict]:
+        with self.db.read() as conn:
+            found = rows(conn, 'SELECT * FROM strategy_signals WHERE signal_id=?', (signal_id,))
+            return found[0] if found else None
+
     # -- 计划 ------------------------------------------------------------
-    def save_plan(self, *, index_id: str, signal_date: str, strategy_version: str,
-                  status: str, signal_id: Optional[str] = None,
-                  account_id: Optional[str] = None, signal_close: Optional[float] = None,
-                  threshold_high: Optional[float] = None, atr14: Optional[float] = None,
-                  buy_max: Optional[float] = None,
+    def save_plan(self, *, account_id: str, index_id: str, signal_date: str,
+                  strategy_version: str, status: str, signal_id: Optional[str] = None,
+                  signal_close: Optional[float] = None, threshold_high: Optional[float] = None,
+                  atr14: Optional[float] = None, buy_max: Optional[float] = None,
                   initial_stop_reference: Optional[float] = None,
                   trail_trigger_reference: Optional[float] = None,
                   detail: str = '') -> dict:
-        key = _plan_id(index_id, signal_date, strategy_version)
+        if not account_id:
+            raise ValueError('执行计划必须具有明确账户归属')
+        key = _plan_id(account_id, index_id, signal_date, strategy_version)
         now = utc(self.clock())
         with self.db.transaction() as conn:
             conn.execute(
@@ -114,28 +135,43 @@ class StrategyStore:
                     trail_trigger_reference,detail,created_at,updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(plan_id) DO UPDATE SET status=excluded.status,
+                    signal_id=COALESCE(excluded.signal_id,strategy_plans.signal_id),
                     detail=excluded.detail, buy_max=excluded.buy_max,
-                    atr14=excluded.atr14, updated_at=excluded.updated_at''',
+                    atr14=excluded.atr14, signal_close=excluded.signal_close,
+                    threshold_high=excluded.threshold_high,
+                    initial_stop_reference=excluded.initial_stop_reference,
+                    trail_trigger_reference=excluded.trail_trigger_reference,
+                    updated_at=excluded.updated_at''',
                 (key, account_id, index_id, strategy_version, signal_id, signal_date, status,
                  signal_close, threshold_high, atr14, buy_max, initial_stop_reference,
                  trail_trigger_reference, detail, now, now))
             return one(conn, 'SELECT * FROM strategy_plans WHERE plan_id=?', (key,))
 
-    def active_plan(self, index_id: str, *, statuses: tuple[str, ...] = ('SIGNAL', 'AWAITING_CONFIRMATION')) -> Optional[dict]:
+    def active_plan(self, account_id: str, index_id: str, *,
+                    statuses: tuple[str, ...] = ('SIGNAL', 'AWAITING_CONFIRMATION')) -> Optional[dict]:
+        """只查**指定账户**的活跃计划；账户之间绝不互相影响。"""
         marks = ','.join('?' for _ in statuses)
         with self.db.read() as conn:
             found = rows(conn,
-                         f'SELECT * FROM strategy_plans WHERE index_id=? AND status IN ({marks})'
-                         ' ORDER BY signal_date DESC LIMIT 1', (index_id, *statuses))
+                         f'SELECT * FROM strategy_plans WHERE account_id=? AND index_id=?'
+                         f' AND status IN ({marks}) ORDER BY signal_date DESC LIMIT 1',
+                         (account_id, index_id, *statuses))
             return found[0] if found else None
 
-    def clear_plan(self, index_id: str, *, reason: str) -> None:
+    def clear_plan(self, account_id: str, index_id: str, *, reason: str) -> None:
+        """只取消**指定账户**的计划。"""
         now = utc(self.clock())
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE strategy_plans SET status='CANCELLED', detail=?, updated_at=?"
-                " WHERE index_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')",
-                (reason, now, index_id))
+                " WHERE account_id=? AND index_id=? AND status IN ('SIGNAL','AWAITING_CONFIRMATION')",
+                (reason, now, account_id, index_id))
+
+    def plans_for(self, account_id: str) -> list[dict]:
+        with self.db.read() as conn:
+            return rows(conn, 'SELECT * FROM strategy_plans WHERE account_id=?'
+                              ' AND status IN (\'SIGNAL\',\'AWAITING_CONFIRMATION\')'
+                              ' ORDER BY signal_date DESC, index_id', (account_id,))
 
     # -- 持仓推进状态 ----------------------------------------------------
     def save_position(self, account_id: str, state: PositionState) -> None:
@@ -181,9 +217,9 @@ class StrategyStore:
                     last_exit_reason,pending_stop,pending_stop_effective_date,pending_action,
                     pending_action_date,main_lot_id,shares,entry_executed,execution_source,
                     state_json,created_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (position_id, account_id, state.index_id, state.strategy_version,
-                 state.signal_date, *values, now))
+                 state.signal_date, *values[:-1], now, now))
 
     def load_position(self, account_id: str, index_id: str) -> Optional[PositionState]:
         with self.db.read() as conn:
@@ -194,11 +230,32 @@ class StrategyStore:
             return None
         return PositionState.from_payload(json.loads(found[0]['state_json']))
 
+    def load_position_on(self, account_id: str, index_id: str,
+                         signal_date: str) -> Optional[PositionState]:
+        """按 (账户, 指数, 信号日) 精确取某一份证据，供历史查询/重建使用。"""
+        with self.db.read() as conn:
+            found = rows(conn,
+                         'SELECT state_json FROM strategy_positions WHERE account_id=? AND index_id=?'
+                         ' AND signal_date=?', (account_id, index_id, signal_date))
+        if not found:
+            return None
+        return PositionState.from_payload(json.loads(found[0]['state_json']))
+
     def open_positions(self, account_id: str) -> list[dict]:
         with self.db.read() as conn:
             return rows(conn, 'SELECT * FROM strategy_positions WHERE account_id=?'
                               ' AND exit_filled=0 AND entry_executed=1 ORDER BY index_id',
                         (account_id,))
+
+    def positions_for(self, account_id: str, *, index_id: Optional[str] = None) -> list[dict]:
+        """该账户的全部策略证据行（含已平仓），供真实持仓对账与历史查询。"""
+        sql = 'SELECT * FROM strategy_positions WHERE account_id=?'
+        args: tuple = (account_id,)
+        if index_id:
+            sql += ' AND index_id=?'
+            args += (index_id,)
+        with self.db.read() as conn:
+            return rows(conn, sql + ' ORDER BY signal_date DESC', args)
 
     # -- 冷却 ------------------------------------------------------------
     def save_cooldown(self, account_id: str, index_id: str, *, exit_date: str,
@@ -242,4 +299,4 @@ class StrategyStore:
         return found[0] if found else {'ratio': 0.0, 'last_add_date': None}
 
 
-__all__ = ['StrategyStore']
+__all__ = ['MARKET_SCOPE', 'StrategyStore']

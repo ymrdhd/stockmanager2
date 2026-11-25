@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {api, ApiError, setGuard, WriteAttempt, page, type Fact} from '../src/api/client.ts'
 import {fen,money,shanghaiTime,yuan} from '../src/ui.ts'
-import {dividendCorrectionForm,dividendForm,openingForm,quoteResolutionForm,reconciliationForm,tradeForm,transferForm,accountForm} from '../src/forms.ts'
+import {companyForm,dividendCorrectionForm,dividendForm,openingForm,quoteResolutionForm,reconciliationForm,tradeForm,transferForm,accountForm} from '../src/forms.ts'
 
 test('integer cents and unknown values are displayed without float accounting',()=>{
   assert.equal(fen('1990.01'),199001);assert.equal(fen('-10.05'),-1005);assert.throws(()=>fen('0.001'))
@@ -57,7 +57,10 @@ test('a changed database identity blocks retrying the previous request',async()=
   setGuard(()=>({identity:['00000000-0000-4000-8000-000000000002',1]}))
   await assert.rejects(writer.retry(),(e:unknown)=>e instanceof ApiError&&e.code==='identity_changed')
   assert.notEqual(writer.pending,null)
-  writer.discard();setGuard(()=>({}))
+  await assert.rejects(writer.discard(),(e:unknown)=>e instanceof ApiError&&e.code==='identity_changed')
+  assert.notEqual(writer.pending,null)
+  setGuard(()=>({identity:['00000000-0000-4000-8000-000000000001',1]}))
+  assert.equal(await writer.discard(),true);setGuard(()=>({}))
 })
 test('a request already in the ledger is reported instead of being posted again',async()=>{
   let posted=0
@@ -67,7 +70,7 @@ test('a request already in the ledger is reported instead of being posted again'
   assert.equal(state.committed,true)
   assert.equal(posted,1)
   // The page must offer the committed result, not a second POST of the same request.
-  writer.discard();assert.equal(writer.pending,null)
+  assert.equal(await writer.discard(),true);assert.equal(writer.pending,null)
 })
 test('list boundary validates revision and pagination',()=>{
   assert.deepEqual(page({items:[{id:'one'}],ledger_revision:1,total:1,limit:50,offset:0}).items,[{id:'one'}])
@@ -95,3 +98,9 @@ test('trade form keeps exact price and explicit specified batch, account creatio
   const body=form.build(values);assert.equal(body.price,'12.3456');assert.equal(body.fees_fen,null);assert.deepEqual(body.allocations,{lot:50});assert.equal(body.trading_day,'2026-01-06')
   assert.throws(()=>form.build({...values,side:'buy'}));assert.throws(()=>accountForm().build({name:'new',kind:'securities',effective_at:'',included:'true'}))
 })
+
+ test('company action form supplies actual ratios, not fabricated trades',()=>{
+  const form=companyForm([{id:'a',kind:'securities'}],[{id:'i',market:'SH',code:'510300'}])
+  assert.equal(form.path,'/company-events')
+  assert.deepEqual(form.build({account_id:'a',instrument_id:'i',kind:'split',ratio_from:'1',ratio_to:'2',cash_tail:'',occurred_at:'2026-01-06T09:00',note:'confirmed fixture'}),{account_id:'a',instrument_id:'i',kind:'split',ratio_from:1,ratio_to:2,cash_tail_fen:null,occurred_at:'2026-01-06T09:00:00+08:00',note:'confirmed fixture'})
+ })

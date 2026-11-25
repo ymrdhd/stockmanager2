@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from backend.api.auth import router as auth_router
 from backend.api.finance import router as finance_router
+from backend.api.maintenance import router as maintenance_router
 from backend.api.market import router as market_router
 from backend.api.portfolio import router as portfolio_router
 from backend.api.requests import router as request_router
@@ -90,6 +91,7 @@ def create_app(config: AppConfig | None = None, *, database: DatabaseSettings | 
     app.include_router(market_router)
     app.include_router(strategy_router)
     app.include_router(finance_router)
+    app.include_router(maintenance_router)
     app.include_router(request_router)
     if security is not None:
         app.add_middleware(BrowserSecurity, security=security)

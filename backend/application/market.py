@@ -13,7 +13,8 @@ from backend.application.market_calendar import (
 from backend.application.portfolio import PortfolioService, QuoteInput
 from backend.application.trading.service import TradeError, dump, one, rows, utc
 from backend.infrastructure.database import Database, DatabaseError
-from backend.infrastructure.market.eastmoney import CLOSE_DELAY, EastmoneyProvider, MarketDataError
+from backend.infrastructure.market.eastmoney import MarketDataError
+from backend.infrastructure.market.tencent import CLOSE_DELAY, TencentQuoteProvider
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class MarketService:
     def __init__(self, db: Database, provider: QuoteProvider | None = None,
                  clock: Callable[[], datetime] = lambda:datetime.now(UTC)) -> None:
         self.db = db
-        self.provider = provider if provider is not None else EastmoneyProvider()
+        self.provider = provider if provider is not None else TencentQuoteProvider()
         self.clock = clock
         self.portfolio = PortfolioService(db, clock)
         self._refresh_lock = Lock()
@@ -51,12 +52,28 @@ class MarketService:
             for instrument in instruments:
                 quote,quality = self.portfolio._current_quote(conn,instrument['id'],cutoff,window,revision)
                 items.append({'instrument_id':instrument['id'], 'code':instrument['code'],
-                    'market':instrument['market'], 'quote':quote, 'quality':quality})
+                    'market':instrument['market'], 'quote':quote, 'quality':quality,
+                    # Evidence provenance is exposed explicitly so the UI and the
+                    # reviewer can see which source produced an accounted quote.
+                    'source':quote['source'] if quote else None,
+                    'price_basis':quote['price_basis'] if quote else None,
+                    'kind':quote['kind'] if quote else None,
+                    'observed_at':quote['observed_at'] if quote else None,
+                    'acquired_at':quote['acquired_at'] if quote else None})
+        provider, provider_available = self._provider_state()
         with self._state_lock:
             last_result = self._last_result
         return {'as_of':cutoff, 'quote_revision':revision, 'market_phase':window.phase if window else 'unknown',
                 'latest_completed_trading_day':window.latest_completed.isoformat() if window else None,
-                'calendar_coverage':calendar_coverage(now),'last_refresh':last_result,'items':items}
+                'calendar_coverage':calendar_coverage(now),'last_refresh':last_result,
+                'provider':provider,'provider_available':provider_available,'items':items}
+
+    def _provider_state(self) -> tuple[str, bool]:
+        """Name the configured source; availability is structural, not a probe."""
+        provider = self.provider
+        name = getattr(provider,'name',None) or type(provider).__name__
+        ready = all(callable(getattr(provider,attr,None)) for attr in ('spot','closes'))
+        return str(name), ready and bool(getattr(provider,'available',True))
 
     @staticmethod
     def _instruments(conn, instrument_id: str | None) -> list[dict]:

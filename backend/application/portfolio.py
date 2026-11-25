@@ -11,7 +11,7 @@ from pydantic import Field, field_validator, model_validator
 
 from backend.application.trading.service import (
     Input, TradeInput, TradeService, TradeError, Conflict, MAX_FEN, MAX_QTY, SCALE,
-    audit, bump, cash_balance, dump, money, one, prior, remember, rows, uid, utc, require_account,
+    audit, bump, cash_balance, dump, money, one, prior, remember, rows, uid, utc, require_account, verified_trade_signal,
 )
 from backend.infrastructure.database import Database
 from backend.application.market_calendar import (
@@ -52,6 +52,30 @@ class OpeningInput(Input):
         return self
 
 
+class OpeningCorrectionInput(Input):
+    """更正要说明依据；原记录不覆盖，只被标记为已被替换。
+
+    ``opening_id`` 由路径给出时允许在请求体里省略；两者同时给出时必须一致。
+    """
+    request_id: str = Field(min_length=1,max_length=128)
+    opening_id: str = Field(default='',max_length=128)
+    quantity: int = Field(strict=True,gt=0,le=MAX_QTY)
+    cost_fen: int = Field(strict=True,ge=0,le=MAX_FEN)
+    fees_fen: int = Field(strict=True,ge=0,le=MAX_FEN)
+    occurred_at: datetime
+    note: str = Field(min_length=1,max_length=2000)
+
+    @field_validator('occurred_at',mode='before')
+    @classmethod
+    def timestamp(cls,value):
+        return TradeInput.timestamp_input(value)
+
+    @model_validator(mode='after')
+    def validate_time(self):
+        require_time(self.occurred_at)
+        return self
+
+
 class CompanyInput(Input):
     request_id: str = Field(min_length=1,max_length=128)
     account_id: str
@@ -60,6 +84,11 @@ class CompanyInput(Input):
     occurred_at: datetime
     amount_fen: int | None = Field(default=None,strict=True,gt=0,le=MAX_FEN)
     note: str = Field(min_length=1,max_length=2000)
+    # 拆分/合并的比例：新数量 = 旧数量 × ratio_to // ratio_from。
+    ratio_from: int | None = Field(default=None,strict=True,ge=1,le=10**9)
+    ratio_to: int | None = Field(default=None,strict=True,ge=1,le=10**9)
+    # 除不尽的碎股按真实收到/付出的现金尾差单独记录，绝不并入成本。
+    cash_tail_fen: int | None = Field(default=None,strict=True,gt=0,le=MAX_FEN)
 
     @field_validator('occurred_at',mode='before')
     @classmethod
@@ -71,6 +100,14 @@ class CompanyInput(Input):
         require_time(self.occurred_at)
         if (self.kind=='dividend') != (self.amount_fen is not None):
             raise ValueError('only confirmed cash dividends may carry amount')
+        scaling = self.kind in ('split','merge')
+        if not scaling and (self.ratio_from is not None or self.ratio_to is not None
+                            or self.cash_tail_fen is not None):
+            raise ValueError('only split or merge may carry ratio or cash tail')
+        if (self.ratio_from is None) != (self.ratio_to is None):
+            raise ValueError('split or merge requires both ratio_from and ratio_to')
+        if scaling and self.ratio_from is not None and self.ratio_to == self.ratio_from:
+            raise ValueError('split or merge ratio must change the share count')
         return self
 
 
@@ -138,18 +175,211 @@ class PortfolioService:
             require_account(conn,data.account_id,securities=True,active=True,at=value['occurred_at'])
             one(conn,'SELECT id FROM instruments WHERE id=?',(data.instrument_id,))
             scope=(data.account_id,data.instrument_id)
-            if conn.execute('SELECT 1 FROM opening_positions WHERE account_id=? AND instrument_id=?',scope).fetchone() or conn.execute("SELECT 1 FROM trade_executions WHERE account_id=? AND instrument_id=? AND status='effective'",scope).fetchone():
+            # Only a current row blocks a new baseline; replaced or voided rows are
+            # history and must never make the scope permanently unwritable.
+            if conn.execute("""SELECT 1 FROM opening_positions WHERE account_id=? AND instrument_id=?
+                    AND superseded_by IS NULL AND voided_at IS NULL""",scope).fetchone() or conn.execute("SELECT 1 FROM trade_executions WHERE account_id=? AND instrument_id=? AND status='effective'",scope).fetchone():
                 raise Conflict('opening position must precede effective trades and be unique')
-            if conn.execute('SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=?',scope).fetchone():
+            if conn.execute("""SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=?
+                    AND voided_at IS NULL AND occurred_at<=?""",(*scope,value['occurred_at'])).fetchone():
                 raise Conflict('opening position cannot follow company action facts')
             id_=uid(); lot=uid()
-            conn.execute('INSERT INTO opening_positions VALUES (?,?,?,?,?,?,?,?)',(id_,*scope,data.quantity,data.cost_fen,data.fees_fen,value['occurred_at'],data.note))
+            conn.execute("""INSERT INTO opening_positions
+                (id,account_id,instrument_id,quantity,cost_fen,fees_fen,occurred_at,note,superseded_by,voided_at)
+                VALUES (?,?,?,?,?,?,?,?,NULL,NULL)""",
+                (id_,*scope,data.quantity,data.cost_fen,data.fees_fen,value['occurred_at'],data.note))
             conn.execute("INSERT INTO trade_lots VALUES (?,NULL,NULL,'ordinary',NULL,NULL,?,?,?,?,'open',?)",(lot,data.quantity,data.quantity,data.cost_fen,data.fees_fen,id_))
             audit(conn,'opening_position',id_,'confirmed',data.request_id,value)
             bump(conn,day_of(data.occurred_at).isoformat())
             result={'id':id_,'lot_id':lot,**value}
             remember(conn,data.request_id,payload,result)
             return result
+
+    @staticmethod
+    def _allocate(conn: sqlite3.Connection,v: dict) -> list[tuple[dict,int]]:
+        """FIFO (or explicitly specified) allocation over the batches visible now.
+
+        ``TradeService._plan`` cannot be reused here: it refuses every scope that
+        carries a non-dividend company event, which is exactly the scope a
+        correction has to replay. The allocation maths is identical.
+        """
+        lots=rows(conn,"""SELECT l.*,COALESCE(t.executed_at,o.occurred_at) AS executed_at
+            FROM trade_lots l LEFT JOIN trade_executions t ON t.id=l.open_execution_id
+            LEFT JOIN opening_positions o ON o.id=l.opening_id
+            WHERE COALESCE(t.account_id,o.account_id)=? AND COALESCE(t.instrument_id,o.instrument_id)=?
+            AND (t.status='effective' OR (o.id IS NOT NULL AND o.superseded_by IS NULL AND o.voided_at IS NULL))
+            AND l.status='open' AND COALESCE(t.executed_at,o.occurred_at)<=?
+            ORDER BY COALESCE(t.executed_at,o.occurred_at),COALESCE(t.rowid,0)""",
+            (v['account_id'],v['instrument_id'],v['executed_at']))
+        eligible={lot['id']:lot for lot in lots
+                  if lot['lot_role']==v['lot_role'] and lot['strategy_id']==v['strategy_id']}
+        specified=v['allocations']
+        if specified is not None:
+            if (sum(specified.values())!=v['quantity']
+                    or any(k not in eligible or q>eligible[k]['remaining_qty'] for k,q in specified.items())):
+                raise Conflict('historical replay conflict: specified lots no longer fund this sale')
+            return [(eligible[k],q) for k,q in specified.items()]
+        if v['lot_role']!='ordinary':
+            raise Conflict('historical replay conflict: strategy sale lost its specified lots')
+        need=plan_need=v['quantity']
+        plan=[]
+        for lot in eligible.values():
+            take=min(need,lot['remaining_qty'])
+            if take:
+                plan.append((lot,take)); need-=take
+        if need: raise Conflict('historical replay conflict: insufficient lots after correction')
+        return plan if plan_need else []
+
+    def _replay_scope(self,conn: sqlite3.Connection,account: str,instrument: str,request: str,
+                      opening: tuple[str,int,int,int] | None) -> list[dict]:
+        """Rebuild every allocation of one scope against the current baseline batch.
+
+        ``opening`` is the batch that must survive as the position baseline (its id,
+        quantity, cost and fees); ``None`` means the scope has no baseline any more,
+        so any remaining sale must fail instead of silently running on empty lots.
+        Batches opened by real buys are replayed from their own recorded payload, so
+        nothing here invents a trade, a price or a cash movement.
+        """
+        facts=rows(conn,"""SELECT * FROM trade_executions WHERE account_id=? AND instrument_id=?
+            AND status='effective' ORDER BY executed_at,rowid""",(account,instrument))
+        previous=rows(conn,"""SELECT a.* FROM lot_allocations a JOIN trade_executions t
+            ON t.id=a.sell_execution_id WHERE t.account_id=? AND t.instrument_id=?
+            AND t.status='effective' ORDER BY a.rowid""",(account,instrument))
+        conn.execute("""DELETE FROM lot_allocations WHERE sell_execution_id IN
+            (SELECT id FROM trade_executions WHERE account_id=? AND instrument_id=? AND status='effective')""",
+            (account,instrument))
+        conn.execute("""UPDATE trade_lots SET remaining_qty=0,remaining_cost_fen=0,remaining_fees_fen=0,
+            status='reversed' WHERE open_execution_id IN
+            (SELECT id FROM trade_executions WHERE account_id=? AND instrument_id=?)""",(account,instrument))
+        conn.execute("""UPDATE trade_lots SET remaining_qty=0,remaining_cost_fen=0,remaining_fees_fen=0,
+            status='reversed' WHERE opening_id IN
+            (SELECT id FROM opening_positions WHERE account_id=? AND instrument_id=? AND id IS NOT ?)""",
+            (account,instrument,opening[0] if opening else None))
+        if opening is not None:
+            conn.execute("""UPDATE trade_lots SET remaining_qty=?,remaining_cost_fen=?,remaining_fees_fen=?,
+                status='open' WHERE opening_id=?""",(opening[1],opening[2],opening[3],opening[0]))
+        for fact in facts:
+            v=json.loads(fact['payload'])
+            if v['side']=='buy':
+                TradeService._post(conn,fact['id'],v,[],cash=False)
+            else:
+                TradeService._post(conn,fact['id'],v,self._allocate(conn,v),cash=False)
+        if previous:
+            audit(conn,'opening_position',opening[0] if opening else instrument,'allocations_rebuilt',
+                  request,{'account_id':account,'instrument_id':instrument,'previous_allocations':previous})
+        return [{'id':fact['id'],'executed_at':fact['executed_at']} for fact in facts]
+
+    def correct_opening(self,data: OpeningCorrectionInput,opening_id: str|None=None) -> dict:
+        """Revise a confirmed opening baseline without overwriting the original row."""
+        data=OpeningCorrectionInput.model_validate(data)
+        target=data.opening_id or (opening_id or '')
+        if not target:
+            raise TradeError('correction requires the opening position it replaces')
+        if data.opening_id and opening_id and data.opening_id!=opening_id:
+            raise Conflict('opening position in body conflicts with the addressed record')
+        if data.opening_id!=target:
+            data=data.model_copy(update={'opening_id':target})
+        self._actual(data.occurred_at)
+        value=data.model_dump(mode='json',exclude={'request_id'})
+        value['occurred_at']=utc(data.occurred_at)
+        payload=dump({'opening_correction':value})
+        with self.db.transaction() as conn:
+            old=prior(conn,data.request_id,payload)
+            if old is not None: return old
+            original=one(conn,'SELECT * FROM opening_positions WHERE id=?',(data.opening_id,))
+            if original['superseded_by'] is not None:
+                raise Conflict('opening position already replaced')
+            if original['voided_at'] is not None:
+                raise Conflict('opening position already voided')
+            account,instrument=original['account_id'],original['instrument_id']
+            require_account(conn,account,securities=True,active=True,at=value['occurred_at'])
+            id_=uid(); lot=uid()
+            # The original row stays exactly as recorded; only its successor link changes.
+            conn.execute('UPDATE opening_positions SET superseded_by=? WHERE id=?',(id_,original['id']))
+            conn.execute("""INSERT INTO opening_positions
+                (id,account_id,instrument_id,quantity,cost_fen,fees_fen,occurred_at,note,superseded_by,voided_at)
+                VALUES (?,?,?,?,?,?,?,?,NULL,NULL)""",
+                (id_,account,instrument,data.quantity,data.cost_fen,data.fees_fen,value['occurred_at'],data.note))
+            conn.execute("INSERT INTO trade_lots VALUES (?,NULL,NULL,'ordinary',NULL,NULL,?,?,?,?,'open',?)",
+                         (lot,data.quantity,data.quantity,data.cost_fen,data.fees_fen,id_))
+            replayed=self._replay_scope(conn,account,instrument,data.request_id,
+                                        (id_,data.quantity,data.cost_fen,data.fees_fen))
+            earliest=min([day_of(datetime.fromisoformat(original['occurred_at'])),
+                          day_of(data.occurred_at)]+[day_of(datetime.fromisoformat(f['executed_at'])) for f in replayed]).isoformat()
+            details={**value,'supersedes':original['id'],'lot_id':lot,
+                     'previous':{'quantity':original['quantity'],'cost_fen':original['cost_fen'],
+                                 'fees_fen':original['fees_fen'],'occurred_at':original['occurred_at']},
+                     'replayed_executions':[f['id'] for f in replayed],'earliest_affected_day':earliest,
+                     'strategy_evidence_recheck':True}
+            audit(conn,'opening_position',id_,'corrected',data.request_id,details)
+            bump(conn,earliest)
+            result={'id':id_,'lot_id':lot,'supersedes':original['id'],**value,
+                    'replayed_executions':[f['id'] for f in replayed],'earliest_affected_day':earliest,
+                    'strategy_evidence_recheck':True}
+            remember(conn,data.request_id,payload,result)
+            return result
+
+    def void_opening(self,opening_id: str,request_id: str,reason: str) -> dict:
+        """Void a baseline while keeping the row as history; unsafe scopes roll back."""
+        request=request_id.strip() if isinstance(request_id,str) else ''
+        if not 1<=len(request)<=128 or not isinstance(reason,str) or not 1<=len(reason.strip())<=2000:
+            raise TradeError('void requires request ID and reason')
+        payload=dump({'void_opening':opening_id,'reason':reason})
+        with self.db.transaction() as conn:
+            old=prior(conn,request,payload)
+            if old is not None: return old
+            original=one(conn,'SELECT * FROM opening_positions WHERE id=?',(opening_id,))
+            if original['voided_at'] is not None:
+                raise Conflict('opening position already voided')
+            if original['superseded_by'] is not None:
+                raise Conflict('opening position already replaced')
+            account,instrument=original['account_id'],original['instrument_id']
+            voided=utc(require_time(self.clock()))
+            conn.execute('UPDATE opening_positions SET voided_at=? WHERE id=?',(voided,opening_id))
+            conn.execute("""UPDATE trade_lots SET remaining_qty=0,remaining_cost_fen=0,remaining_fees_fen=0,
+                status='reversed' WHERE opening_id=?""",(opening_id,))
+            # A baseline that funded sales cannot be removed without breaking them.
+            replayed=self._replay_scope(conn,account,instrument,request,None)
+            earliest=min([day_of(datetime.fromisoformat(original['occurred_at']))]+
+                         [day_of(datetime.fromisoformat(f['executed_at'])) for f in replayed]).isoformat()
+            details={'reason':reason,'voided_at':voided,
+                     'previous':{'quantity':original['quantity'],'cost_fen':original['cost_fen'],
+                                 'fees_fen':original['fees_fen'],'occurred_at':original['occurred_at']},
+                     'replayed_executions':[f['id'] for f in replayed],'earliest_affected_day':earliest,
+                     'strategy_evidence_recheck':True,
+                     # Opening positions carry no cash by themselves; the account's cash
+                     # baseline is a separate movement and is never rewritten here.
+                     'cash_reversed_fen':0}
+            audit(conn,'opening_position',opening_id,'voided',request,details)
+            bump(conn,earliest)
+            result={'id':opening_id,'account_id':account,'instrument_id':instrument,
+                    'voided_at':voided,'reason':reason,'replayed_executions':[f['id'] for f in replayed],
+                    'earliest_affected_day':earliest,'strategy_evidence_recheck':True,
+                    'cash_reversed_fen':0}
+            remember(conn,request,payload,result)
+            return result
+
+    def openings(self,account_id: str|None=None,limit: int=100,offset: int=0) -> dict:
+        """Every recorded baseline row, including replaced and voided history."""
+        sql="""SELECT o.*,CASE WHEN o.superseded_by IS NULL AND o.voided_at IS NULL THEN 1 ELSE 0 END AS is_current,
+            l.id AS lot_id,l.remaining_qty AS remaining_qty,l.opened_qty AS opened_qty,
+            l.remaining_cost_fen AS remaining_cost_fen,l.remaining_fees_fen AS remaining_fees_fen,
+            l.status AS lot_status
+            FROM opening_positions o LEFT JOIN trade_lots l ON l.opening_id=o.id"""
+        args: tuple=()
+        if account_id is not None:
+            sql+=' WHERE o.account_id=?'
+            args=(account_id,)
+        with self.db.read() as conn:
+            revision=one(conn,'SELECT ledger_revision,earliest_affected_day FROM ledger_state')
+            items=rows(conn,sql+' ORDER BY o.occurred_at,o.rowid LIMIT ? OFFSET ?',(*args,limit,offset))
+            for item in items:
+                item['is_current']=bool(item['is_current'])
+            total=conn.execute('SELECT count(*) FROM ('+sql+')',args).fetchone()[0]
+            incomplete=rows(conn,"""SELECT DISTINCT account_id,instrument_id FROM trade_executions
+                WHERE status='pending' ORDER BY account_id,instrument_id""")
+            return {'items':items,**revision,'data_incomplete':bool(incomplete),
+                    'incomplete_scopes':incomplete,'total':total,'limit':limit,'offset':offset}
 
     def company(self,data: CompanyInput) -> dict:
         data=CompanyInput.model_validate(data)
@@ -161,18 +391,161 @@ class PortfolioService:
             if old is not None: return old
             require_account(conn,data.account_id,securities=True,active=True,at=value['occurred_at'])
             one(conn,'SELECT id FROM instruments WHERE id=?',(data.instrument_id,))
-            if data.kind=='dividend' and conn.execute("SELECT 1 FROM cash_movements WHERE account_id=? AND kind='opening' AND occurred_at>=?",(data.account_id,value['occurred_at'])).fetchone():
+            if data.kind=='dividend' and conn.execute("SELECT 1 FROM effective_cash_movements WHERE account_id=? AND kind='opening' AND occurred_at>=?",(data.account_id,value['occurred_at'])).fetchone():
                 raise Conflict('dividend conflicts with opening cash boundary')
             id_=uid()
             movement_id=None
             if data.kind=='dividend':
                 movement_id=uid()
                 conn.execute('INSERT INTO cash_movements VALUES (?,?,?,?,?,?,?,?,?,?)',(movement_id,data.account_id,None,None,data.amount_fen,'dividend',value['occurred_at'],None,data.request_id,data.note))
-            conn.execute('INSERT INTO company_events VALUES (?,?,?,?,?,?,?)',(id_,data.account_id,data.instrument_id,data.kind,value['occurred_at'],movement_id,data.note))
-            audit(conn,'company_event',id_,'confirmed' if data.kind=='dividend' else 'unresolved',data.request_id,value)
+            conn.execute("""INSERT INTO company_events
+                (id,account_id,instrument_id,kind,occurred_at,cash_movement_id,note,ratio_from,ratio_to,cash_tail_fen)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (id_,data.account_id,data.instrument_id,data.kind,value['occurred_at'],movement_id,data.note,
+                 data.ratio_from,data.ratio_to,data.cash_tail_fen))
+            details=dict(value)
+            applied=None
+            gap=None
+            if data.kind in ('split','merge'):
+                if data.ratio_from is None:
+                    # No verified ratio: this stays a recorded data gap. Nothing is
+                    # rescaled and nothing is silently assumed.
+                    gap=['company_action_ratio_missing']
+                else:
+                    applied=self._scale_position(conn,data,id_,value['occurred_at'])
+                    details.update(applied['details'])
+            elif data.kind in ('rights','other'):
+                # Rights issues and one-off events have no verified quantity formula,
+                # so they stay recorded gaps rather than guessed adjustments.
+                gap=['company_action_not_modeled']
+            if gap: details['reason_codes']=gap
+            event='applied' if applied else ('confirmed' if data.kind=='dividend' else 'unresolved')
+            audit(conn,'company_event',id_,event,data.request_id,details)
             bump(conn,day_of(data.occurred_at).isoformat())
             result={'id':id_,**value}
+            if applied: result.update(applied['result'])
+            elif gap: result['reason_codes']=gap
             remember(conn,data.request_id,payload,result)
+            return result
+
+    @staticmethod
+    def _scale_position(conn: sqlite3.Connection, data: CompanyInput, event: str, occurred_at: str) -> dict:
+        """把既有批次的数量按 ``ratio_to/ratio_from`` 换算，总成本与总费用守恒。
+
+        只调整**尚未被卖出**的批次：一个已经用旧尺度分摊过成本的批次无法在不
+        改写已执行成交的前提下换算，因此这里整体拒绝，而不是留下一半旧尺度
+        一半新尺度的账本。碎股按调用方申报的真实现金尾差单独记账，绝不并进
+        成本，也不伪造任何买卖成交通知。
+        """
+        frm,to=data.ratio_from,data.ratio_to
+        scope=(data.account_id,data.instrument_id)
+        if conn.execute('SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND occurred_at>=? AND applied_at IS NOT NULL AND voided_at IS NULL',(*scope,occurred_at)).fetchone():
+            raise Conflict('company action must follow previous applied events')
+        if conn.execute("""SELECT 1 FROM trade_executions WHERE account_id=? AND instrument_id=?
+                AND status='effective' AND executed_at>?""",(*scope,occurred_at)).fetchone():
+            raise Conflict('company action must follow the last effective trade in this scope')
+        lots=rows(conn,"""SELECT l.id,l.opened_qty,l.remaining_qty,l.remaining_cost_fen,l.remaining_fees_fen,
+            l.lot_role,l.frozen_atr FROM trade_lots l
+            LEFT JOIN trade_executions t ON t.id=l.open_execution_id
+            LEFT JOIN opening_positions o ON o.id=l.opening_id
+            WHERE COALESCE(t.account_id,o.account_id)=? AND COALESCE(t.instrument_id,o.instrument_id)=?
+            AND l.status='open' AND l.remaining_qty>0
+            AND (t.status='effective' OR (o.id IS NOT NULL AND o.superseded_by IS NULL AND o.voided_at IS NULL))
+            ORDER BY COALESCE(t.executed_at,o.occurred_at),l.rowid""",scope)
+        if not lots:
+            raise Conflict('company action requires an open position in this scope')
+        if conn.execute("SELECT 1 FROM opening_positions WHERE account_id=? AND instrument_id=? AND superseded_by IS NULL AND voided_at IS NULL AND occurred_at>=?", (*scope, occurred_at)).fetchone():
+            raise Conflict('company action must follow confirmed opening position')
+        scaled,fractional,invalid=[],False,False
+        for lot in lots:
+            if lot['opened_qty']!=lot['remaining_qty']:
+                raise Conflict('company action cannot rescale a batch that already funded a sale')
+            units=lot['opened_qty']*to
+            new=units//frm
+            if not 0<new<=MAX_QTY:
+                raise Conflict('company action quantity outside supported range')
+            fractional=fractional or units%frm!=0
+            invalid=invalid or (lot['lot_role'] in ('main','sub') and lot['frozen_atr'] is not None)
+            scaled.append((lot,new))
+        if fractional and data.cash_tail_fen is None:
+            raise Conflict('fractional shares require the actual cash tail amount')
+        if not fractional and data.cash_tail_fen is not None:
+            raise Conflict('cash tail requires a fractional share result')
+        tail=None
+        if data.cash_tail_fen is not None:
+            from backend.application.trading.service import post_cash
+            tail=post_cash(conn, account=data.account_id,kind='adjustment',amount=data.cash_tail_fen,
+                           at=occurred_at,note='公司行为现金尾差',request=f'{event}:tail')['id']
+        snapshot={'lots':[],'ratio_from':frm,'ratio_to':to}
+        for lot,new in scaled:
+            conn.execute('UPDATE trade_lots SET opened_qty=?,remaining_qty=? WHERE id=?',(new,new,lot['id']))
+            snapshot['lots'].append({'id':lot['id'],'opened_before':lot['opened_qty'],
+                                     'opened_after':new,'cost_before':lot['remaining_cost_fen'],
+                                     'fees_before':lot['remaining_fees_fen']})
+        if tail: snapshot['tail_cash_movement_id']=tail
+        applied=utc(datetime.now(UTC))
+        conn.execute("""UPDATE company_events SET applied_at=?,strategy_evidence_invalid=?,applied_snapshot=?
+            WHERE id=?""",(applied,1 if invalid else 0,dump(snapshot),event))
+        details={'applied_at':applied,'ratio_from':frm,'ratio_to':to,
+                 'cash_tail_fen':data.cash_tail_fen,'tail_cash_movement_id':tail,
+                 'batches':snapshot['lots'],'strategy_evidence_invalid':invalid}
+        if invalid:
+            details['strategy_evidence_recheck_reason']='公司行为改变了价格尺度，冻结 ATR 与保护价需重新核实'
+        result={'applied_at':applied,'ratio_from':frm,'ratio_to':to,
+                'cash_tail_fen':data.cash_tail_fen,'strategy_evidence_invalid':invalid,
+                'batches':snapshot['lots']}
+        return {'details':details,'result':result}
+
+    def void_company_event(self,event_id: str,request_id: str,reason: str) -> dict:
+        request=request_id.strip() if isinstance(request_id,str) else ''
+        if not 1<=len(request)<=128 or not isinstance(reason,str) or not 1<=len(reason.strip())<=2000:
+            raise TradeError('void requires request ID and reason')
+        payload=dump({'void_company_event':event_id,'reason':reason})
+        with self.db.transaction() as conn:
+            old=prior(conn,request,payload)
+            if old is not None: return old
+            event=one(conn,'SELECT * FROM company_events WHERE id=?',(event_id,))
+            if event['voided_at'] is not None:
+                raise Conflict('company event already voided')
+            if event['superseded_by'] is not None:
+                raise Conflict('company event already replaced')
+            voided=utc(require_time(self.clock()))
+            details={'reason':reason,'kind':event['kind'],'applied_at':event['applied_at'],
+                     'strategy_evidence_invalid_before':bool(event['strategy_evidence_invalid'])}
+            if event['applied_at'] is not None:
+                if conn.execute('SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND occurred_at>? AND applied_at IS NOT NULL AND voided_at IS NULL',(event['account_id'],event['instrument_id'],event['occurred_at'])).fetchone():
+                    raise Conflict('later corporate action depends on this event')
+                snapshot=json.loads(event['applied_snapshot'])
+                # Only an untouched application can be undone: if later facts moved
+                # these batches, reversing the ratio would invent a wrong quantity.
+                for item in snapshot['lots']:
+                    lot=one(conn,'SELECT * FROM trade_lots WHERE id=?',(item['id'],))
+                    if lot['opened_qty']!=item['opened_after'] or lot['remaining_qty']!=item['opened_after'] or lot['status']!='open':
+                        raise Conflict('later facts changed these batches; void is not safe')
+                for item in snapshot['lots']:
+                    conn.execute("""UPDATE trade_lots SET opened_qty=?,remaining_qty=?
+                        WHERE id=?""",(item['opened_before'],item['opened_before'],item['id']))
+                details['batches']=snapshot['lots']
+                tail=snapshot.get('tail_cash_movement_id')
+                if tail:
+                    movement=one(conn,'SELECT * FROM cash_movements WHERE id=?',(tail,))
+                    if conn.execute('SELECT 1 FROM cash_movements WHERE reversal_of=?',(tail,)).fetchone():
+                        raise Conflict('cash tail already reversed')
+                    conn.execute('INSERT INTO cash_movements VALUES (?,?,?,?,?,?,?,?,?,?)',
+                                 (uid(),movement['account_id'],None,None,-movement['amount_fen'],'reversal',
+                                  movement['occurred_at'],tail,None,reason))
+                    details['tail_reversed_fen']=movement['amount_fen']
+                conn.execute('UPDATE company_events SET voided_at=?,strategy_evidence_invalid=0 WHERE id=?',(voided,event_id))
+            else:
+                conn.execute('UPDATE company_events SET voided_at=? WHERE id=?',(voided,event_id))
+            details['voided_at']=voided
+            audit(conn,'company_event',event_id,'voided',request,details)
+            bump(conn,day_of(datetime.fromisoformat(event['occurred_at'])).isoformat())
+            result={**one(conn,'SELECT * FROM company_events WHERE id=?',(event_id,)),'reason':reason,
+                    # 冲销的实际金额必须回给调用方：现金尾差是按真实金额独立记录的事实。
+                    'tail_reversed_fen':details.get('tail_reversed_fen',0),
+                    'reversed_batches':details.get('batches',[])}
+            remember(conn,request,payload,result)
             return result
 
     def quote(self, data: QuoteInput) -> dict:
@@ -341,15 +714,29 @@ class PortfolioService:
 
     @staticmethod
     def _lots(conn: sqlite3.Connection,account: str,cutoff: str) -> list[dict]:
-        return rows(conn,"""SELECT l.id AS lot_id,l.open_execution_id,l.opening_id,l.lot_role,l.strategy_id,l.signal_date,l.frozen_atr,
+        # A replaced or voided opening row is history: its batch must never add a
+        # second position. Reversed batches are likewise excluded, so a replay that
+        # is still in progress can never be observed as real holdings.
+        result=rows(conn,"""SELECT l.id AS lot_id,l.open_execution_id,l.opening_id,l.lot_role,l.strategy_id,l.signal_date,l.frozen_atr,
             COALESCE(t.instrument_id,o.instrument_id) AS instrument_id,COALESCE(t.executed_at,o.occurred_at) AS opened_at,
             l.opened_qty-COALESCE(SUM(CASE WHEN s.id IS NOT NULL THEN a.quantity END),0) AS quantity,
             COALESCE(t.amount_fen,o.cost_fen)-COALESCE(SUM(CASE WHEN s.id IS NOT NULL THEN a.cost_fen END),0) AS cost_fen,
             COALESCE(t.fees_fen,o.fees_fen)-COALESCE(SUM(CASE WHEN s.id IS NOT NULL THEN a.buy_fees_fen END),0) AS fees_fen
             FROM trade_lots l LEFT JOIN trade_executions t ON t.id=l.open_execution_id LEFT JOIN opening_positions o ON o.id=l.opening_id
             LEFT JOIN lot_allocations a ON a.lot_id=l.id LEFT JOIN trade_executions s ON s.id=a.sell_execution_id AND s.status='effective' AND s.executed_at<=?
-            WHERE COALESCE(t.account_id,o.account_id)=? AND COALESCE(t.executed_at,o.occurred_at)<=? AND (t.status='effective' OR o.id IS NOT NULL)
+            WHERE COALESCE(t.account_id,o.account_id)=? AND COALESCE(t.executed_at,o.occurred_at)<=? AND l.status!='reversed'
+            AND (t.status='effective' OR (o.id IS NOT NULL AND o.superseded_by IS NULL AND o.voided_at IS NULL))
             GROUP BY l.id ORDER BY opened_at,l.rowid""",(cutoff,account,cutoff))
+        # Each applied action retains its before/after quantities. Reverse future
+        # changes in reverse effective order; cost/fee facts remain unchanged.
+        by_id={lot['lot_id']:lot for lot in result}
+        for event in rows(conn,"""SELECT applied_snapshot FROM company_events
+            WHERE account_id=? AND applied_at IS NOT NULL AND voided_at IS NULL
+              AND occurred_at>? ORDER BY occurred_at DESC,rowid DESC""",(account,cutoff)):
+            for item in json.loads(event['applied_snapshot'])['lots']:
+                if item['id'] in by_id:
+                    by_id[item['id']]['quantity'] += item['opened_before']-item['opened_after']
+        return result
 
     def _cutoff(self,as_of: datetime) -> str:
         if as_of.utcoffset() is None or not 1900<=as_of.year<=9998: raise TradeError('timestamp must have timezone and supported year')
@@ -419,13 +806,27 @@ class PortfolioService:
             lots = [lot for lot in self._lots(conn, account, cutoff)
                     if lot['lot_role'] in ('main','sub')]
             positions = self._strategy_positions(conn, account, cutoff)
+            for lot in lots:
+                payload = conn.execute('SELECT payload FROM trade_executions WHERE id=?',(lot['open_execution_id'],)).fetchone()
+                proof = verified_trade_signal(conn,json.loads(payload[0])) if payload else None
+                lot['signal_evidence'] = proof
             codes = {row['id']: row['code'] for row in
                      rows(conn,'SELECT id,code FROM instruments')}
-            items, reasons = self._evidence_items(lots, positions, codes, cutoff)
+            invalidated = self._scale_invalidated(conn, account, cutoff)
+            items, reasons = self._evidence_items(lots, positions, codes, cutoff, invalidated)
+            if invalidated:
+                reasons = sorted(set(reasons) | {'company_action_invalidated_strategy_scale'})
             return {**versions,'account_id':account,'as_of':cutoff,
                     'status':self._evidence_status(items),'reason_codes':reasons,
                     'items':items,
                     'note':'策略证据只说明该批次来自哪一条已记录的 V9/G2 决策；成交、数量与现金仍以账本为准。'}
+
+    @staticmethod
+    def _scale_invalidated(conn: sqlite3.Connection, account: str, cutoff: str) -> set[str]:
+        """Instruments whose applied company action broke the frozen price scale."""
+        return {row['instrument_id'] for row in rows(conn,
+            """SELECT DISTINCT instrument_id FROM company_events WHERE account_id=?
+            AND occurred_at<=? AND strategy_evidence_invalid=1""",(account,cutoff))}
 
     @staticmethod
     def _strategy_positions(conn: sqlite3.Connection, account: str, cutoff: str) -> dict:
@@ -435,17 +836,19 @@ class PortfolioService:
                 'SELECT index_id,signal_date,entry_date,entry_price,stop_price,trail_trigger,'
                 'stage,highest_price,holding_days,exit_after_bars,renewals,e2a_extended_days,'
                 'extended,add_executed,exit_filled,closed_date,last_exit_action,last_exit_reason,'
-                'pending_stop,pending_stop_effective_date,execution_source '
-                'FROM strategy_positions WHERE account_id=?',(account,))
+                'pending_stop,pending_stop_effective_date,execution_source,main_lot_id '
+                'FROM strategy_positions WHERE account_id=? AND updated_at<=?',(account,cutoff))
         except sqlite3.OperationalError:
             # A database below schema 8 has no strategy evidence table at all.
             return {}
         return {(row['index_id'],str(row['signal_date'])[:10]): row for row in found}
 
     @staticmethod
-    def _evidence_items(lots: list[dict], positions: dict, codes: dict, cutoff: str):
+    def _evidence_items(lots: list[dict], positions: dict, codes: dict, cutoff: str,
+                        invalidated: set[str] | None = None):
         from backend.domain.strategy.symbols import IndexCodeError, index_for_etf
 
+        invalidated = invalidated or set()
         items, reasons = [], set()
         for lot in lots:
             code = codes.get(lot['instrument_id'])
@@ -456,18 +859,24 @@ class PortfolioService:
             signal_date = str(lot['signal_date'])[:10] if lot['signal_date'] else None
             record = positions.get((index_id,signal_date)) if index_id and signal_date else None
             codes_out = list(lot.get('reason_codes', []))
-            if lot['frozen_atr'] is None or signal_date is None:
+            if lot['instrument_id'] in invalidated:
+                # The batch itself is intact, but its frozen ATR and protective stop
+                # belong to the pre-action price scale and cannot be reused silently.
+                status, codes_out = 'unverified', codes_out + ['company_action_invalidated_strategy_scale']
+            elif lot['frozen_atr'] is None or signal_date is None:
                 status, codes_out = 'unverified', codes_out + ['frozen_atr_or_signal_date_missing']
             elif index_id is None:
                 status, codes_out = 'unverified', codes_out + ['security_is_not_a_configured_etf']
+            elif lot.get('signal_evidence'):
+                status = 'verified'
             elif record is None:
                 status, codes_out = 'unverified', codes_out + ['strategy_position_not_recorded']
             else:
-                status = 'verified'
+                status, codes_out = 'unverified', codes_out + ['strategy_signal_link_not_verified']
             reasons.update(codes_out)
             items.append({**lot,'instrument_code':code,'index_id':index_id,
                           'evidence_status':status,'reason_codes':codes_out,
-                          'strategy':None if record is None else {
+                          'strategy':None if record is None or status!='verified' or record['main_lot_id']!=lot['lot_id'] else {
                               'entry_date':record['entry_date'],'entry_price':record['entry_price'],
                               'stop_price':record['stop_price'],'trail_trigger':record['trail_trigger'],
                               'stage':record['stage'],'highest_price':record['highest_price'],
@@ -537,14 +946,22 @@ class PortfolioService:
         prev_lots=self._lots(conn,account,before)
         pending=rows(conn,"SELECT DISTINCT instrument_id FROM trade_executions WHERE account_id=? AND status='pending' AND executed_at<=?",(account,cutoff))
         actions=rows(conn,"SELECT e.*,m.amount_fen FROM company_events e LEFT JOIN effective_cash_movements m ON m.id=e.cash_movement_id WHERE e.account_id=? AND e.occurred_at<=? AND (e.kind!='dividend' OR m.id IS NOT NULL)",(account,cutoff))
-        blocked={r['instrument_id'] for r in pending}|{r['instrument_id'] for r in actions if r['kind']!='dividend'}
+        # An applied split/merge is a settled fact, not a gap. Only events that are
+        # still unresolved and not voided may block the instrument, and an applied
+        # event that invalidated a strategy scale is reported as its own reason code.
+        unresolved=[r for r in actions if r['kind']!='dividend'
+                    and r['applied_at'] is None and r['voided_at'] is None]
+        scale_invalid={r['instrument_id'] for r in actions if r['strategy_evidence_invalid'] and r['voided_at'] is None}
+        tails={json.loads(r['applied_snapshot']).get('tail_cash_movement_id'): r for r in actions if r['applied_at'] and r['voided_at'] is None and r['applied_snapshot'] and json.loads(r['applied_snapshot']).get('tail_cash_movement_id')}
+        blocked={r['instrument_id'] for r in pending}|{r['instrument_id'] for r in unresolved}
         reasons=[] if window else ['calendar_unavailable']
-        later_openings=rows(conn,'SELECT instrument_id FROM opening_positions WHERE account_id=? AND occurred_at>?',(account,cutoff))
+        later_openings=rows(conn,'SELECT instrument_id FROM opening_positions WHERE account_id=? AND occurred_at>? AND voided_at IS NULL AND superseded_by IS NULL',(account,cutoff))
         if later_openings:
             blocked.update(r['instrument_id'] for r in later_openings)
             reasons.append('before_confirmed_position_baseline')
         if pending: reasons.append('pending_trade')
-        if any(r['kind']!='dividend' for r in actions): reasons.append('unresolved_company_action')
+        if unresolved: reasons.append('unresolved_company_action')
+        if scale_invalid: reasons.append('company_action_invalidated_strategy_scale')
         trades=rows(conn,"SELECT * FROM trade_executions WHERE account_id=? AND status='effective' AND executed_at<=? ORDER BY executed_at,rowid",(account,cutoff))
         realized_rows=rows(conn,"""SELECT t.instrument_id,SUM(t.amount_fen-t.fees_fen-(SELECT COALESCE(SUM(a.cost_fen+a.buy_fees_fen),0) FROM lot_allocations a WHERE a.sell_execution_id=t.id)) AS realized_fen
             FROM trade_executions t WHERE t.account_id=? AND t.status='effective' AND t.side='sell' AND t.executed_at<=? GROUP BY t.instrument_id""",(account,cutoff))
@@ -560,6 +977,8 @@ class PortfolioService:
             quantity=sum(r['quantity'] for r in current); prev_qty=sum(r['quantity'] for r in previous)
             cost=sum(r['cost_fen'] for r in current); fees=sum(r['fees_fen'] for r in current)
             q,quality=self._current_quote(conn,instrument,cutoff,window,revision) if quantity else (None,'valid')
+            if q and any(r['instrument_id']==instrument and r['applied_at'] is not None and r['voided_at'] is None and r['occurred_at']>q['effective_at'] for r in actions):
+                quality='stale'
             mv=money(quantity,q['price']) if quantity and quality=='valid' else 0 if not quantity else None
             if instrument in blocked:
                 mv=None
@@ -579,6 +998,7 @@ class PortfolioService:
                 else: prev_market+=old_value
             today=[r for r in trades if r['instrument_id']==instrument and r['executed_at']>=start]
             dividend=sum(r['amount_fen'] for r in actions if r['instrument_id']==instrument and r['kind']=='dividend' and r['occurred_at']>=start)
+            tail=sum(r['cash_tail_fen'] or 0 for r in tails.values() if r['instrument_id']==instrument and r['occurred_at']>=start)
             cash_trades=sum((r['amount_fen'] if r['side']=='sell' else -r['amount_fen'])-r['fees_fen'] for r in today)
             opening_today=any(r['opening_id'] and r['opened_at']>=start for r in lots if r['instrument_id']==instrument)
             if opening_today:
@@ -587,16 +1007,16 @@ class PortfolioService:
             invalid_session_trade = bool(today and window and not window.is_session)
             if invalid_session_trade:
                 reasons.append(f'{instrument}:trade_on_non_session_day')
-            dp=None if mv is None or old_value is None or instrument in blocked or opening_today or invalid_session_trade else mv-old_value+cash_trades+dividend
+            dp=None if mv is None or old_value is None or instrument in blocked or opening_today or invalid_session_trade else mv-old_value+cash_trades+dividend+tail
             if dp is None: daily_ok=False
             else: daily_known+=dp
             positions.append({'instrument_id':instrument,**master,'quantity':quantity,'lots':current,'remaining_cost_fen':cost,'remaining_fees_fen':fees,'holding_cost_fen':cost+fees,'price':q['price'] if q else None,'quote':q,'market_value_fen':mv,'realized_fen':None if instrument in blocked else realized.get(instrument,0),'unrealized_fen':None if mv is None or instrument in blocked else mv-cost-fees,'daily_pnl_fen':dp,'quality':'derived_unverified' if instrument in blocked else quality})
         balance,cash_quality,cash_reasons=cash_balance(conn,account,cutoff); reasons+=cash_reasons
         equity=balance+market_known if balance is not None and cash_quality=='valid' and market_ok else None
         previous_cash,previous_cash_quality,_=cash_balance(conn,account,before)
-        flows=rows(conn,"SELECT kind,amount_fen FROM effective_cash_movements WHERE account_id=? AND occurred_at>=? AND occurred_at<=? AND kind IN ('deposit','withdrawal','adjustment','opening')",(account,start,cutoff))
+        flows=rows(conn,"SELECT id,kind,amount_fen FROM effective_cash_movements WHERE account_id=? AND occurred_at>=? AND occurred_at<=? AND kind IN ('deposit','withdrawal','adjustment','opening')",(account,start,cutoff))
         external=sum(r['amount_fen'] for r in flows if r['kind'] in ('deposit','withdrawal'))
-        adjustments=sum(r['amount_fen'] for r in flows if r['kind']=='adjustment')
+        adjustments=sum(r['amount_fen'] for r in flows if r['kind']=='adjustment' and r['id'] not in tails)
         equity_pnl=equity-previous_cash-prev_market-external-adjustments if equity is not None and previous_cash is not None and previous_cash_quality=='valid' and prev_ok and not opening_today_any and not any(r['kind']=='opening' for r in flows) else None
         daily=daily_known if daily_ok and balance is not None and 'cash_fact_conflicts_with_baseline' not in cash_reasons else None
         if equity_pnl is None:
@@ -609,6 +1029,7 @@ class PortfolioService:
             base=openings[0]; coverage=base['occurred_at']
             if equity is not None and not any(r['opening_id'] for r in lots) and not any(r['executed_at']<=coverage for r in trades):
                 total_flows=conn.execute("SELECT COALESCE(SUM(amount_fen),0) FROM effective_cash_movements WHERE account_id=? AND occurred_at>? AND occurred_at<=? AND kind IN ('deposit','withdrawal','adjustment')",(account,coverage,cutoff)).fetchone()[0]
+                total_flows-=sum(r['cash_tail_fen'] or 0 for r in tails.values() if r['occurred_at']>coverage)
                 cumulative=equity-base['amount_fen']-total_flows
             else: reasons.append('cumulative_baseline_incomplete')
         if not openings: reasons.append('cumulative_baseline_missing')

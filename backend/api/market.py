@@ -22,7 +22,22 @@ Service = Annotated[MarketService,Depends(market)]
 
 @router.get('/market/status')
 def status(svc: Service,instrument_id: str|None=None):
-    return invoke(svc.status,instrument_id)
+    """Expose quote provenance per instrument plus the configured provider.
+
+    Route path is unchanged: the desktop client already polls this URL. The
+    per-item evidence fields are projected explicitly so the response contract
+    never depends on how many columns a quote row happens to carry.
+    """
+    result = invoke(svc.status,instrument_id)
+    items = []
+    for item in result.get('items',[]):
+        items.append({'instrument_id':item.get('instrument_id'),'code':item.get('code'),
+            'market':item.get('market'),'quote':item.get('quote'),'quality':item.get('quality'),
+            'source':item.get('source'),'price_basis':item.get('price_basis'),
+            'kind':item.get('kind'),'observed_at':item.get('observed_at'),
+            'acquired_at':item.get('acquired_at')})
+    return {**result,'items':items,'provider':result.get('provider'),
+            'provider_available':result.get('provider_available')}
 
 
 @router.post('/market/refresh')

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {computed, onMounted, onBeforeUnmount, ref} from 'vue'
+import {computed, onMounted, onBeforeUnmount, ref, watch} from 'vue'
 import {api, ApiError, fact, facts, page, str, WriteAttempt, type Fact} from '../api/client'
 import {getHealth, type HealthState} from '../api/health'
 import * as session from '../api/session'
@@ -15,7 +15,10 @@ const health=ref<HealthState>({kind:'checking'}), system=ref<Fact|null>(null), o
 const accounts=ref<Fact[]>([]), instruments=ref<Fact[]>([]), categories=ref<Fact[]>([]), lots=ref<Fact[]>([])
 const valuation=ref<Fact|null>(null), strategy=ref<Fact|null>(null), month=ref<Fact|null>(null), historical=ref<Fact|null>(null)
 const pool=ref<Fact|null>(null), positionsView=ref<Fact|null>(null), strategyError=ref(''), strategyLoading=ref(false)
+const signalWriting=ref(false), signalFeedback=ref('')
 const selectedAccount=ref(''), asOf=ref(''), period=ref(''), historyTime=ref('')
+const openings=ref<Fact[]>([]), openingsError=ref('')
+const backupState=ref<Fact|null>(null), migrationState=ref<Fact|null>(null), maintenanceError=ref(''), maintenanceLoading=ref(false)
 const error=ref(''), readError=ref(''), feedback=ref(''), busy=ref(false), loading=ref(false)
 const retryPending=ref(false), pendingCorrupt=ref(false), storageError=ref('')
 const spec=ref<FormSpec|null>(null), formKey=ref(0), refresh=ref(0)
@@ -129,6 +132,12 @@ async function loadQuotes() {
   }catch(e){if(active&&token===quoteSequence)quoteError.value=String(e)}
 }
 async function loadMonth(){month.value=null;try{month.value=await api('/finance/month'+(period.value?`?period=${encodeURIComponent(period.value)}`:''))}catch(e){readError.value=String(e)}}
+/** The read-only opening list is the source for correcting or voiding a batch. */
+async function loadOpenings(){
+  openingsError.value='';openings.value=[]
+  try{openings.value=page(await api('/openings?limit=200&offset=0')).items}
+  catch(e){openingsError.value=String(e)}
+}
 async function loadHistory(){historical.value=null;try{if(!historyTime.value)throw new Error('请选择历史估值时间');historical.value=await api(`/finance/overview?as_of=${encodeURIComponent(shanghaiTime(historyTime.value))}`)}catch(e){readError.value=String(e)}}
 async function submit(values:Record<string,string>) {
   if(!spec.value||!writable.value)return
@@ -156,7 +165,7 @@ async function retry(){
     if(pendingIdentity!==null&&safeKey(checked)!==pendingIdentity)throw new Error('数据库身份与原请求不一致，禁止跨库重试')
     const state=await writer.check()
     if(state.committed===true){
-      writer.discard();spec.value=null
+      await writer.discard();spec.value=null
       feedback.value=`原请求 ${requestId} 已在账本中入账，未生成新请求。已按实际账本重新读取。`
       await reload();return
     }
@@ -165,19 +174,25 @@ async function retry(){
   finally{syncPending();busy.value=false}
 }
 /** Abandoning an unconfirmed write is an explicit operator decision, never automatic. */
-function discardPending(){
+async function discardPending(){
   if(busy.value||!writer.pending)return
   if(!window.confirm('放弃这条待确认写入？之后再提交将生成新的请求 ID，可能与已入账记录重复。请先核对服务器账本中是否存在该请求编号。'))return
   const requestId=writer.requestId
-  writer.discard();syncPending();spec.value=null
-  feedback.value=`已放弃待确认写入 ${requestId}。原请求仍可能已入账，请按该请求编号核对成交历史。`
+  let removed=true
+  try{removed=await writer.discard()}catch(e){error.value=String(e)}
+  syncPending();spec.value=null
+  feedback.value=removed
+    ?`已放弃待确认写入 ${requestId}。原请求仍可能已入账，请按该请求编号核对成交历史。`
+    :`本机待确认记录已被另一个标签页替换（当前为 ${writer.requestId||'空'}），原来的 ${requestId} 未删除；请按该请求编号核对成交历史。`
 }
 /** Only after the operator has reconciled the ledger by hand may an unreadable record go away. */
-function clearCorruptPending(){
+async function clearCorruptPending(){
   if(busy.value||!writer.corrupt)return
   if(!window.confirm('确认已按成交历史人工核对过账本？清除后本机不再保留该待核实记录。'))return
-  writer.clearCorrupt();syncPending()
-  feedback.value='已清除无法解析的待核实记录。请按成交历史继续人工核对。'
+  let removed=false
+  try{removed=await writer.clearCorrupt()}catch(e){error.value=String(e)}
+  syncPending()
+  feedback.value=removed?'已清除无法解析的待核实记录。请按成交历史继续人工核对。':'待核实记录已不是无法解析的状态（可能已被另一个标签页处理），本机未删除任何记录。'
 }
 async function refreshStrategy(){
   if(strategyLoading.value)return
@@ -186,10 +201,36 @@ async function refreshStrategy(){
   try{
     if(!selectedAccount.value)throw new Error('请先选择证券账户')
     const id=encodeURIComponent(selectedAccount.value)
+    // The read-only path only displays evidence; only POST /strategy/refresh writes signals.
     const [p,pos]=await Promise.all([api(`/strategy/pool/${id}`),api(`/strategy/positions/${id}`)])
     if(active&&token===poolSequence){pool.value=p;positionsView.value=pos}
   }catch(e){if(active&&token===poolSequence){pool.value=null;positionsView.value=null;strategyError.value=String(e)}}
   finally{if(active&&token===poolSequence)strategyLoading.value=false}
+}
+/** An explicit operator action: this is the only path that records formal signals. */
+async function writeStrategySignals(){
+  if(signalWriting.value||!writable.value)return
+  signalWriting.value=true;strategyError.value='';signalFeedback.value=''
+  const token=++poolSequence
+  try{
+    if(!selectedAccount.value)throw new Error('请先选择证券账户')
+    const id=encodeURIComponent(selectedAccount.value)
+    const written=await api(`/strategy/refresh?account_id=${id}`,'POST')
+    if(!active||token!==poolSequence)return
+    pool.value=written
+    signalFeedback.value=facts(written.items).some(row=>!!row.signal_id)?'已读取服务器保存的信号证据。':'服务端未返回正式信号。'
+    const pos=await api(`/strategy/positions/${id}`)
+    if(active&&token===poolSequence)positionsView.value=pos
+  }catch(e){if(active)strategyError.value=String(e)}
+  finally{if(active)signalWriting.value=false}
+}
+async function loadMaintenance(){
+  maintenanceError.value='';maintenanceLoading.value=true;backupState.value=null;migrationState.value=null
+  try{
+    const [b,m]=await Promise.all([api('/maintenance/backups'),api('/maintenance/migration')])
+    backupState.value=b;migrationState.value=m
+  }catch(e){maintenanceError.value=String(e)}
+  finally{maintenanceLoading.value=false}
 }
 async function refreshMarket(){if(!writable.value)return;busy.value=true;error.value='';feedback.value='';try{const r=await api('/market/refresh','POST');feedback.value=`实际行情刷新结果：${JSON.stringify(r)}`;await reload()}catch(e){error.value=String(e)}finally{busy.value=false}}
 function beforeUnload(e:BeforeUnloadEvent){if(writer.pending||writer.corrupt||busy.value){e.preventDefault();e.returnValue=''}}
@@ -242,6 +283,15 @@ async function boot(){
 }
 /** Cross-tab: another tab may create, retry or abandon the pending write. */
 function onStorage(){syncPending()}
+/**
+ * Switching account must never leave the previous account's pool, decision table or
+ * error text on screen, so every strategy view is dropped before the next load.
+ */
+function clearStrategyView():void{
+  poolSequence++
+  pool.value=null;positionsView.value=null;strategyError.value='';signalFeedback.value='';signalWriting.value=false
+}
+watch(selectedAccount,()=>{clearStrategyView()})
 onMounted(()=>{void boot();window.addEventListener('beforeunload',beforeUnload);window.addEventListener('storage',onStorage);timer=setInterval(()=>{void poll()},20000)})
 onBeforeUnmount(()=>{active=false;sequence++;valuationSequence++;quoteSequence++;poolSequence++;stopPolling();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('storage',onStorage)})
 const validTransfer=(r:Fact)=>r.status==='effective'
@@ -254,6 +304,9 @@ const factorLabels:Record<string,string>={PASS:'通过',FAIL:'不通过',UNVERIF
 const num=(v:unknown,d=4)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d):display(v)
 const nested=(v:unknown)=>v&&typeof v==='object'&&!Array.isArray(v)?v as Fact:{}
 const statusText=(v:unknown)=>statusLabels[str(v)]??display(v)
+/** Which price series a row was computed on; the two are never mixed in one number. */
+const basisLabels:Record<string,string>={index_level:'指数点位',etf_unadjusted:'ETF 未复权',etf_adjusted:'ETF 复权价'}
+const basisText=(v:unknown)=>basisLabels[str(v)]??(str(v)||'未标注')
 /** Flatten the pool item into display values; no numbers are recomputed in the browser. */
 const strategyRows=computed(()=>pool.value?facts(pool.value.items).map(item=>{
   const gap=nested(item.gap), factor=nested(item.factor), combo=nested(item.combo), series=nested(item.series), base=nested(item.regime)
@@ -266,12 +319,15 @@ const strategyRows=computed(()=>pool.value?facts(pool.value.items).map(item=>{
     threshold_text:`${num(item.threshold_high)} ${str(item.price_unit)}`,
     buy_max_text:`${num(item.buy_max)} ${str(item.price_unit)}`,
     gap_text:gap.atr_multiple==null?'--':`${num(gap.abs,4)} / ${num(gap.atr_multiple,2)} ATR`,
+    basis_text:basisText(item.price_basis),
+    input_version_text:str(item.input_version)||'—',
+    tradable_text:item.tradable===true?'可预填真实成交':`不可预填：${str(item.tradable_block_reason)||'标的价格口径不是未复权 ETF 价'}`,
     status_text:statusText(item.status),
     factor_text:`因子 ${factorLabels[str(factor.status)]??'—'}；组合 ${factorLabels[str(combo.status)]??'—'}`,
     cooldown_text:nested(item.cooldown).active?str(nested(item.cooldown).note)||'冷却中':'无冷却限制',
     data_text:`${str(series.source)||'无来源'}；${series.bars??0} 根；末日 ${str(series.last_date)||'—'}${str(series.warning)?`；${str(series.warning)}`:''}`,
   }}):[])
-const strategyColumns=computed(()=>cols({label:'指数与交易标的',regime_text:'G2 市场状态',er60_text:'ER60',signal_date:'最近正式信号日',price_basis_text:'信号收盘',threshold_text:'突破位',buy_max_text:'买入上限',atr14:'ATR14',gap_text:'距突破位 / ATR 倍数',status_text:'信号状态',factor_text:'因子与准入',cooldown_text:'冷却剩余',data_text:'数据来源与质量'}).concat([{key:'detail',label:'状态原因'}]))
+const strategyColumns=computed(()=>cols({label:'指数与交易标的',regime_text:'G2 市场状态',er60_text:'ER60',signal_date:'最近正式信号日',price_basis_text:'信号收盘',basis_text:'价格口径',threshold_text:'突破位',buy_max_text:'买入上限',atr14:'ATR14',gap_text:'距突破位 / ATR 倍数',status_text:'信号状态',factor_text:'因子与准入',cooldown_text:'冷却剩余',data_text:'数据来源与质量',input_version_text:'数据版本',tradable_text:'可否预填成交'}).concat([{key:'detail',label:'状态原因'}]))
 const positionRows=computed(()=>positionsView.value?facts(positionsView.value.items).map(item=>{
   const p=nested(item.position), pyramid=nested(item.pyramid), aux=nested(item.ndx_aux), cooldown=nested(item.cooldown)
   return {...item,
@@ -284,28 +340,35 @@ const positionRows=computed(()=>positionsView.value?facts(positionsView.value.it
     term_text:`第 ${p.holding_days??'—'}/${p.exit_after_bars??'—'} 日；续期 ${p.renewals??0} 次；E2a 延持 ${p.e2a_extended_days??0}/10${p.extended?'（延持中）':''}`,
     pyramid_text:pyramid.reason?`${str(pyramid.status)}：${str(pyramid.reason)}`:'—',
     ndx_text:aux.status?`${str(aux.status)}：${str(aux.detail)}`:'—',
-    action_text:`${actionLabels[str(p.action)]??display(p.action)}${p.action_price==null?'':` @ ${num(p.action_price)}`}${str(p.action_reason)?`；${str(p.action_reason)}`:''}`,
+    action_text:`【模型建议，非实际成交】${actionLabels[str(p.action)]??display(p.action)}${p.action_price==null?'':` @ ${num(p.action_price)}`}${str(p.action_reason)?`；${str(p.action_reason)}`:''}`,
     live_text:`策略记录 ${p.add_executed?'已加仓':'主仓'}；账本剩余 ${item.live_quantity??0} 股`,
     cooldown_text:cooldown.active?str(cooldown.note)||'冷却中':'无冷却限制',
   }}):[])
 const positionColumns=computed(()=>cols({label:'指数与交易标的',entry_text:'建仓事实（策略证据）',atr_text:'信号日 ATR',stop_text:'当前保护价',trail_text:'跟踪止盈',term_text:'时间退出',pyramid_text:'盈利加仓条件',ndx_text:'NDX 辅助仓',action_text:'策略建议',live_text:'实际持仓对照',cooldown_text:'冷却'}).concat([{key:'warnings',label:'未核对与提示'}]))
-/** Only a recorded formal signal may prefill a trade form; price and quantity stay operator-confirmed. */
+/** Only a recorded formal signal on the unadjusted ETF series may prefill a trade form. */
 function canFill(row:Fact):boolean{
   const status=str(row.status)
-  if(status!=='SIGNAL'&&status!=='AWAITING_CONFIRMATION')return false
+  if(status!=='SIGNAL'&&status!=='AWAITING_CONFIRMATION'&&status!=='PLAN_PENDING')return false
+  // A number derived from an index level or an adjusted series is not a fillable ETF price.
+  if(row.tradable!==true||str(row.price_basis)!=='etf_unadjusted'||!str(row.signal_id)||typeof row.atr14!=='number'||Number(num(row.atr14))<=0)return false
   const code=str(row.etf_code)
   return !!code&&instruments.value.some(i=>str(i.code)===code)
+}
+function fillBlockReason(row:Fact):string{
+  if(row.tradable===true&&str(row.price_basis)==='etf_unadjusted')return ''
+  return str(row.tradable_block_reason)||`价格口径为 ${basisText(row.price_basis)}，不能预填真实成交`
 }
 function openTradeFromSignal(row:Fact){
   if(!writable.value||!canFill(row))return
   const instrument=instruments.value.find(i=>str(i.code)===str(row.etf_code))
   const fill=nested(row.fill)
-  const note=`策略信号证据：${str(row.index_id)} 信号日 ${str(row.signal_date)}，冻结 ATR ${num(row.atr14)}，`
+  // atr14 is already in yuan on the unadjusted ETF series, so it is the frozen ATR to keep.
+  const note=`策略信号证据：${str(row.index_id)} 信号日 ${str(row.signal_date)}，冻结 ATR ${num(row.atr14)}（ETF 未复权口径，元），`
     +`突破位 ${num(row.threshold_high)} ${str(row.price_unit)}，买入上限 ${num(row.buy_max)} ${str(row.price_unit)}`
     +(fill.entry_price==null?'':`，次日开盘价 ${num(fill.entry_price)} 已通过价格条件`)
   openForm(()=>forms.tradeForm(accounts.value,instruments.value,lots.value,undefined,{
     account_id:selectedAccount.value,instrument_id:str(instrument?.id),side:'buy',lot_role:'main',
-    strategy_id:'INDEX_STRATEGY_ATR',signal_date:str(row.signal_date),frozen_atr:String(row.atr14??''),note,
+    strategy_id:'INDEX_STRATEGY_ATR',signal_id:str(row.signal_id),signal_date:str(row.signal_date),frozen_atr:num(row.atr14),note,
   }))
 }
 </script>
@@ -364,21 +427,29 @@ function openTradeFromSignal(row:Fact){
         </template>
         <template v-else><p>请选择证券账户或重新读取。</p></template>
         <h3>V9/G2 策略观察池</h3>
-        <p class="notice">观察池只用<b>指数点位</b>日线判定突破与 G2 状态；ETF 复权价只用于研究口径，真实市值用未复权价。策略建议不等于真实成交：真实主仓/子仓/退出只能经「录入真实成交」确认。</p>
-        <div class="toolbar"><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池'}}</button><span v-if="pool">数据日期 {{display(pool.as_of)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(fact(pool.regime as Fact).label)}} / ER60 {{display(fact(pool.regime as Fact).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
+        <p class="notice">默认 <b>ETF 模式</b>下，V9 突破位、ATR 与 BuyMax 全部用<b>ETF 未复权人民币日线</b>计算；<b>G2 基准</b>用 <b>14 只指数真实点位</b>判定。两套价格各自成体系、不混算，也不做点位折算；真实市值用未复权价。表内「信号收盘」列标明每一行用的是哪套价格。策略建议不等于真实成交：真实主仓/子仓/退出只能经「录入真实成交」确认。</p>
+        <div class="toolbar"><button :disabled="strategyLoading||!selectedAccount" @click="refreshStrategy">{{strategyLoading?'正在刷新策略…':'刷新策略观察池（只读）'}}</button><button :disabled="signalWriting||!writable||!selectedAccount" @click="writeStrategySignals">{{signalWriting?'正在写入…':'记录正式信号（写入）'}}</button><span v-if="pool">数据日期 {{display(pool.as_of)}}；规则 {{display(pool.strategy_version)}}；基准 {{display(nested(pool.regime).label)}} / ER60 {{display(nested(pool.regime).er60)}}；权益 {{money(pool.equity_fen)}}（{{display(pool.equity_quality)}}）；基础仓 {{money(pool.base_amount_fen)}}；指数仓 {{pool.core_positions}}/{{pool.max_positions}}；可用现金 {{money(pool.cash_fen)}}</span></div>
+        <p class="notice">刷新只读取证据、不写库；只有「记录正式信号（写入）」会把信号与数据版本落到账本。</p>
+        <p v-if="signalFeedback" class="notice">{{signalFeedback}}</p>
         <p v-if="strategyError" class="error" role="alert">{{strategyError}}</p>
-        <p v-if="pool&&Array.isArray(fact(pool.regime as Fact).warning)===false&&fact(pool.regime as Fact).warning" class="notice">G2 基准提示：{{display(fact(pool.regime as Fact).warning)}}</p>
+        <p v-if="pool&&Array.isArray(nested(pool.regime).warning)===false&&nested(pool.regime).warning" class="notice">G2 基准提示：{{display(nested(pool.regime).warning)}}</p>
         <p v-if="pool&&Array.isArray(pool.equity_reasons)&&pool.equity_reasons.length" class="notice">权益口径：{{display(pool.equity_reasons)}}</p>
         <RecordTable v-if="pool" :rows="strategyRows" :columns="strategyColumns">
           <template #actions="{row}">
             <button v-if="canFill(row)" :disabled="!writable" @click="openTradeFromSignal(row)">按此信号录入真实成交</button>
+            <small v-else-if="fillBlockReason(row)">{{fillBlockReason(row)}}</small>
           </template>
         </RecordTable>
         <p v-else-if="!strategyLoading">尚未读取策略观察池。选择证券账户后点击「刷新策略观察池」。</p>
         <h3>持仓决策（策略建议 vs 实际持仓）</h3>
-        <p class="notice">主仓与子仓各自使用其真实成交价与信号日冻结 ATR 计算止损；此处不会修改真实持仓。</p>
+        <p class="notice">主仓与子仓各自使用其真实成交价与信号日冻结 ATR 计算止损；此处不会修改真实持仓。下表「决策」列是<b>模型建议</b>，不代表任何实际成交。</p>
+        <p v-if="positionsView&&positionsView.model_only===true" class="notice">此处不释放仓位、不启动冷却；只有真实卖出成交才会。</p>
         <template v-if="positionsView">
           <RecordTable :rows="positionRows" :columns="positionColumns"/>
+          <template v-if="facts(positionsView.unrealized_model_actions).length">
+            <h4>未实现的模型动作（仅建议，不影响真实持仓）</h4>
+            <RecordTable :rows="facts(positionsView.unrealized_model_actions)" :columns="cols({index_id:'指数',etf_code:'ETF 代码',action:'建议动作',action_price:'参考价（元）',action_reason:'原因',price_basis:'价格口径'})"/>
+          </template>
           <h4>真实账本中的策略批次（核对依据）</h4>
           <RecordTable v-if="facts(positionsView.custody).length" :rows="facts(positionsView.custody)" :columns="cols({lot_id:'批次ID',lot_role:'角色',strategy_id:'策略标识',signal_date:'信号日',frozen_atr:'冻结ATR',code:'证券代码',market:'市场',kind:'类型',remaining:'剩余数量'})"/>
           <p v-else class="notice">账本中没有带策略标记的主仓/子仓批次；策略持仓状态若存在则属于未核对证据。</p>
@@ -400,12 +471,17 @@ function openTradeFromSignal(row:Fact){
         <div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.instrumentForm)">创建证券标的</button><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts))">期初及证券现金</button><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.openingForm(accounts,instruments))">期初持仓录入</button><button :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots))">录入买入 / 卖出</button></div>
         <h3>成交历史（包括待核对和冲正）</h3>
         <PagedRecords path="/trades" :refresh="refresh" :columns="cols({id:'成交ID',account_id:'账户ID',instrument_id:'标的ID',side:'方向',quantity:'数量',price:'价格（元）',fees_fen:'费用',amount_fen:'金额',executed_at:'成交时间',status:'状态',pending_reason:'待核对原因',note:'备注'})"><template #actions="{row}"><button v-if="row.status==='pending'" :disabled="!writable" @click="openForm(()=>forms.confirmation(`/trades/${row.id}/confirm`))">确认</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.tradeForm(accounts,instruments,lots,row))">更正</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(`/trades/${row.id}/void`,'作废成交'))">作废</button></template></PagedRecords>
-        <h3>证券资金记录</h3><PagedRecords path="/cash" :refresh="refresh" :columns="cashColumns"><template #actions="{row}"><template v-if="!row.transfer_id&&!row.execution_id&&['deposit','withdrawal','adjustment'].includes(String(row.kind))"><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/cash/${row.id}/void`,'作废资金记录'))">作废</button></template></template></PagedRecords>
+        <h3>证券资金记录</h3><PagedRecords path="/cash" :refresh="refresh" :columns="cashColumns"><template #actions="{row}"><template v-if="!row.transfer_id&&!row.execution_id&&['opening','deposit','withdrawal','adjustment'].includes(String(row.kind))"><button :disabled="!writable" @click="openForm(()=>forms.cashForm(accounts,row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/cash/${row.id}/void`,'作废资金记录'))">作废</button></template></template></PagedRecords>
         <details><summary>账户及证券标的 ID 对照</summary><RecordTable :rows="accounts" :columns="cols({id:'账户ID',name:'名称',kind:'类型'})"/><RecordTable :rows="instruments" :columns="cols({id:'标的ID',market:'市场',code:'代码',kind:'类型'})"/></details>
+        <h3>期初持仓批次（可更正 / 作废）</h3>
+        <p class="notice">更正与作废都保留审计痕迹：作废不会删除原批次，只会写入一条冲正记录。这里只列出期初批次，不改动真实成交历史。</p>
+        <div class="toolbar"><button @click="loadOpenings">{{openings.length?'重新读取期初批次':'读取期初批次'}}</button></div>
+        <p v-if="openingsError" class="error" role="alert">{{openingsError}}</p>
+        <RecordTable v-if="openings.length" :rows="openings" :columns="cols({id:'期初批次ID',account_id:'账户ID',instrument_id:'标的ID',quantity:'数量',cost_fen:'成本',fees_fen:'费用',occurred_at:'发生时间',status:'状态',note:'备注'})"><template #actions="{row}"><button :disabled="!writable" @click="openForm(()=>forms.openingCorrectionForm(row))">更正</button><button :disabled="!writable" @click="openForm(()=>forms.openingVoidForm(row))">作废</button></template></RecordTable>
         <h3>现金分红</h3>
-        <p class="notice">现金分红是外部收益，进入证券账户现金，不改变持仓股数。数量型公司行为（拆股、并股、配股）尚未实现，请不要在此录入。</p>
-        <div class="toolbar"><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.dividendForm(accounts,instruments))">录入现金分红</button></div>
-        <PagedRecords path="/company-events" :refresh="refresh" :columns="cols({id:'公司行为ID',account_id:'账户ID',instrument_id:'标的ID',kind:'类型',occurred_at:'发生时间',cash_movement_id:'对应现金流水',note:'备注'})"><template #actions="{row}"><template v-if="row.kind==='dividend'"><button :disabled="!writable" @click="openForm(()=>forms.dividendCorrectionForm(row))">更正金额</button><button :disabled="!writable" @click="openForm(()=>forms.voidForm(`/company-events/${row.id}/void`,'作废现金分红'))">作废</button></template></template></PagedRecords>
+        <p class="notice">现金分红是外部收益，进入证券账户现金，不改变持仓股数。拆分与合并仅录入已核实的实际比例及真实尾差；复杂配股尚不支持数量调整。</p>
+        <div class="toolbar"><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.dividendForm(accounts,instruments))">录入现金分红</button><button :disabled="!writable||!securities.length||!instruments.length" @click="openForm(()=>forms.companyForm(accounts,instruments))">核实拆分 / 合并</button></div>
+        <PagedRecords path="/company-events" :refresh="refresh" :columns="cols({id:'公司行为ID',account_id:'账户ID',instrument_id:'标的ID',kind:'类型',occurred_at:'发生时间',cash_movement_id:'对应现金流水',note:'备注'})"><template #actions="{row}"><button v-if="row.kind==='dividend'" :disabled="!writable" @click="openForm(()=>forms.dividendCorrectionForm(row))">更正金额</button><button v-if="row.status!=='reversed'" :disabled="!writable" @click="openForm(()=>forms.voidForm(row.kind==='dividend'?`/company-events/${row.id}/void`:`/portfolio/company-events/${row.id}/void`,row.kind==='dividend'?'作废现金分红':'作废公司行为'))">作废</button></template></PagedRecords>
       </section>
       <section v-if="tab==='财务'"><h2>个人财务</h2><div class="toolbar"><button :disabled="!writable" @click="openForm(forms.accountForm)">创建账户</button><button :disabled="!writable" @click="openForm(forms.categoryForm)">新增分类</button><button :disabled="!writable" @click="openForm(()=>forms.billForm(accounts,categories))">新增收入 / 支出 / 手续费</button><button :disabled="!writable||!overview" @click="openForm(()=>forms.transferForm(accountRows))">内部转账</button></div>
         <h3>账户及余额</h3><RecordTable :rows="accountRows" :columns="accountColumns"><template #actions="{row}"><button v-if="row.kind!=='securities'&&row.status==='active'" :disabled="!writable" @click="openForm(()=>forms.balanceForm(row))">余额核实</button><button :disabled="!writable" @click="openForm(()=>forms.accountUpdate(row,currentRevision))">账户状态</button><button :disabled="!writable" @click="openForm(()=>forms.scopeForm(row,currentRevision))">统计范围</button><button v-if="!row.effective_at" :disabled="!writable" @click="openForm(()=>forms.effectiveForm(row,currentRevision))">核实生效时间</button></template></RecordTable>
@@ -416,7 +492,7 @@ function openTradeFromSignal(row:Fact){
         <details><summary>手工余额历史</summary><PagedRecords path="/finance/balances" :refresh="refresh" :columns="cols({account_id:'账户ID',before_fen:'原余额',after_fen:'新余额',occurred_at:'生效时间',reason:'原因',status:'状态'})"/></details>
       </section>
     </template>
-    <section v-if="tab==='系统'"><h2>系统与维护</h2><p>运行模式：{{display(system?.mode)}}；{{system?.writable===true?'允许写入':'禁止写入'}}。断线不会切换数据库。</p><details v-if="system?.identity" open><summary>已验证数据库身份</summary><pre>{{JSON.stringify(system.identity,null,2)}}</pre></details><h3>行情及日历</h3><pre v-if="market">{{JSON.stringify({calendar_coverage:market.calendar_coverage,market_phase:market.market_phase,last_refresh:market.last_refresh},null,2)}}</pre><p v-else>行情状态不可用。</p><button :disabled="!writable" @click="refreshMarket">手动刷新行情</button><h3>维护命令（在服务端终端显式执行）</h3><p>正式库身份检查：<code>python start.py check-database</code></p><p>一致性备份：<code>python start.py backup --destination &lt;新备份目录绝对路径&gt;</code></p><p>数据库升级：停止写服务，执行 <code>python start.py upgrade-database --destination &lt;新备份目录绝对路径&gt; --confirm</code>。不从网页自动接管或恢复正式库。</p><p class="notice">正式 V9/G2 策略及真实行情实网验证尚未完成。当前只用于本机开发/隔离测试，不开放公网。</p></section>
+    <section v-if="tab==='系统'"><h2>系统与维护</h2><p>运行模式：{{display(system?.mode)}}；{{system?.writable===true?'允许写入':'禁止写入'}}。断线不会切换数据库。</p><details v-if="system?.identity" open><summary>已验证数据库身份</summary><pre>{{JSON.stringify(system.identity,null,2)}}</pre></details><h3>行情及日历</h3><pre v-if="market">{{JSON.stringify({calendar_coverage:market.calendar_coverage,market_phase:market.market_phase,last_refresh:market.last_refresh},null,2)}}</pre><p v-else>行情状态不可用。</p><button :disabled="!writable" @click="refreshMarket">手动刷新行情</button><h3>维护命令（在服务端终端显式执行）</h3><p>正式库身份检查：<code>python start.py check-database</code></p><p>一致性备份：<code>python start.py backup --destination &lt;新备份目录绝对路径&gt;</code></p><p>数据库升级：停止写服务，执行 <code>python start.py upgrade-database --destination &lt;新备份目录绝对路径&gt; --confirm</code>。不从网页自动接管或恢复正式库。</p><h3>备份与迁移对账</h3><p class="notice">查询只读取服务端现状；请通过上述服务端维护命令创建备份，网页端不会自动接管、还原或删除任何备份。</p><div class="toolbar"><button :disabled="maintenanceLoading" @click="loadMaintenance">{{maintenanceLoading?'正在读取…':'查询备份状态与迁移对账'}}</button></div><p v-if="maintenanceError" class="error" role="alert">{{maintenanceError}}</p><template v-if="backupState"><h4>备份状态</h4><RecordTable :rows="facts(backupState.items).length?facts(backupState.items):[backupState]" :columns="cols({name:'备份名称',path:'位置',backup_at:'创建时间',file_size:'体积（字节）',verified:'已校验',status:'状态'})"/><p v-if="facts(backupState.items).length===0" class="notice">服务端尚未返回任何备份条目。</p></template><template v-if="migrationState"><h4>迁移对账报告</h4><pre>{{JSON.stringify(migrationState,null,2)}}</pre></template><p class="notice">V9/G2 集成待审查，证券实网验证尚未完成。当前只用于本机开发/隔离测试，不开放公网。</p></section>
   </main>
 </template>
 

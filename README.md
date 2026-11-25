@@ -93,3 +93,12 @@ python tools/package_changes.py --base "$base" --summary "实际变更摘要" --
 ```
 
 将命令输出的实际 ZIP 路径传给 `python tools/verify_review.py` 校验。ZIP 位于 `artifacts/reviews/`，不会进入 Git。收到审查意见后仍用原 BASE 打包全部本轮变化；仅在独立审查 APPROVED 或 APPROVED_WITH_ISSUES 后推进。
+
+### 08 维护与旧库演练（仅隔离副本）
+
+- `python start.py backup --destination <新备份目录>`；`python start.py backup-status --destination <备份父目录>`。
+- `python start.py restore-check --source <备份目录>`；正式恢复先停止写服务，再显式 `python start.py restore --source <备份目录> --confirm`。恢复会核验身份并提高 generation；跨文件切换不是原子事务，失败按维护报告及 pre-restore 备份核对。
+- `python tools/migrate_legacy.py probe --stock-db <旧股库副本> --finance-db <旧财务库副本>`。
+- `python tools/migrate_legacy.py dry-run --stock-db <旧股库副本> --finance-db <旧财务库副本> --target <新隔离库>`。
+- `python tools/migrate_legacy.py migrate --stock-db <旧股库副本> --finance-db <旧财务库副本> --target <新隔离库> --confirm`；`python tools/migrate_legacy.py report --target <隔离库>`。
+- 使用 SQLite Backup API/`.backup` 取得一致性副本，拒绝带未完成 WAL 的源副本；不对正在使用的旧库操作，不自动接管。缺失旧余额、行情、费用等须人工对账，真实旧库未验收前不发布。前端生产构建及真实行情仍待验证。

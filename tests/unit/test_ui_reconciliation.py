@@ -90,8 +90,12 @@ def test_system_status_and_write_guard(cfg):
     with TestClient(create_app()) as c:
         assert c.get('/api/v1/system/status').json()['writable'] is False
     with TestClient(create_app(AppConfig(market_auto_refresh=False),database=cfg)) as c:
-        r=c.get('/api/v1/system/status').json(); assert r['mode']=='server' and r['identity']['schema_version']==7 and r['writable']
+        r=c.get('/api/v1/system/status').json(); assert r['mode']=='server' and r['identity']['schema_version']==database.SCHEMA_VERSION and r['writable']
         assert c.post('/api/v1/accounts',json={'request_id':'no-date','name':'missing'}).status_code==422
+        report = c.get('/api/v1/maintenance/migration')
+        assert report.status_code==200 and report.json()['status']=='not_run'
+        backups = c.get('/api/v1/maintenance/backups')
+        assert backups.status_code==200 and backups.json()['items']==[]
 
 
 def legacy06(tmp_path):

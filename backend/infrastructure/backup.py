@@ -1,18 +1,44 @@
 """Consistent online SQLite snapshots, never overwriting an existing backup."""
 
-from contextlib import closing
-from dataclasses import asdict
-from datetime import UTC, datetime
 import hashlib
 import json
-from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+from contextlib import closing
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
 
 from backend.infrastructure.database import (
-    DatabaseError, DatabaseSettings, _connect, absolute_path, read_identity, validate_identity, validate_binding,
+    DatabaseError,
+    DatabaseSettings,
+    _connect,
+    absolute_path,
+    read_identity,
+    validate_binding,
+    validate_identity,
 )
+
+SNAPSHOT_NAME = 'database.sqlite'
+MANIFEST_NAME = 'manifest.json'
+# Recognised revision tables are read from the copy, never from the live writer.
+REVISION_SOURCES = (('ledger_state', 'ledger_revision'), ('quote_state', 'quote_revision'))
+SENSITIVE_NOTICE = (
+    '本备份包含个人账户、成交、批次、资金与账单等财务数据，仅限本人在做隔离存放与恢复演练时使用；'
+    '备份目录只含数据库快照与 manifest，不含登录密码、会话令牌或 CSRF 凭据，请与凭据文件分开保管。'
+)
+
+
+def _revision(conn: sqlite3.Connection, table: str, column: str) -> int | None:
+    """Read one revision counter from the snapshot; identifiers are fixed constants."""
+    try:
+        row = conn.execute(f'SELECT {column} FROM {table}').fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or type(row[0]) is not int:
+        return None
+    return row[0]
 
 
 def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previous: bool = False) -> Path:
@@ -24,7 +50,7 @@ def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previo
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.backup-', dir=target.parent))
     try:
-        snapshot = staging / 'database.sqlite'
+        snapshot = staging / SNAPSHOT_NAME
         with closing(_connect(settings.path, readonly=True)) as source:
             validate_identity(source, settings, allow_previous=allow_previous)
             with closing(sqlite3.connect(snapshot)) as copy:
@@ -41,12 +67,30 @@ def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previo
                 if (copy.execute('PRAGMA integrity_check').fetchall() != [('ok',)]
                         or copy.execute('PRAGMA foreign_key_check').fetchall() != []):
                     raise DatabaseError('backup integrity or foreign key check failed')
+                revisions = {column: _revision(copy, table, column)
+                             for table, column in REVISION_SOURCES}
+        missing = [column for column, value in revisions.items() if value is None]
         with snapshot.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         manifest = {**asdict(identity), 'backup_at': datetime.now(UTC).isoformat(),
                     'source_instance_role': source_identity.instance_role,
-                    'sha256': digest, 'integrity_check': 'ok', 'foreign_key_check': 'ok'}
-        (staging / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+                    # Recorded so a restore report can name the ledger the snapshot came from.
+                    'source_path_basename': settings.path.name,
+                    'file_size': snapshot.stat().st_size,
+                    'sha256': digest, 'integrity_check': 'ok', 'foreign_key_check': 'ok',
+                    'ledger_revision': revisions['ledger_revision'],
+                    'quote_revision': revisions['quote_revision'],
+                    'missing': missing,
+                    'contains_personal_financial_data': True,
+                    'sensitive_notice': SENSITIVE_NOTICE}
+        # Default ensure_ascii keeps the manifest readable on any console/locale while the
+        # JSON semantics still carry the Chinese notice.
+        (staging / MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+        # Credentials and sessions live in data/ next to the ledger; a backup must never
+        # widen into a directory copy. Only these two files may exist before publication.
+        if sorted(path.name for path in staging.iterdir()) != sorted([MANIFEST_NAME, SNAPSHOT_NAME]):
+            raise DatabaseError('backup staging must contain exactly the snapshot and manifest')
         # A valid backup directory is nonempty: rename cannot replace it.
         if target.exists():
             raise DatabaseError('backup destination already exists')
@@ -55,3 +99,62 @@ def create_backup(settings: DatabaseSettings, destination: Path, *, allow_previo
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+
+
+def backup_layout(backup: Path) -> tuple[Path, Path] | None:
+    """Accept either the backup directory or its database.sqlite file."""
+    if backup.is_dir() and not backup.is_symlink():
+        return backup / SNAPSHOT_NAME, backup / MANIFEST_NAME
+    if backup.is_file() and backup.name == SNAPSHOT_NAME:
+        return backup, backup.with_name(MANIFEST_NAME)
+    return None
+
+
+def list_backups(directory: Path) -> dict:
+    """Read-only inventory of published backups; unknown content is reported, not trusted."""
+    path = absolute_path(directory)
+    if not path.is_dir():
+        return {'items': [], 'directory': str(path),
+                'note': '备份目录尚不存在；正式服务创建首个备份后才会出现。'}
+    items = []
+    problems: list[str] = []
+    for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        layout = backup_layout(entry)
+        if layout is None:
+            continue
+        snapshot, manifest_path = layout
+        manifest: dict = {}
+        note = None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            if not isinstance(manifest, dict):
+                raise ValueError('manifest must be a JSON object')
+        except (OSError, ValueError) as exc:
+            manifest, note = {}, f'manifest unreadable: {exc}'
+        verified = False
+        if not note and snapshot.is_file():
+            try:
+                with snapshot.open('rb') as stream:
+                    verified = hashlib.file_digest(stream, 'sha256').hexdigest() == manifest.get('sha256')
+            except OSError as exc:
+                note = f'snapshot unreadable: {exc}'
+        if note is not None:
+            problems.append(f'{entry.name}: {note}')
+        items.append({
+            'name': entry.name,
+            'path_basename': entry.name,
+            'backup_at': manifest.get('backup_at'),
+            'generation': manifest.get('generation'),
+            'schema_version': manifest.get('schema_version'),
+            'ledger_revision': manifest.get('ledger_revision'),
+            'quote_revision': manifest.get('quote_revision'),
+            'sha256': manifest.get('sha256'),
+            'verified': verified,
+        })
+    if not items:
+        note = '该目录下没有已发布的备份（缺少 manifest.json 的条目已跳过）。'
+    elif problems:
+        note = '；'.join(problems)
+    else:
+        note = None
+    return {'items': items, 'directory': str(path), 'note': note}

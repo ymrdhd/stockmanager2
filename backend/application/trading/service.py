@@ -83,6 +83,8 @@ class TradeInput(Input):
     lot_role: Literal['ordinary', 'main', 'sub'] = 'ordinary'
     signal_date: date | None = None
     frozen_atr: Decimal | None = Field(default=None, gt=0, le=1000000, decimal_places=4, max_digits=11)
+    signal_id: str | None = Field(default=None, min_length=1, max_length=128)
+    strategy_exit_action: Literal['STOP','GAP_STOP','EXIT','CLOSED'] | None = None
     allocations: dict[str, int] | None = None
     strategy_deviation: bool = False
 
@@ -136,12 +138,14 @@ class TradeInput(Input):
             raise ValueError('buy cannot allocate lots')
         if (self.lot_role != 'ordinary') != (self.strategy_id is not None):
             raise ValueError('strategy main/sub lots require strategy ID; ordinary lots do not')
-        if self.lot_role == 'ordinary' and (self.signal_date is not None or self.frozen_atr is not None):
+        if self.lot_role == 'ordinary' and (self.signal_date is not None or self.frozen_atr is not None or self.signal_id is not None):
             raise ValueError('ordinary lots cannot carry strategy signal metadata')
         if self.signal_date is not None and self.signal_date > self.trading_day:
             raise ValueError('signal date cannot follow execution date')
-        if self.side == 'sell' and (self.signal_date is not None or self.frozen_atr is not None):
+        if self.side == 'sell' and (self.signal_date is not None or self.frozen_atr is not None or self.signal_id is not None):
             raise ValueError('sell uses original lot signal metadata, not new signal metadata')
+        if self.strategy_exit_action is not None and self.side != 'sell':
+            raise ValueError('only actual sells may record a confirmed strategy exit action')
         if money(self.quantity, int(self.price * SCALE)) > MAX_FEN:
             raise ValueError('trade amount exceeds supported range')
         return self
@@ -202,6 +206,9 @@ def canonical(data: TradeInput) -> dict:
     value['price'] = int(data.price * SCALE)
     value['frozen_atr'] = int(data.frozen_atr * SCALE) if data.frozen_atr is not None else None
     value['executed_at'] = utc(data.executed_at)
+    # Old requests without a signal association keep exactly their original canonical form.
+    if data.signal_id is None: value.pop('signal_id', None)
+    if data.strategy_exit_action is None: value.pop('strategy_exit_action', None)
     return value
 
 
@@ -248,6 +255,27 @@ def require_account(conn: sqlite3.Connection, account: str, *, securities: bool 
     if at and result['effective_at'] and at < result['effective_at']:
         raise Conflict('fact precedes account effective time')
     return result
+
+
+def verified_trade_signal(conn: sqlite3.Connection, value: dict) -> dict | None:
+    """Resolve an explicit signal against the actual account, instrument, time and scale.
+
+    Bad/missing evidence never discards a broker execution. The recorded ID is an
+    audit reference, not a permission to label a real lot as strategy-verified.
+    """
+    if not value.get('signal_id') or value.get('side') != 'buy':
+        return None
+    signal = conn.execute("""SELECT s.signal_id,s.strategy_version,s.config_version,s.input_version
+        FROM strategy_signals s JOIN instruments i ON i.code=s.instrument_code
+        WHERE s.signal_id=? AND (s.account_id=? OR s.account_id IS NULL) AND i.id=?
+          AND i.kind='etf' AND s.status='SIGNAL' AND s.source_verified=1 AND s.is_proxy=0
+          AND s.price_basis='etf_unadjusted' AND s.price_unit='元'
+          AND s.signal_date=? AND s.created_at<=? AND s.config_version LIKE 'cfg:%'
+          AND CAST(round(s.atr14*10000) AS INTEGER)=?""",
+        (value['signal_id'],value['account_id'],value['instrument_id'],value.get('signal_date'),
+         value['executed_at'],value.get('frozen_atr'))).fetchone()
+    if signal is None: return None
+    return dict(zip(('signal_id','strategy_version','config_version','input_version'),signal))
 
 
 def post_cash(conn: sqlite3.Connection, *, account: str, kind: str, amount: int,
@@ -366,7 +394,10 @@ class TradeService:
         trade['external_id'] = v['external_id']
         trade['requested_allocations'] = v['allocations']
         trade['strategy_deviation'] = bool(v['strategy_deviation'])
-        trade['strategy_evidence_missing'] = bool(trade['side'] == 'buy' and trade['strategy_id'] and (trade['signal_date'] is None or trade['frozen_atr'] is None))
+        trade['signal_id'] = v.get('signal_id')
+        trade['strategy_exit_action'] = v.get('strategy_exit_action')
+        trade['strategy_evidence'] = verified_trade_signal(conn, v)
+        trade['strategy_evidence_missing'] = bool(trade['side'] == 'buy' and trade['strategy_id'] and trade['strategy_evidence'] is None)
         return trade
 
     def _plan(self, conn: sqlite3.Connection, v: dict, *, replay: bool = False) -> tuple[str | None, list[tuple[dict, int]]]:
@@ -386,7 +417,7 @@ class TradeService:
         lots = rows(conn, """SELECT l.*,COALESCE(t.executed_at,o.occurred_at) AS executed_at FROM trade_lots l
             LEFT JOIN trade_executions t ON t.id=l.open_execution_id LEFT JOIN opening_positions o ON o.id=l.opening_id
             WHERE COALESCE(t.account_id,o.account_id)=? AND COALESCE(t.instrument_id,o.instrument_id)=?
-            AND (t.status='effective' OR o.id IS NOT NULL) AND l.status='open'
+            AND (t.status='effective' OR (o.id IS NOT NULL AND o.superseded_by IS NULL AND o.voided_at IS NULL)) AND l.status='open'
             AND COALESCE(t.executed_at,o.occurred_at)<=? ORDER BY COALESCE(t.executed_at,o.occurred_at),COALESCE(t.rowid,0)""", (v['account_id'], v['instrument_id'], v['executed_at']))
         eligible = {lot['id']: lot for lot in lots if lot['lot_role'] == v['lot_role'] and lot['strategy_id'] == v['strategy_id']}
         specified = v['allocations']
@@ -448,18 +479,18 @@ class TradeService:
 
     @staticmethod
     def _boundary(conn: sqlite3.Connection, v: dict) -> str | None:
-        cash = conn.execute("SELECT occurred_at FROM cash_movements WHERE account_id=? AND kind='opening'", (v['account_id'],)).fetchone()
+        cash = conn.execute("SELECT occurred_at FROM effective_cash_movements WHERE account_id=? AND kind='opening'", (v['account_id'],)).fetchone()
         if cash and v['executed_at'] <= cash[0]:
             return 'before_or_at_cash_baseline'
-        opening = conn.execute('SELECT occurred_at FROM opening_positions WHERE account_id=? AND instrument_id=?', (v['account_id'], v['instrument_id'])).fetchone()
+        opening = conn.execute('SELECT occurred_at FROM opening_positions WHERE account_id=? AND instrument_id=? AND superseded_by IS NULL AND voided_at IS NULL', (v['account_id'], v['instrument_id'])).fetchone()
         if opening and v['executed_at'] <= opening[0]:
             return 'before_or_at_position_baseline'
-        if conn.execute("SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND kind!='dividend' AND occurred_at<=?", (v['account_id'],v['instrument_id'],v['executed_at'])).fetchone():
+        if conn.execute("SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND kind!='dividend' AND voided_at IS NULL AND (applied_at IS NULL OR occurred_at>=?)", (v['account_id'],v['instrument_id'],v['executed_at'])).fetchone():
             return 'unresolved_company_action'
         return None
 
     def _replay(self, conn: sqlite3.Connection, account: str, instrument: str, request: str) -> None:
-        if conn.execute("SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND kind!='dividend'",(account,instrument)).fetchone():
+        if conn.execute("SELECT 1 FROM company_events WHERE account_id=? AND instrument_id=? AND kind!='dividend' AND voided_at IS NULL",(account,instrument)).fetchone():
             raise Conflict('unresolved company action requires manual reconciliation before replay')
         facts = rows(conn, "SELECT * FROM trade_executions WHERE account_id=? AND instrument_id=? AND status='effective' ORDER BY executed_at,rowid", (account,instrument))
         allocations = rows(conn, "SELECT a.* FROM lot_allocations a JOIN trade_executions t ON t.id=a.sell_execution_id WHERE t.account_id=? AND t.instrument_id=? AND t.status='effective' ORDER BY a.rowid", (account,instrument))
@@ -467,7 +498,7 @@ class TradeService:
             audit(conn,'trade_replay',instrument,'allocations_rebuilt',request,{'account_id':account,'previous_allocations':allocations})
         conn.execute("DELETE FROM lot_allocations WHERE sell_execution_id IN (SELECT id FROM trade_executions WHERE account_id=? AND instrument_id=? AND status='effective')", (account,instrument))
         conn.execute("UPDATE trade_lots SET remaining_qty=0,remaining_cost_fen=0,remaining_fees_fen=0,status='reversed' WHERE open_execution_id IN (SELECT id FROM trade_executions WHERE account_id=? AND instrument_id=?)", (account,instrument))
-        for opening in rows(conn,'SELECT * FROM opening_positions WHERE account_id=? AND instrument_id=?',(account,instrument)):
+        for opening in rows(conn,'SELECT * FROM opening_positions WHERE account_id=? AND instrument_id=? AND superseded_by IS NULL AND voided_at IS NULL',(account,instrument)):
             conn.execute("UPDATE trade_lots SET remaining_qty=?,remaining_cost_fen=?,remaining_fees_fen=?,status='open' WHERE opening_id=?",(opening['quantity'],opening['cost_fen'],opening['fees_fen'],opening['id']))
         for fact in facts:
             v = json.loads(fact['payload'])
@@ -600,7 +631,10 @@ class TradeService:
                     record['external_id'] = v['external_id']
                     record['requested_allocations'] = v['allocations']
                     record['strategy_deviation'] = bool(v['strategy_deviation'])
-                    record['strategy_evidence_missing'] = bool(record['side'] == 'buy' and record['strategy_id'] and (record['signal_date'] is None or record['frozen_atr'] is None))
+                    record['signal_id'] = v.get('signal_id')
+                    record['strategy_exit_action'] = v.get('strategy_exit_action')
+                    record['strategy_evidence'] = verified_trade_signal(conn, v)
+                    record['strategy_evidence_missing'] = bool(record['side'] == 'buy' and record['strategy_id'] and record['strategy_evidence'] is None)
             incomplete = rows(conn, "SELECT DISTINCT account_id,instrument_id FROM trade_executions WHERE status='pending' ORDER BY account_id,instrument_id")
             result = {'items': records, **revision, 'data_incomplete': bool(incomplete), 'incomplete_scopes': incomplete}
             if limit is not None:

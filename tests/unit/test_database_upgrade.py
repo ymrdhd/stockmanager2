@@ -161,3 +161,31 @@ def test_explicit_cli_upgrade_and_maintenance_lock(tmp_path):
     result=subprocess.run(cmd+['check-database'],capture_output=True,text=True,check=True,timeout=10)
     assert json.loads(result.stdout)['schema_version']==SCHEMA_VERSION
     assert (dest/'manifest.json').exists()
+
+
+def test_0008_upgrade_preserves_invalidated_strategy_evidence(tmp_path):
+    path = tmp_path/'old-strategy.sqlite'
+    identity = replace(Identity.new('formal'), schema_version=8)
+    engine = create_engine(URL.create('sqlite', database=str(path)))
+    try:
+        migrate_schema(engine, identity, target='0008')
+    finally:
+        engine.dispose()
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("INSERT INTO strategy_bars VALUES ('fixture','2026-01-05',10,11,9,10,100,'index_level','fixture',1,'2026-01-05T08:00:00Z')")
+        conn.execute("""INSERT INTO strategy_signals(signal_id,index_id,strategy_version,config_version,signal_date,input_version,price_basis,price_unit,status,created_at,updated_at)
+            VALUES ('old-signal','HS300','v9','old','2026-01-05','old','index_level','元','SIGNAL','2026-01-05T08:00:00Z','2026-01-05T08:00:00Z')""")
+        conn.execute("""INSERT INTO strategy_plans(plan_id,index_id,strategy_version,signal_id,signal_date,status,created_at,updated_at)
+            VALUES ('old-plan','HS300','v9','old-signal','2026-01-05','PENDING','2026-01-05T08:00:00Z','2026-01-05T08:00:00Z')""")
+    cfg = cfg_for(path,identity,tmp_path/'official.json')
+    adopt_database(cfg,confirm=True)
+    dest=tmp_path/'backup-0008'
+    upgrade_database(cfg,dest,confirm=True)
+    with open_database(cfg) as db,db.read() as conn:
+        assert conn.execute('SELECT revision,close,acquired_at FROM strategy_bars').fetchone()==(1,10.0,'2026-01-05T08:00:00Z')
+        assert conn.execute('SELECT signal_id,status FROM strategy_signals').fetchone()==('old-signal','INVALID_PRICE_BASIS')
+        assert conn.execute('SELECT signal_id,status FROM strategy_plans').fetchone()==('old-signal','CANCELLED')
+        assert conn.execute('PRAGMA foreign_key_check').fetchall()==[]
+        assert conn.execute('PRAGMA integrity_check').fetchone()==('ok',)
+    with closing(sqlite3.connect(dest/'database.sqlite')) as conn:
+        assert conn.execute('SELECT status FROM strategy_signals').fetchone()==('SIGNAL',)

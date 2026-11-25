@@ -290,22 +290,43 @@ def legacy05(tmp_path):
     return settings
 
 
+def _shared_rows(path, tables):
+    """按**旧schema的列**取值：0009 起有意新增可空列，旧事实本身仍必须逐字节不变。"""
+    with closing(sqlite3.connect(path)) as c:
+        out = {}
+        for t in tables:
+            cols = [row[1] for row in c.execute('PRAGMA table_info(%s)' % t)]
+            out[t] = (cols, c.execute('SELECT %s FROM %s ORDER BY rowid'
+                                      % (','.join(cols), t)).fetchall())
+        return out
+
+
 def test_0005_to_0006_preserves_all_facts_with_fk(tmp_path):
     settings=legacy05(tmp_path)
     tables=('trade_executions','trade_lots','lot_allocations','cash_movements','opening_positions','company_events','ledger_state')
+    before=_shared_rows(settings.path, tables)
     with closing(sqlite3.connect(settings.path)) as c:
-        before={t:c.execute('SELECT * FROM '+t+' ORDER BY rowid').fetchall() for t in tables}
         accounts=c.execute('SELECT * FROM accounts').fetchall()
     dest=tmp_path/'pre-finance'; upgrade_database(settings,dest,confirm=True)
     with open_database(settings) as db,db.read() as c:
         assert c.execute('SELECT version_num FROM alembic_version').fetchone()==(REVISION,)
         assert c.execute('SELECT schema_version FROM system_metadata').fetchone()==(SCHEMA_VERSION,)
         assert c.execute('SELECT id,name,kind,currency,balance_mode,status FROM accounts').fetchall()==accounts
-        for t in tables: assert c.execute('SELECT * FROM '+t+' ORDER BY rowid').fetchall()==before[t]
+        for t in tables:
+            cols, expected = before[t]
+            # 旧列的原值一字不改……
+            assert c.execute('SELECT %s FROM %s ORDER BY rowid' % (','.join(cols), t)).fetchall()==expected
+            # ……0009 只新增可空列，旧行的新列必须是 NULL / 默认 0，不得凭空有值。
+            current=[row[1] for row in c.execute('PRAGMA table_info(%s)' % t)]
+            assert cols==current[:len(cols)], f'{t} 旧列顺序被改动'
+            for extra in current[len(cols):]:
+                values={row[0] for row in c.execute('SELECT %s FROM %s' % (extra, t))}
+                assert values <= {None, 0}, f'{t}.{extra} 不应被迁移填入 {values}'
         assert c.execute('PRAGMA integrity_check').fetchone()==('ok',) and c.execute('PRAGMA foreign_key_check').fetchall()==[] and c.execute('PRAGMA foreign_keys').fetchone()==(1,)
     assert json.loads((dest/'manifest.json').read_text())['schema_version']==5
-    with closing(sqlite3.connect(dest/'database.sqlite')) as c:
-        for t in tables: assert c.execute('SELECT * FROM '+t+' ORDER BY rowid').fetchall()==before[t]
+    copied=_shared_rows(dest/'database.sqlite', tables)
+    for t in tables:
+        assert copied[t][1]==before[t][1]
 
 
 def test_0006_actual_ddl_failure_rolls_back(tmp_path,monkeypatch):

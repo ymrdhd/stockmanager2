@@ -7,10 +7,11 @@ import sqlite3
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
 from backend.config import WEB_DIST, AppConfig, AuthConfig
 from backend.infrastructure.authfile import DEFAULT_AUTH_FILE, AuthFileError, load_auth, save_auth
-from backend.infrastructure.backup import create_backup
+from backend.infrastructure.backup import create_backup, list_backups
 from backend.infrastructure.binding import load_binding
 from backend.infrastructure.database import (
     DEFAULT_BINDING,
@@ -24,6 +25,7 @@ from backend.infrastructure.database import (
     read_identity,
     upgrade_database,
 )
+from backend.infrastructure.restore import check_backup, restore
 
 
 def _identity_args(parser: argparse.ArgumentParser, *, local: bool = False) -> None:
@@ -89,6 +91,32 @@ def _server_settings(args: argparse.Namespace) -> DatabaseSettings:
                             official_path=binding.path, mode='server')
 
 
+def _restore_settings(args: argparse.Namespace) -> DatabaseSettings:
+    """Formal settings for restore; --database keeps the binding published beside that file.
+
+    A missing binding still permits `restore-check` to inspect a backup, but a real restore
+    then stops at the pre-restore backup: adopt-database owns rebuilding a lost binding.
+    """
+    binding_path = DEFAULT_BINDING
+    try:
+        binding = load_binding(DEFAULT_BINDING)
+        path, uuid, generation = binding.path, binding.uuid, binding.generation
+    except DatabaseError:
+        path, uuid, generation = absolute_path(DEFAULT_DATABASE), str(uuid4()), 1
+    if args.database is not None:
+        # An explicit target carries its own binding beside it, exactly like adopt-database.
+        path = absolute_path(args.database)
+        binding_path = path.parent / DEFAULT_BINDING.name
+        try:
+            beside = load_binding(binding_path)
+        except DatabaseError:
+            pass
+        else:
+            uuid, generation = beside.uuid, beside.generation
+    return DatabaseSettings(path=path, expected_uuid=uuid, generation=generation,
+                            official_path=path, binding_path=binding_path, mode='server')
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Stock Manager database and loopback launcher')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -128,6 +156,21 @@ def main() -> int:
     _identity_args(upgrade)
     upgrade.add_argument('--destination', type=Path, required=True)
     upgrade.add_argument('--confirm', action='store_true')
+    restore_check = commands.add_parser('restore-check',
+                                       help='verify a backup directory before any restore')
+    restore_check.add_argument('--source', type=Path, required=True)
+    restore_check.add_argument('--database', type=Path, default=None,
+                              help='formal database path (default: the published binding)')
+    restore_command = commands.add_parser('restore',
+                                         help='replace the formal database with a verified backup')
+    restore_command.add_argument('--source', type=Path, required=True)
+    restore_command.add_argument('--database', type=Path, default=None,
+                                 help='formal database path (default: the published binding)')
+    restore_command.add_argument('--report', type=Path, default=None,
+                                 help='also write the JSON report to this file')
+    restore_command.add_argument('--confirm', action='store_true')
+    status = commands.add_parser('backup-status', help='list the backups published in a directory')
+    status.add_argument('--destination', type=Path, required=True)
     commands.add_parser('client', help='browser only; no local database or backend')
     args = parser.parse_args()
     try:
@@ -158,6 +201,19 @@ def main() -> int:
             config = DatabaseSettings(path=args.database, official_path=args.database,
                                       expected_uuid=args.uuid, generation=args.generation)
             print(json.dumps(asdict(adopt_database(config, confirm=args.confirm))))
+            return 0
+        if args.command == 'backup-status':
+            print(json.dumps(list_backups(args.destination), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == 'restore-check':
+            verdict = check_backup(_restore_settings(args), args.source)
+            print(json.dumps({key: verdict[key] for key in ('ok', 'reason', 'counts', 'checks')},
+                             indent=2, ensure_ascii=False))
+            return 0 if verdict['ok'] else 1
+        if args.command == 'restore':
+            report = restore(_restore_settings(args), args.source, confirm=args.confirm,
+                             destination_report=args.report)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
         local = args.command == 'local'
         config = _local_settings(args) if local else _server_settings(args)
