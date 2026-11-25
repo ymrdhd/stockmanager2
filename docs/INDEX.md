@@ -40,3 +40,4 @@
 - [CHANGELOG.md](CHANGELOG.md)：本次变更记录。
 
 09I 收尾交接：`09I_REPORT.md`（实际变更及测试）、`09I_FUNCTION_MATRIX.md`（当前剩余分类）、`09I_HANDOFF.md`（最终环境验收顺序与候选口径）。不构成正式发布批准。
+09J 交接：`09J_REPORT.md`（接近止损证据边界测试）、`09J_HANDOFF.md`（剩余产品决策及本地验收范围）。
