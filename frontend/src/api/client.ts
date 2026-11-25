@@ -25,6 +25,11 @@ export class ApiError extends Error {
     super(message); this.uncertain = uncertain; this.status = status; this.code = code
   }
 }
+/** A failed read that cannot establish the current authenticated service is safe.
+ * Ordinary validation/version conflicts remain local to the requesting view. */
+export function readConnectionFailure(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.status === undefined || error.status === 401 || error.status === 403 || error.status === 408 || error.status >= 500 || (error.status >= 200 && error.status < 300))
+}
 function detail(body: unknown): string {
   try {
     const d = fact(body).detail

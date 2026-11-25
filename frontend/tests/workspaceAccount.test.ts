@@ -6,10 +6,11 @@ import {readFileSync} from 'node:fs'
 import {stripTypeScriptTypes} from 'node:module'
 import {runInNewContext} from 'node:vm'
 import {AccountScope} from '../src/api/accountScope.ts'
-import {ApiError, fact, facts, page, str, WriteAttempt, type Fact} from '../src/api/client.ts'
+import {ApiError, readConnectionFailure, fact, facts, page, str, WriteAttempt, type Fact} from '../src/api/client.ts'
 import {auditDetails, display, localTime, money, shanghaiTime} from '../src/ui.ts'
 type Ref<T>={value:T;listeners:Set<()=>void>}
 const viewAccount=(view:Ref<Fact|null>)=>view.value?.account_id
+const generationOf=(view:Ref<Fact|null>)=>(view.value?.identity as Fact|undefined)?.generation
 function ref<T>(initial:T):Ref<T>{let v=initial;const listeners=new Set<()=>void>();return {get value(){return v},set value(next:T){if(next!==v){v=next;for(const listener of listeners)listener()}},listeners}}
 function watch<T>(source:Ref<T>,callback:()=>void){source.listeners.add(callback)}
 function deferred<T>(){let resolve!:(value:T)=>void,reject!:(reason:unknown)=>void;const promise=new Promise<T>((r,j)=>{resolve=r;reject=j});return {promise,resolve,reject}}
@@ -20,7 +21,7 @@ function setup(request:(path:string)=>Promise<Fact>,logout=async()=>{}):Setup{
   const source=raw.split('<script setup lang="ts">')[1].split('</script>')[0].replace(/^import .*$/gm,'')
   const js=stripTypeScriptTypes(source,{mode:'strip'})
   const context={ref,watch,computed:(get:()=>unknown)=>({get value(){return get()}}),onMounted:()=>{},onBeforeUnmount:()=>{},
-    api:request,requestApi:request,getHealth:async()=>({kind:'connected',version:'test'}),session:{forgetIdentity(){},forgetSession(){},declare(){},stored:async()=>({username:'test'}),logout},ApiError,fact,facts,page,str,WriteAttempt,AccountScope,auditDetails,display,localTime,money,shanghaiTime,URLSearchParams,Date,
+    api:request,requestApi:request,getHealth:async()=>({kind:'connected',version:'test'}),session:{forgetIdentity(){},forgetSession(){},declare(){},stored:async()=>({username:'test'}),logout},ApiError,readConnectionFailure,fact,facts,page,str,WriteAttempt,AccountScope,auditDetails,display,localTime,money,shanghaiTime,URLSearchParams,Date,
     harness:null as Setup|null}
   runInNewContext(js+`\nglobalThis.harness={financeAudit,financeAuditError,financeAuditLoading,readFinanceAudit,filterBills,period,loadMonth,proposedPort,validPort,portCommand,selectedAccount,valuation,strategy,pool,positionsView,pnlHistory,pnlMonth,tradeDetail,tradeAccount,tradePath,reconciliationReport,reconciliationError,reconciliationLoading,loadReconciliation,
   investmentError:typeof investmentError==='undefined'?{value:''}:investmentError,
@@ -163,7 +164,7 @@ test('Workspace reconnect does not silently accept a new database generation',as
   assert.ok(w.manualReload)
   await w.manualReload!()
   assert.equal(w.writable.value,true)
-  assert.equal((w.system.value?.identity as Fact).generation,2)
+  assert.equal(generationOf(w.system),2)
 })
 
 
@@ -187,7 +188,7 @@ test('Workspace poll refuses a changed generation; rechecking a different candid
   generation=3;await w.manualReload!()
   assert.equal(w.writable.value,false);assert.equal(w.system.value,null)
   await w.manualReload!();assert.equal(w.writable.value,true)
-  assert.equal((w.system.value?.identity as Fact).generation,3)
+  assert.equal(generationOf(w.system),3)
 })
 
 test('Workspace sign out clears private projections before the server responds',async()=>{
@@ -238,4 +239,44 @@ test('finance audit rejects another database even at the same ledger version',as
   w.system.value=systemStatus('db-a',1);w.overview.value={ledger_revision:3}
   await w.readFinanceAudit('bills',{id:'new'})
   assert.equal(w.financeAudit.value,null);assert.match(w.financeAuditError.value,/身份不一致/);assert.equal(w.freshness.value,'stale')
+})
+
+test('Workspace immediately fences writes on a current secondary read transport failure',async()=>{
+  let failure=false
+  const w=setup(async path=>{
+    if(failure&&path.startsWith('/portfolio/'))throw new ApiError('timeout',false)
+    return workspaceReply(path)
+  })
+  await w.reload();assert.equal(w.writable.value,true)
+  w.selectedAccount.value='A';failure=true;await w.refreshInvestment(false)
+  assert.equal(w.writable.value,false);assert.equal(w.freshness.value,'stale')
+  assert.equal(w.signIn.value,false,'transport failure is not an expired session')
+  failure=false;await w.reload();assert.equal(w.writable.value,true)
+})
+
+test('Workspace ignores a late transport failure from an obsolete connection generation',async()=>{
+  const late=deferred<Fact>();let pending=false
+  const w=setup(async path=>pending&&path.startsWith('/portfolio/')?late.promise:workspaceReply(path))
+  await w.reload();w.selectedAccount.value='A';pending=true
+  const obsolete=w.refreshInvestment(false)
+  w.wentOffline();pending=false;await w.reload();assert.equal(w.writable.value,true)
+  late.reject(new ApiError('old timeout',false));await obsolete
+  assert.equal(w.writable.value,true)
+})
+
+test('actual PagedRecords setup reports connection failures but not ordinary conflicts or obsolete responses',async()=>{
+  const raw=readFileSync(new URL('../src/components/PagedRecords.vue',import.meta.url),'utf-8')
+  const source=raw.split('<script setup lang="ts">')[1].split('</script>')[0].replace(/^import .*$/gm,'')
+  const notices:unknown[][]=[]
+  const pending=deferred<Fact>()
+  let failure:ApiError|null=new ApiError('unavailable',false,503),unmount=()=>{}
+  const context={ref,watch:()=>{},onBeforeUnmount:(fn:()=>void)=>{unmount=fn},defineProps:()=>({path:'/trades',refresh:1}),defineEmits:()=> (...args:unknown[])=>notices.push(args),
+    api:async()=>{if(failure)throw failure;return pending.promise},ApiError,readConnectionFailure,page,
+    harness:null as {load():Promise<void>}|null}
+  runInNewContext(stripTypeScriptTypes(source,{mode:'strip'})+'\nglobalThis.harness={load}',context)
+  const list=context.harness!;await list.load();assert.equal(notices.length,1);assert.equal(notices[0][0],'connectionFailure')
+  failure=new ApiError('version conflict',false,409);await list.load();assert.equal(notices.length,1)
+  failure=null;const obsolete=list.load();unmount();pending.reject(new ApiError('old timeout',false));await obsolete;assert.equal(notices.length,1)
+  const workspace=readFileSync(new URL('../src/pages/WorkspacePage.vue',import.meta.url),'utf-8')
+  assert.ok([...workspace.matchAll(/<PagedRecords\b[^>]*>/g)].every(m=>m[0].includes('@connection-failure="handleRead"')))
 })

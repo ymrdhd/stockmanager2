@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import {ref, watch, onBeforeUnmount} from 'vue'
-import {api, ApiError, page, type Page} from '../api/client'
+import {api, ApiError, readConnectionFailure, page, type Page} from '../api/client'
 import RecordTable from './RecordTable.vue'
 const props = defineProps<{path:string; columns:{key:string;label:string}[]; refresh:number; accountId?:string}>()
-const emit=defineEmits<{unauthorized:[error:ApiError]}>()
+const emit=defineEmits<{connectionFailure:[error:ApiError]}>()
 const result = ref<Page|null>(null), error = ref(''), loading = ref(false)
 let serial = 0
 async function load(offset = 0, revision?:number) {
@@ -15,7 +15,7 @@ async function load(offset = 0, revision?:number) {
       if(account&&r.items.some(row=>row.account_id!==account))throw new Error('列表返回其他账户的记录，已拒绝展示')
       result.value = r
     }
-  } catch (e) { if(token===serial) {error.value=String(e);result.value=null;if(e instanceof ApiError&&e.status===401)emit('unauthorized',e)} }
+  } catch (e) { if(token===serial) {error.value=String(e);result.value=null;if(readConnectionFailure(e))emit('connectionFailure',e)} }
   finally {if(token===serial) loading.value=false}
 }
 watch(() => [props.path,props.refresh,props.accountId], () => {result.value=null;void load()}, {immediate:true,flush:'sync'})
